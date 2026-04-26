@@ -22,5 +22,6 @@ typechain-types/
 out/
 
 deployments/*.json
+**/deployments/*.json
 
 implemtation.md

@@ -39,9 +39,9 @@ pnpm --filter contracts deploy:0g
 The deploy script writes `contracts/deployments/0g-galileo.json`. After deploy, verify each contract:
 
 ```bash
-pnpm --filter contracts verify:0g -- <STYLE_REGISTRY_ADDRESS> "https://example.invalid/metadata/"
-pnpm --filter contracts verify:0g -- <ROYALTY_VAULT_ADDRESS>
-pnpm --filter contracts verify:0g -- <CREDIT_SYSTEM_ADDRESS> <ROYALTY_VAULT_ADDRESS> <STYLE_REGISTRY_ADDRESS> 1000000000000000
+pnpm --filter contracts verify:0g <STYLE_REGISTRY_ADDRESS> "https://example.invalid/metadata/"
+pnpm --filter contracts verify:0g <ROYALTY_VAULT_ADDRESS> <STYLE_REGISTRY_ADDRESS>
+pnpm --filter contracts verify:0g <CREDIT_SYSTEM_ADDRESS> <ROYALTY_VAULT_ADDRESS> <STYLE_REGISTRY_ADDRESS> 1000000000000000
 ```
 
 Mint a demo iNFT-style token after deployment:
