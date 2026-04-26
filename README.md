@@ -58,3 +58,5 @@ pnpm --filter backend compute:hello
 ```
 
 `storage:hello` encrypts bytes locally, uploads them through 0G Storage, downloads the bytes, and decrypts them. `compute:hello` performs a chat completion through a configured 0G Compute provider.
+
+The 0G Compute broker currently requires more test funds than basic chain/storage work. If the wallet has no Compute ledger yet, the SDK asks for `broker.ledger.addLedger(3)`, so keep at least `3 0G` plus gas available before running the broker-backed compute smoke test.
