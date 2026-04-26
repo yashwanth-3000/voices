@@ -1,0 +1,14 @@
+{
+  "name": "voices",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.2",
+  "scripts": {
+    "compile": "pnpm --filter contracts compile",
+    "test": "pnpm --filter contracts test",
+    "deploy:0g": "pnpm --filter contracts deploy:0g",
+    "mint:0g": "pnpm --filter contracts mint:0g",
+    "storage:hello": "pnpm --filter backend storage:hello",
+    "compute:hello": "pnpm --filter backend compute:hello"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "storage:hello": "tsx src/storage-hello.ts",
+    "compute:hello": "tsx src/compute-hello.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.2.6",
+    "@0glabs/0g-serving-broker": "^0.7.5",
+    "dotenv": "^17.2.3",
+    "ethers": "6.13.1",
+    "openai": "^6.34.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
