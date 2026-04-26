@@ -1,7 +1,10 @@
-import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
+import { createRequire } from "node:module";
 import { ethers } from "ethers";
 import OpenAI from "openai";
 import { normalizePrivateKey, optionalEnv, requiredEnv } from "./config.js";
+
+const require = createRequire(import.meta.url);
+const { createZGComputeNetworkBroker } = require("@0glabs/0g-serving-broker") as typeof import("@0glabs/0g-serving-broker");
 
 type ChatMessage = {
   role: "system" | "user";
