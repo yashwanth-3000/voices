@@ -1,13 +1,17 @@
 node_modules/
 .pnpm-store/
 pnpm-lock.yaml
+.0g-skills/
 
 .env
+backend/.voices-storage-cache.json
+.voices-storage-cache.json
 .env.*
 !.env.example
 
 .DS_Store
 *.log
+*.swp
 *.tsbuildinfo
 
 dist/

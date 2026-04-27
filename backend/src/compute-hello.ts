@@ -49,29 +49,35 @@ async function runBrokerHello() {
   const broker = await createZGComputeNetworkBroker(
     wallet as unknown as Parameters<typeof createZGComputeNetworkBroker>[0]
   );
-  const { endpoint, model } = await broker.inference.getServiceMetadata(providerAddress);
-  const body = { model, messages };
-  const headers = await broker.inference.getRequestHeaders(providerAddress, JSON.stringify(body));
 
-  const response = await fetch(`${endpoint}/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify(body)
-  });
+  try {
+    const { endpoint, model } = await broker.inference.getServiceMetadata(providerAddress);
+    const body = { model, messages };
+    const headers = await broker.inference.getRequestHeaders(providerAddress, JSON.stringify(body));
 
-  if (!response.ok) {
-    throw new Error(`0G Compute request failed: ${response.status} ${await response.text()}`);
+    const response = await fetch(`${endpoint}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      throw new Error(`0G Compute request failed: ${response.status} ${await response.text()}`);
+    }
+
+    const data = await response.json();
+    const chatId = response.headers.get("ZG-Res-Key") || response.headers.get("zg-res-key") || data.id || data.chatID;
+    const verified = await broker.inference.processResponse(providerAddress, chatId, JSON.stringify(data.usage || {}));
+
+    console.log("0G Compute broker hello-world complete");
+    console.log(`Provider: ${providerAddress}`);
+    console.log(`Model: ${model}`);
+    console.log(`TEE response verified: ${verified ?? "skipped"}`);
+    console.log(data.choices?.[0]?.message?.content || "(empty response)");
+  } finally {
+    broker.inference.stopAutoFunding();
+    provider.destroy();
   }
-
-  const data = await response.json();
-  const chatId = response.headers.get("ZG-Res-Key") || response.headers.get("zg-res-key") || data.id || data.chatID;
-  const verified = await broker.inference.processResponse(providerAddress, chatId, JSON.stringify(data.usage || {}));
-
-  console.log("0G Compute broker hello-world complete");
-  console.log(`Provider: ${providerAddress}`);
-  console.log(`Model: ${model}`);
-  console.log(`TEE response verified: ${verified ?? "skipped"}`);
-  console.log(data.choices?.[0]?.message?.content || "(empty response)");
 }
 
 async function main() {

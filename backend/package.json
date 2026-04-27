@@ -4,8 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:mock": "PORT=4317 AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "start:mock": "PORT=4317 AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx src/index.ts",
+    "start:0g": "AGENT_STORAGE_MODE=0g AGENT_COMPUTE_MODE=0g AGENT_CHAIN_MODE=0g tsx src/index.ts",
+    "smoke:agents": "AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx src/smoke-agents.ts",
     "storage:hello": "tsx src/storage-hello.ts",
     "compute:hello": "tsx src/compute-hello.ts",
+    "test": "tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -13,6 +20,7 @@
     "@0glabs/0g-serving-broker": "^0.7.5",
     "dotenv": "^17.2.3",
     "ethers": "6.13.1",
+    "fastify": "^5.6.2",
     "openai": "^6.34.0"
   },
   "devDependencies": {
