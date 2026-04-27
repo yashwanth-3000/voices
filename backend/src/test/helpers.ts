@@ -1,4 +1,4 @@
-import { EventBus } from "../events/event-bus.js";
+import { EventLog } from "../events/event-log.js";
 import { MockChainClient } from "../infra/chain.js";
 import { MockComputeClient } from "../infra/compute.js";
 import { KeeperHubRestClient } from "../infra/keeperhub.js";
@@ -11,9 +11,9 @@ export function createTestOrchestrator(overrides: { compute?: AgentCompute } = {
   const compute = overrides.compute ?? new MockComputeClient();
   const chain = new MockChainClient();
   const keeperhub = new KeeperHubRestClient();
-  const bus = new EventBus({ storage });
-  const orchestrator = new Orchestrator({ storage, compute, chain, keeperhub, bus });
-  return { orchestrator, storage, compute, chain, keeperhub, bus };
+  const eventLog = new EventLog({ storage });
+  const orchestrator = new Orchestrator({ storage, compute, chain, keeperhub, eventLog });
+  return { orchestrator, storage, compute, chain, keeperhub, eventLog };
 }
 
 export function longSample(): string {

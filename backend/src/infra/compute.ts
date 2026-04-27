@@ -200,14 +200,12 @@ function buildDraft(prompt: string): string {
     /Return only <draft>[\s\S]*$/i,
     ""
   );
-  const styleProfileText = between(prompt, "Style profile to follow:", "Few-shot examples of this voice");
-  const styleWords = distinctiveWords(styleProfileText, 5);
-  const cleanTopic = compact(topic || "Write a concise update").replace(/\.$/, "");
+  const cleanTopic = normalizeMockTopic(topic || "this topic");
 
   return [
-    `${cleanTopic}.`,
-    `The useful part is not another polished prompt. It is the system around it: a style profile, an event trail, and a settlement path that can be checked later.`,
-    `Keep the claim simple. The voice is ${styleWords.slice(0, 3).join(", ") || "clear and specific"}; the workflow should show exactly what happened.`
+    `${cleanTopic} is bigger than the headline. The useful question is what changed, who had to react, and which assumptions stopped being safe.`,
+    "The concrete part matters most: ownership changed, incentives shifted, and people who depended on the platform had to re-check what they could trust.",
+    "No fake precision, no invented motives, no pretending the consequences are settled. Say the visible mechanism plainly, then stop before speculation starts sounding like evidence."
   ].join("\n\n");
 }
 
@@ -218,27 +216,51 @@ function buildPlatformVariants(prompt: string): Record<string, string> {
   return Object.fromEntries(
     platforms.map((platform) => {
       if (platform === "x") {
-        return [platform, truncate(`${firstSentence(draft)} The value is the event trail: style, draft, publish, feedback.`, 276)];
+        return [platform, truncate(firstSentence(draft), 260)];
       }
       if (platform === "linkedin") {
         return [
           platform,
           [
             firstSentence(draft),
-            "What matters is the workflow behind it: the style is profiled, the draft is generated from that profile, platform variants are published, and feedback updates the profile through events.",
-            "That makes the demo inspectable instead of just impressive."
+            "The important part is to keep the claim careful: name the mechanism, avoid fake precision, and separate what is visible from what is still interpretation.",
+            "That makes the post useful instead of just confident."
           ].join("\n\n")
         ];
       }
       if (platform === "instagram") {
         return [
           platform,
-          `${firstSentence(draft)}\n\nA style profile, an event trail, and feedback that actually changes the next run.\n\n#0G #iNFT #Agents #CreatorTools`
+          `${firstSentence(draft)}\n\nNo fake certainty. Just the visible change, the tradeoff, and why it matters.`
         ];
       }
       return [platform, firstSentence(draft)];
     })
   );
+}
+
+function normalizeMockTopic(topic: string): string {
+  const stripped = compact(topic)
+    .replace(/^(write|draft|create|make)\s+(me\s+)?(a\s+|an\s+)?(post|tweet|thread|caption|linkedin post|article)?\s*(about|on|for)?\s*/i, "")
+    .replace(/^about\s+/i, "")
+    .replace(/[.?!]+$/, "")
+    .trim();
+  const normalized = rephraseMockHowSubject(stripped || "this topic")
+    .replace(/\belon\s+(?:much|mush|musk)\b/gi, "Elon Musk")
+    .replace(/\bthe\s+x\b/gi, "X")
+    .replace(/\bx\b/gi, "X")
+    .replace(/\belon\s+musk\b/gi, "Elon Musk")
+    .replace(/\bthe\s+twitter\b/gi, "Twitter")
+    .replace(/\btwitter\b/gi, "Twitter");
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function rephraseMockHowSubject(input: string): string {
+  const match = input.match(/^how\s+(.+?)\s+(bought|acquired)\s+(.+)$/i);
+  if (!match) {
+    return input;
+  }
+  return `${match[1]} ${match[2].toLowerCase() === "acquired" ? "acquiring" : "buying"} ${match[3]}`;
 }
 
 export function createComputeClient(): AgentCompute {

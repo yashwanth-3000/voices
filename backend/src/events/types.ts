@@ -8,6 +8,7 @@ export type EventType =
   | "style.minted"
   | "style.refined"
   | "style.failed"
+  | "agent.activity"
   | "generation.requested"
   | "generation.drafted"
   | "settlement.intent.created"

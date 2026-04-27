@@ -63,6 +63,8 @@ export function TestPageClient() {
   const [lastTxHash, setLastTxHash] = useState("");
   const [busyAction, setBusyAction] = useState("");
   const [error, setError] = useState("");
+  const [streamStatus, setStreamStatus] = useState<Record<string, "connecting" | "open" | "closed" | "error">>({});
+  const [selectedEventId, setSelectedEventId] = useState("");
   const streams = useRef<Map<string, EventSource>>(new Map());
   const eventsRef = useRef<AgentEvent[]>([]);
 
@@ -73,6 +75,26 @@ export function TestPageClient() {
   const latestDraft = [...events].reverse().find((event) => event.type === "generation.drafted");
   const latestPublished = [...events].reverse().find((event) => event.type === "generation.published");
   const latestRefined = [...events].reverse().find((event) => event.type === "style.refined");
+  const liveMode = runtime?.costProfile === "live_0g";
+  const walletReady = Boolean(walletAddress && chainId === "16602");
+  const signedReady = Boolean(attestationMessage && attestationSignature);
+  const uploadReady = walletReady && signedReady && sampleCharacters >= 1024;
+  const creditCount = parseBigIntSafe(creditBalance);
+  const hasCredits = creditCount !== null && creditCount > BigInt(0);
+  const nextAction = getNextAction({
+    liveMode,
+    walletReady,
+    signedReady,
+    uploadReady,
+    mintIntentReady: Boolean(mintIntent),
+    styleReady: Boolean(styleId),
+    hasCredits,
+    promptReady: Boolean(prompt.trim()),
+    spendIntentReady: Boolean(spendIntent),
+    hasDraft: Boolean(latestDraft),
+    feedbackReady: Boolean(feedback.trim()),
+    refined: Boolean(latestRefined)
+  });
   const generatedDraft = payloadString(latestDraft, "draft");
   const platformVariants = payloadRecord(latestPublished, "variants");
   const eventGroups = useMemo(() => {
@@ -81,6 +103,14 @@ export function TestPageClient() {
       events: events.filter((event) => requestIdFromEvent(event) === requestId || event.id === requestId)
     }));
   }, [events, requestIds]);
+  const activityEvents = useMemo(
+    () => events.filter((event) => event.type === "agent.activity").slice(-18).reverse(),
+    [events]
+  );
+  const selectedEvent = useMemo(
+    () => events.find((event) => event.id === selectedEventId) ?? null,
+    [events, selectedEventId]
+  );
 
   useEffect(() => {
     void checkHealth();
@@ -310,6 +340,7 @@ export function TestPageClient() {
     try {
       setHealth(await apiGet("/admin/health"));
     } catch (flowError) {
+      setHealth(null);
       setError(errorMessage(flowError));
     }
   }
@@ -379,12 +410,20 @@ export function TestPageClient() {
 
   function openEventStream(requestId: string) {
     if (streams.current.has(requestId)) return;
+    setStreamStatus((current) => ({ ...current, [requestId]: "connecting" }));
     const source = new EventSource(`/api/backend/events/stream/${requestId}`);
+    source.onopen = () => {
+      setStreamStatus((current) => ({ ...current, [requestId]: "open" }));
+    };
     source.onmessage = (message) => {
       const event = JSON.parse(message.data) as AgentEvent;
+      setStreamStatus((current) => ({ ...current, [requestId]: "open" }));
       setEvents((current) => mergeEvents(current, [event]));
     };
-    source.onerror = () => source.close();
+    source.onerror = () => {
+      setStreamStatus((current) => ({ ...current, [requestId]: "error" }));
+      source.close();
+    };
     streams.current.set(requestId, source);
   }
 
@@ -394,6 +433,9 @@ export function TestPageClient() {
   }
 
   function resetRunState() {
+    for (const source of streams.current.values()) source.close();
+    streams.current.clear();
+    setStreamStatus({});
     setEvents([]);
     setRequestIds([]);
     setStyleId("");
@@ -440,6 +482,21 @@ export function TestPageClient() {
         </div>
       </section>
 
+      <section className="runbook-strip">
+        <div className="next-action-card">
+          <span>Next action</span>
+          <strong>{nextAction}</strong>
+        </div>
+        <div className="readiness-grid">
+          <ReadinessItem ok={liveMode} label="Backend live" detail={liveMode ? "0G storage, compute, and chain modes" : "Run backend in 0G modes"} />
+          <ReadinessItem ok={walletReady} label="Wallet ready" detail={walletReady ? `${short(walletAddress)} on Galileo` : "Connect MetaMask to chain 16602"} />
+          <ReadinessItem ok={sampleCharacters >= 1024} label="Samples ready" detail={`${sampleCharacters.toLocaleString()} characters`} />
+          <ReadinessItem ok={signedReady} label="Attestation signed" detail={signedReady ? "Signature captured" : "Sign before upload"} />
+          <ReadinessItem ok={Boolean(styleId)} label="iNFT minted" detail={styleId ? `Token ${styleId}` : pendingStyleId || "Waiting"} />
+          <ReadinessItem ok={hasCredits} label="Credits ready" detail={creditBalance ? `${creditBalance} credit(s)` : "Refresh credits"} />
+        </div>
+      </section>
+
       <section className="main-grid">
         <div className="stack">
           <div className="panel controls-panel">
@@ -455,7 +512,7 @@ export function TestPageClient() {
             <label>Attestation signature<input value={attestationSignature} onChange={(event) => setAttestationSignature(event.target.value)} /></label>
             <div className="button-row multi-actions">
               <button type="button" onClick={signAttestation} disabled={busy || !walletAddress || !samplesText}>Sign attestation</button>
-              <button type="button" className="primary" onClick={uploadStyle} disabled={busy || !attestationSignature}>{busyAction === "upload" ? "Uploading..." : "Upload + profile"}</button>
+              <button type="button" className="primary" onClick={uploadStyle} disabled={busy || !uploadReady}>{busyAction === "upload" ? "Uploading..." : "Upload + profile"}</button>
               <button type="button" className="primary" onClick={mintOnChain} disabled={busy || !mintIntent}>{busyAction === "mint" ? "Minting..." : "Mint on-chain"}</button>
             </div>
             <div className="resume-row">
@@ -478,7 +535,7 @@ export function TestPageClient() {
             <label>Generation prompt<textarea placeholder="What should the agent write?" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
             <div className="checkbox-row">{["x", "linkedin", "instagram"].map((platform) => <label className="checkbox-label" key={platform}><input checked={platforms.includes(platform)} onChange={() => togglePlatform(platform)} type="checkbox" />{platform}</label>)}</div>
             <div className="button-row multi-actions">
-              <button type="button" className="primary" onClick={generateContent} disabled={busy || !styleId}>{busyAction === "generate" ? "Generating..." : "Generate"}</button>
+              <button type="button" className="primary" onClick={generateContent} disabled={busy || !styleId || !prompt.trim()}>{busyAction === "generate" ? "Generating..." : "Generate"}</button>
               <button type="button" className="primary" onClick={settleOnChain} disabled={busy || !spendIntent}>{busyAction === "settle" ? "Settling..." : "Spend credit + settle royalty"}</button>
             </div>
           </div>
@@ -501,6 +558,57 @@ export function TestPageClient() {
 
           <div className="panel"><div className="panel-title">Lifecycle</div><div className="steps">{steps.map((step) => <div className="step" data-state={step.state} key={step.label}><span className="step-dot" /><div><strong>{step.label}</strong><span>{step.detail ?? step.state}</span></div></div>)}</div></div>
 
+          <div className="panel activity-panel">
+            <div className="panel-title">Live agent activity</div>
+            <div className="activity-list">
+              {activityEvents.length === 0 ? <p className="muted">No agent activity yet. Start upload or generation.</p> : null}
+              {activityEvents.map((event) => (
+                <button
+                  aria-pressed={selectedEventId === event.id}
+                  className="activity-row"
+                  data-selected={selectedEventId === event.id}
+                  data-state={String(event.payload.status ?? "completed")}
+                  key={event.id}
+                  onClick={() => setSelectedEventId(event.id)}
+                  type="button"
+                >
+                  <div>
+                    <strong>{String(event.payload.agentLabel ?? event.payload.agent ?? "Agent")}</strong>
+                    <span>{String(event.payload.tool ?? "tool")}</span>
+                  </div>
+                  <p>{String(event.payload.message ?? eventExplanation(event))}</p>
+                  <time>{formatTime(event.timestamp)}</time>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="panel raw-panel">
+            <div className="raw-heading">
+              <div className="panel-title">Raw selected log</div>
+              {selectedEvent ? <button type="button" onClick={() => setSelectedEventId("")}>Clear</button> : null}
+            </div>
+            {selectedEvent ? (
+              <div className="raw-content">
+                <div className="raw-meta">
+                  <span>{selectedEvent.type}</span>
+                  <code>{selectedEvent.id}</code>
+                </div>
+                <pre className="json-box raw-json">{JSON.stringify(selectedEvent, null, 2)}</pre>
+              </div>
+            ) : (
+              <p className="muted">Click any activity row or event log row to inspect the exact raw event payload.</p>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-title">Transaction intents</div>
+            <div className="intent-list">
+              <IntentPreview title="Mint iNFT" intent={mintIntent} readyLabel={pendingStyleId || "Ready after upload"} />
+              <IntentPreview title="Spend credit" intent={spendIntent} readyLabel={styleId ? `Style ${styleId}` : "Ready after generation"} />
+            </div>
+          </div>
+
           <div className="panel"><div className="panel-title">Latest on-chain tx</div><div className="output-box">{lastTxHash ? <a href={`${GALILEO_EXPLORER}/tx/${lastTxHash}`} rel="noreferrer" target="_blank">{lastTxHash}</a> : "No transaction sent yet."}</div></div>
           <div className="panel"><div className="panel-title">Agents</div><pre className="json-box">{health ? JSON.stringify(health, null, 2) : "No health check yet."}</pre></div>
         </div>
@@ -513,14 +621,30 @@ export function TestPageClient() {
 
       <section className="panel events-panel">
         <div className="panel-title">Real-time event log</div>
-        <div className="event-list">{eventGroups.length === 0 ? <p className="muted">No events yet.</p> : null}{eventGroups.map((group) => <div className="event-group" key={group.requestId}><code>{group.requestId}</code>{group.events.map((event) => <div className="event-row" key={event.id}><span>{event.type}</span><small>{eventExplanation(event)}</small></div>)}</div>)}</div>
+        <div className="event-list">{eventGroups.length === 0 ? <p className="muted">No events yet.</p> : null}{eventGroups.map((group) => <div className="event-group" key={group.requestId}><div className="event-group-head"><code>{group.requestId}</code><span data-state={streamStatus[group.requestId] ?? "closed"}>{streamStatus[group.requestId] ?? "closed"}</span></div>{group.events.map((event) => <button aria-pressed={selectedEventId === event.id} className="event-row" data-selected={selectedEventId === event.id} data-type={event.type === "agent.activity" ? "activity" : "event"} key={event.id} onClick={() => setSelectedEventId(event.id)} type="button"><span>{event.type}</span><small>{eventExplanation(event)}</small><time>{formatTime(event.timestamp)}</time></button>)}</div>)}</div>
       </section>
     </main>
   );
 }
 
+function ReadinessItem({ ok, label, detail }: { ok: boolean; label: string; detail: string }) {
+  return <div className="readiness-item" data-state={ok ? "ok" : "waiting"}><span>{ok ? "Ready" : "Waiting"}</span><strong>{label}</strong><small>{detail}</small></div>;
+}
+
 function Explain({ done, title, waiting, doneText }: { done: boolean; title: string; waiting: string; doneText: string }) {
   return <div data-state={done ? "done" : "waiting"}><strong>{title}</strong><span>{done ? doneText : waiting}</span></div>;
+}
+
+function IntentPreview({ title, intent, readyLabel }: { title: string; intent: TransactionIntent | null; readyLabel: string }) {
+  return (
+    <div className="intent-card" data-state={intent ? "ready" : "waiting"}>
+      <div>
+        <strong>{title}</strong>
+        <span>{intent ? intent.description : readyLabel}</span>
+      </div>
+      {intent ? <dl><dt>To</dt><dd>{intent.to}</dd><dt>Value</dt><dd>{ethers.formatEther(intent.value || "0")} OG</dd></dl> : null}
+    </div>
+  );
 }
 
 const initialSteps: FlowStep[] = [
@@ -558,7 +682,12 @@ async function apiPost<T = Record<string, unknown>>(path: string, body: Record<s
 async function parseResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+  if (!response.ok) {
+    if (data.error === "backend_unavailable") {
+      throw new Error(`Backend is offline at ${data.backendUrl}. Restart it and refresh Health. Details: ${data.message ?? response.status}`);
+    }
+    throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+  }
   return data as T;
 }
 
@@ -613,6 +742,9 @@ function belongsToRequest(event: AgentEvent, requestId: string): boolean {
 }
 
 function eventExplanation(event: AgentEvent): string {
+  if (event.type === "agent.activity") {
+    return `${String(event.payload.agentLabel ?? event.payload.agent ?? "Agent")} ${String(event.payload.status ?? "updated")}: ${String(event.payload.message ?? event.payload.tool ?? "activity")}`;
+  }
   if (event.type.endsWith(".failed")) return String(event.payload.reason ?? event.payload.error ?? "Agent reported failure");
   if (event.type === "style.mint.intent.created") return "Backend prepared a real StyleRegistry.mintStyle transaction.";
   if (event.type === "style.minted") return `On-chain mint confirmed: token ${event.styleId}.`;
@@ -633,6 +765,47 @@ function requireValue(value: string, label: string): string {
 
 function short(value: string): string {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function parseBigIntSafe(value: string): bigint | null {
+  try {
+    return value ? BigInt(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatTime(timestamp: number): string {
+  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(timestamp);
+}
+
+function getNextAction(input: {
+  liveMode: boolean;
+  walletReady: boolean;
+  signedReady: boolean;
+  uploadReady: boolean;
+  mintIntentReady: boolean;
+  styleReady: boolean;
+  hasCredits: boolean;
+  promptReady: boolean;
+  spendIntentReady: boolean;
+  hasDraft: boolean;
+  feedbackReady: boolean;
+  refined: boolean;
+}): string {
+  if (!input.liveMode) return "Start the backend in live 0G mode, then refresh Health.";
+  if (!input.walletReady) return "Connect MetaMask on 0G Galileo.";
+  if (!input.signedReady) return "Sign the writing-sample attestation.";
+  if (!input.uploadReady) return "Add at least 1KB of creator-owned samples.";
+  if (!input.mintIntentReady && !input.styleReady) return "Upload + profile to create the mint transaction.";
+  if (input.mintIntentReady && !input.styleReady) return "Mint the style iNFT on-chain in MetaMask.";
+  if (!input.hasCredits) return "Buy one credit for this wallet.";
+  if (!input.promptReady) return "Enter a generation prompt.";
+  if (!input.hasDraft) return "Generate the draft and platform variants.";
+  if (input.spendIntentReady) return "Spend credit + settle royalty on-chain.";
+  if (!input.feedbackReady) return "Add feedback to test autonomous refinement.";
+  if (!input.refined) return "Send feedback and watch Style Curator refine.";
+  return "Flow complete. Try another prompt or upload a new style.";
 }
 
 function sleep(ms: number): Promise<void> {

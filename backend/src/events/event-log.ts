@@ -1,15 +1,15 @@
 import { EventEmitter } from "node:events";
 import { AgentStorage } from "../infra/types.js";
-import { AgentEvent, EventType, createAgentEvent, requestIdFromEvent, type NewAgentEvent } from "./types.js";
+import { AgentEvent, createAgentEvent, requestIdFromEvent, type NewAgentEvent } from "./types.js";
 
 export type EventHandler = (event: AgentEvent) => void | Promise<void>;
 
-export type EventBusOptions = {
+export type EventLogOptions = {
   storage: AgentStorage;
   streamId?: string;
 };
 
-export class EventBus {
+export class EventLog {
   private readonly emitter = new EventEmitter();
   private readonly events = new Map<string, AgentEvent>();
   private readonly eventOrder: string[] = [];
@@ -17,24 +17,10 @@ export class EventBus {
   private readonly storage: AgentStorage;
   private readonly streamId: string;
 
-  constructor(options: EventBusOptions) {
+  constructor(options: EventLogOptions) {
     this.storage = options.storage;
     this.streamId = options.streamId ?? "voices:agent-events";
     this.emitter.setMaxListeners(100);
-  }
-
-  subscribe(types: readonly EventType[], handler: EventHandler): () => void {
-    const listeners = types.map((type) => {
-      const listener = (event: AgentEvent) => handler(event);
-      this.emitter.on(type, listener);
-      return { type, listener };
-    });
-
-    return () => {
-      for (const { type, listener } of listeners) {
-        this.emitter.off(type, listener);
-      }
-    };
   }
 
   subscribeAll(handler: EventHandler): () => void {
@@ -56,9 +42,15 @@ export class EventBus {
 
     this.events.set(event.id, event);
     this.eventOrder.push(event.id);
-    await this.storage.logAppend(this.streamId, event.id, event);
 
     this.dispatch(event);
+    const task = this.storage
+      .logAppend(this.streamId, event.id, event)
+      .catch(() => undefined)
+      .finally(() => {
+        this.inFlight.delete(task);
+      });
+    this.inFlight.add(task);
 
     return event;
   }
@@ -94,7 +86,7 @@ export class EventBus {
   }
 
   private dispatch(event: AgentEvent): void {
-    for (const listener of [...this.emitter.listeners(event.type), ...this.emitter.listeners("*")]) {
+    for (const listener of this.emitter.listeners("*")) {
       const task = Promise.resolve()
         .then(() => (listener as (event: AgentEvent) => void | Promise<void>)(event))
         .catch(() => undefined)

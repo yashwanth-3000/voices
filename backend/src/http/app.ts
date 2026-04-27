@@ -67,12 +67,16 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       const confirmedProfileKey = `style:${tokenId}:profile`;
       const pendingProfile = await orchestrator.storage.kvGet<Record<string, unknown>>(pendingProfileKey);
       if (pendingProfile) {
-        await orchestrator.storage.kvSet(confirmedProfileKey, {
-          ...pendingProfile,
-          confirmedStyleId: tokenId,
-          pendingStyleId,
-          mintTxHash: txHash
-        });
+        void orchestrator.storage
+          .kvSet(confirmedProfileKey, {
+            ...pendingProfile,
+            confirmedStyleId: tokenId,
+            pendingStyleId,
+            mintTxHash: txHash
+          })
+          .catch((error) => {
+            request.log.warn({ error }, "background confirmed profile write failed");
+          });
       }
     }
 
@@ -225,7 +229,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     for (const event of orchestrator.eventsForRequest(params.requestId)) {
       send(event);
     }
-    const unsubscribe = orchestrator.bus.subscribeAll((event) => {
+    const unsubscribe = orchestrator.events.subscribeAll((event) => {
       if (event.id === params.requestId || event.payload.requestId === params.requestId) {
         send(event);
       }

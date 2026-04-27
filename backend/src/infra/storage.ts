@@ -9,6 +9,13 @@ import { AgentStorage } from "./types.js";
 
 type LogEntry = { key: string; value: unknown };
 type StorageCache = { kv?: Record<string, unknown>; logs?: Record<string, LogEntry[]> };
+type PendingKvWrite = {
+  streamId: string;
+  key: string;
+  value: unknown;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
 
 export class MemoryStorageClient implements AgentStorage {
   protected readonly kv = new Map<string, unknown>();
@@ -69,6 +76,10 @@ export class ZeroGStorageClient extends MemoryStorageClient {
   private readonly signer: ethers.Wallet;
   private readonly indexer: Indexer;
   private readonly cachePath?: string;
+  private readonly flushCheckpointsToZeroG: boolean;
+  private storageTxQueue: Promise<void> = Promise.resolve();
+  private kvFlushTimer?: ReturnType<typeof setTimeout>;
+  private pendingKvWrites: PendingKvWrite[] = [];
 
   constructor() {
     super();
@@ -82,6 +93,7 @@ export class ZeroGStorageClient extends MemoryStorageClient {
     this.cachePath = process.env.AGENT_STORAGE_CACHE_PATH === "off"
       ? undefined
       : resolve(process.env.AGENT_STORAGE_CACHE_PATH?.trim() || ".voices-storage-cache.json");
+    this.flushCheckpointsToZeroG = process.env.AGENT_CHECKPOINT_FLUSH_MODE === "0g";
     this.loadLocalCache();
   }
 
@@ -106,21 +118,23 @@ export class ZeroGStorageClient extends MemoryStorageClient {
   }
 
   override async uploadEncrypted(bytes: Uint8Array, encryptionKey?: string): Promise<{ rootHash: string; txHash?: string }> {
-    const encrypted = encryptBytes(bytes, resolveAesKey(encryptionKey));
-    const file = new MemData(encrypted);
-    const [tx, err] = await this.indexer.upload(
-      file,
-      this.rpcUrl,
-      this.signer as unknown as Parameters<Indexer["upload"]>[2]
-    );
-    if (err || !tx) {
-      throw err ?? new Error("0G encrypted upload failed");
-    }
+    return this.runStorageTransaction("encrypted upload", async () => {
+      const encrypted = encryptBytes(bytes, resolveAesKey(encryptionKey));
+      const file = new MemData(encrypted);
+      const [tx, err] = await this.indexer.upload(
+        file,
+        this.rpcUrl,
+        this.signer as unknown as Parameters<Indexer["upload"]>[2]
+      );
+      if (err || !tx) {
+        throw err ?? new Error("0G encrypted upload failed");
+      }
 
-    if ("rootHash" in tx) {
-      return { rootHash: tx.rootHash, txHash: tx.txHash };
-    }
-    return { rootHash: tx.rootHashes[0], txHash: tx.txHashes[0] };
+      if ("rootHash" in tx) {
+        return { rootHash: tx.rootHash, txHash: tx.txHash };
+      }
+      return { rootHash: tx.rootHashes[0], txHash: tx.txHashes[0] };
+    });
   }
 
   override async downloadEncrypted(rootHash: string, encryptionKey?: string): Promise<Uint8Array> {
@@ -146,17 +160,93 @@ export class ZeroGStorageClient extends MemoryStorageClient {
   }
 
   private async writeKv<T>(streamId: string, key: string, value: T): Promise<void> {
+    if (isCheckpointWrite(streamId, key) && !this.flushCheckpointsToZeroG) {
+      return;
+    }
+
+    const flush = this.enqueueKvWrite(streamId, key, value);
+    if (isCheckpointWrite(streamId, key)) {
+      flush.catch((error) => {
+        console.warn(`0G Storage checkpoint flush failed for ${streamId}:${key}: ${errorMessage(error)}`);
+      });
+      return;
+    }
+    await flush;
+  }
+
+  private enqueueKvWrite(streamId: string, key: string, value: unknown): Promise<void> {
+    const promise = new Promise<void>((resolve, reject) => {
+      this.pendingKvWrites.push({ streamId, key, value, resolve, reject });
+    });
+
+    this.kvFlushTimer ??= setTimeout(() => {
+      this.kvFlushTimer = undefined;
+      void this.flushKvWrites();
+    }, 100);
+
+    return promise;
+  }
+
+  private async flushKvWrites(): Promise<void> {
+    const writes = this.pendingKvWrites.splice(0);
+    if (writes.length === 0) {
+      return;
+    }
+
+    try {
+      await this.runStorageTransaction(`kv/log batch (${writes.length} write${writes.length === 1 ? "" : "s"})`, async () => {
+        await this.writeKvBatch(writes);
+      });
+      for (const write of writes) {
+        write.resolve();
+      }
+    } catch (error) {
+      for (const write of writes) {
+        write.reject(error);
+      }
+    }
+  }
+
+  private async writeKvBatch(writes: PendingKvWrite[]): Promise<void> {
     const [nodes, selectErr] = await this.indexer.selectNodes(1);
     if (selectErr) {
       throw selectErr;
     }
     const flow = getFlowContract(this.flowContractAddress, this.signer as unknown as Parameters<typeof getFlowContract>[1]);
     const batcher = new Batcher(1, nodes, flow, this.rpcUrl);
-    batcher.streamDataBuilder.set(streamIdFor(streamId), utf8Bytes(key), utf8Bytes(JSON.stringify(value)));
+    for (const write of writes) {
+      batcher.streamDataBuilder.set(streamIdFor(write.streamId), utf8Bytes(write.key), utf8Bytes(JSON.stringify(write.value)));
+    }
     const [, err] = await batcher.exec();
     if (err) {
       throw err;
     }
+  }
+
+  private async runStorageTransaction<T>(label: string, operation: () => Promise<T>): Promise<T> {
+    const task = this.storageTxQueue
+      .catch(() => undefined)
+      .then(async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            return await operation();
+          } catch (error) {
+            if (attempt < 2 && isNonceContentionError(error)) {
+              console.warn(`0G Storage ${label} hit nonce contention; retrying after pending tx settles.`);
+              await sleep(4_000 * (attempt + 1));
+              continue;
+            }
+            throw error;
+          }
+        }
+        throw new Error(`0G Storage ${label} failed`);
+      });
+
+    this.storageTxQueue = task.then(
+      () => undefined,
+      () => undefined
+    );
+    return task;
   }
 
   private loadLocalCache(): void {
@@ -194,4 +284,27 @@ function streamIdFor(input: string): string {
 
 function utf8Bytes(input: string): Uint8Array {
   return Uint8Array.from(Buffer.from(input, "utf8"));
+}
+
+function isNonceContentionError(error: unknown): boolean {
+  const record = error as { code?: string; shortMessage?: string; message?: string; info?: { error?: { message?: string } } };
+  const text = [
+    record.code,
+    record.shortMessage,
+    record.message,
+    record.info?.error?.message
+  ].filter(Boolean).join(" ").toLowerCase();
+  return text.includes("replacement") || text.includes("underpriced") || text.includes("nonce") || text.includes("already known");
+}
+
+function isCheckpointWrite(streamId: string, key: string): boolean {
+  return streamId.startsWith("lg:") || key.startsWith("lg:");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

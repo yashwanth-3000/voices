@@ -1,6 +1,6 @@
 import { Wallet } from "ethers";
 import { buildApp } from "./http/app.js";
-import { EventBus } from "./events/event-bus.js";
+import { EventLog } from "./events/event-log.js";
 import { MockChainClient } from "./infra/chain.js";
 import { MockComputeClient } from "./infra/compute.js";
 import { KeeperHubRestClient } from "./infra/keeperhub.js";
@@ -15,7 +15,7 @@ const orchestrator = new Orchestrator({
   chain,
   compute: new MockComputeClient(),
   keeperhub: new KeeperHubRestClient(),
-  bus: new EventBus({ storage })
+  eventLog: new EventLog({ storage })
 });
 
 const app = await buildApp({ orchestrator });

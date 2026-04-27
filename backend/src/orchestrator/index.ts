@@ -1,6 +1,5 @@
-import { ContentCreatorAgent, DistributionManagerAgent, StyleCuratorAgent } from "../agents/index.js";
-import { AgentContext, BaseAgent } from "../agents/base-agent.js";
-import { EventBus } from "../events/event-bus.js";
+import { VoicesLangGraphSwarm } from "../agents/langgraph/swarm.js";
+import { EventLog } from "../events/event-log.js";
 import { AgentEvent, NewAgentEvent } from "../events/types.js";
 import { createChainClient } from "../infra/chain.js";
 import { createComputeClient } from "../infra/compute.js";
@@ -13,12 +12,13 @@ export type OrchestratorDeps = {
   compute?: AgentCompute;
   chain?: AgentChain;
   keeperhub?: KeeperHubClient;
-  bus?: EventBus;
+  eventLog?: EventLog;
+  swarm?: VoicesLangGraphSwarm;
 };
 
 export class Orchestrator {
-  readonly bus: EventBus;
-  readonly agents: BaseAgent[];
+  readonly events: EventLog;
+  readonly swarm: VoicesLangGraphSwarm;
   readonly storage: AgentStorage;
   readonly chain: AgentChain;
   private started = false;
@@ -30,61 +30,54 @@ export class Orchestrator {
     const keeperhub = deps.keeperhub ?? createKeeperHubClient();
     this.storage = storage;
     this.chain = chain;
-    this.bus = deps.bus ?? new EventBus({ storage });
-
-    const context: AgentContext = {
-      bus: this.bus,
-      storage,
-      compute,
-      chain,
-      keeperhub
-    };
-
-    this.agents = [
-      new StyleCuratorAgent(context),
-      new ContentCreatorAgent(context),
-      new DistributionManagerAgent(context)
-    ];
+    this.events = deps.eventLog ?? new EventLog({ storage });
+    this.swarm =
+      deps.swarm ??
+      new VoicesLangGraphSwarm({
+        storage,
+        compute,
+        chain,
+        keeperhub,
+        publish: (event) => this.events.publish(event)
+      });
   }
 
   async start(): Promise<void> {
     if (this.started) {
       return;
     }
-    await this.bus.replay();
-    for (const agent of this.agents) {
-      await agent.start();
-    }
+    await this.events.replay();
+    this.swarm.start();
     this.started = true;
   }
 
   async stop(): Promise<void> {
-    for (const agent of this.agents) {
-      await agent.stop();
-    }
+    this.swarm.stop();
     this.started = false;
   }
 
   async publish(event: AgentEvent | NewAgentEvent): Promise<AgentEvent> {
-    return this.bus.publish(event);
+    const published = await this.events.publish(event);
+    this.swarm.handleEvent(published);
+    return published;
   }
 
   async drain(): Promise<void> {
-    await this.bus.drain();
+    await this.events.drain();
+    await this.swarm.drain();
+    await this.events.drain();
   }
 
   eventsForRequest(requestId: string): AgentEvent[] {
-    return this.bus.eventsForRequest(requestId);
+    return this.events.eventsForRequest(requestId);
   }
 
   status(): {
     started: boolean;
-    agents: ReturnType<BaseAgent["status"]>[];
+    agents: ReturnType<VoicesLangGraphSwarm["status"]>["agents"];
   } {
-    return {
-      started: this.started,
-      agents: this.agents.map((agent) => agent.status())
-    };
+    const swarmStatus = this.swarm.status();
+    return { started: this.started && swarmStatus.started, agents: swarmStatus.agents };
   }
 }
 

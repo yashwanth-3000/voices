@@ -24,6 +24,7 @@ typechain-types/
 .turbo/
 .next/
 out/
+.playwright-cli/
 
 deployments/*.json
 **/deployments/*.json
