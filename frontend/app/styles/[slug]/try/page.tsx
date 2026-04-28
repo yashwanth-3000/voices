@@ -2,7 +2,6 @@
 
 import { useMemo, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
-import { Footer } from "../../../../components/Footer";
 import { Button } from "../../../../components/Button";
 import { getStyle } from "../../../../lib/styles";
 
@@ -58,7 +57,7 @@ export default function TryStylePage({ params }: PageProps) {
       <div>
         <Navbar />
         <main className="siteShell">
-          <section className="section">
+          <section className="section sectionTightTop">
             <div className="container">
               <div className="kicker">Try</div>
               <h1 className="sectionTitle" style={{ marginTop: 10 }}>
@@ -98,29 +97,13 @@ export default function TryStylePage({ params }: PageProps) {
   }
 
   return (
-    <div>
+    <div className="chatPageRoot">
       <Navbar />
-      <main className="siteShell">
-        <section className="section">
-          <div className="container">
-            <div className="kicker">Try style</div>
-            <div className="styleHeader">
-              <div>
-                <h1 className="sectionTitle" style={{ marginTop: 10 }}>
-                  {style.title}
-                </h1>
-                <p className="sectionSub">
-                  Chat-like generator UI (mock). No API calls — responses are hardcoded.
-                </p>
-              </div>
-              <div className="row" style={{ justifyContent: "flex-end" }}>
-                <Button href={`/styles/${style.slug}`} variant="secondary">
-                  Style details
-                </Button>
-              </div>
-            </div>
-
-            <div className="chatShell" style={{ marginTop: 18 }}>
+      <main className="siteShell chatPageMain">
+        <section className="section sectionTightTop chatPageSection">
+          <div className="container chatPageContainer">
+            <h1 className="chatPageHeading">Generate content in selected style</h1>
+            <div className="chatShell chatShellFull" style={{ marginTop: 14 }}>
               <div className="chatHeader">
                 <div className="chatTitle">
                   Writing with <span className="chatAccent">{style.creatorName}</span> · @
@@ -182,7 +165,6 @@ export default function TryStylePage({ params }: PageProps) {
           </div>
         </section>
       </main>
-      <Footer />
     </div>
   );
 }

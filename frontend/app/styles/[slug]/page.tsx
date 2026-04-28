@@ -42,7 +42,7 @@ export default function StyleDetailPage({ params }: PageProps) {
     <div>
       <Navbar />
       <main className="siteShell">
-        <section className="section">
+        <section className="section sectionTightTop">
           <div className="container">
             <div className="kicker">Style</div>
             <div className="styleHeader">
@@ -56,8 +56,8 @@ export default function StyleDetailPage({ params }: PageProps) {
                 </p>
               </div>
               <div className="row" style={{ justifyContent: "flex-end" }}>
-                <Button href={`/styles/${style.slug}/try`} variant="primary">
-                  Try style
+                <Button href="/styles" variant="secondary">
+                  Back to styles
                 </Button>
               </div>
             </div>
@@ -79,6 +79,16 @@ export default function StyleDetailPage({ params }: PageProps) {
                         <div className="styleTraitValue">{t.value}</div>
                       </div>
                     ))}
+                  </div>
+                  <div className="aboutBottomActions" style={{ marginTop: 14 }}>
+                    <span className="stylePriceTag">{style.price}</span>
+                    <Button
+                      href={`/styles/${style.slug}/try`}
+                      variant="primary"
+                      className="tryStyleCta"
+                    >
+                      Try style
+                    </Button>
                   </div>
                 </div>
               </div>
@@ -144,6 +154,7 @@ export default function StyleDetailPage({ params }: PageProps) {
                 </div>
               </div>
             </div>
+
           </div>
         </section>
       </main>

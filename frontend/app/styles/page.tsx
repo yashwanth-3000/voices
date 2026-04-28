@@ -14,7 +14,7 @@ export default function StylesPage() {
     <div>
       <Navbar />
       <main className="siteShell">
-        <section className="section">
+        <section className="section sectionTightTop">
           <div className="container">
             <div className="kicker">Styles</div>
             <h1 className="sectionTitle" style={{ marginTop: 10 }}>

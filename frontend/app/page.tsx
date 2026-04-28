@@ -125,12 +125,12 @@ export default function Page() {
         <section className="hero">
           <div className="container">
             <div className="heroIntro fadeInUp">
-              <h1 className="headline editorialHeadline">
+              <h1 className="headline editorialHeadline heroMainHeading">
                 Write in anyone&apos;s <span className="headlineAccent">voice</span>,{" "}
                 <span className="headlineMuted">ethically.</span>
               </h1>
               <p className="subhead heroCopy">
-                ContentHub lets creators upload writing samples, turn tone into a
+                Voices lets creators upload writing samples, turn tone into a
                 licensable style, and get paid when brands, teams, and solo users
                 generate in that voice.
               </p>
@@ -181,7 +181,7 @@ export default function Page() {
             <h2 className="sectionTitle">From samples to a sellable style</h2>
             <p className="sectionSub">
               The same simple three-step loop as the concept: creators upload,
-              ContentHub analyzes the voice, and explorers license output on demand.
+              Voices analyzes the voice, and explorers license output on demand.
             </p>
 
             <div className="grid howGrid" style={{ marginTop: 16 }}>
