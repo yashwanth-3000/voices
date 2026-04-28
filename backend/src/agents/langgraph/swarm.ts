@@ -1,0 +1,2139 @@
+import { Buffer } from "node:buffer";
+import { ethers } from "ethers";
+import { AIMessage, BaseMessage, HumanMessage, isToolMessage } from "@langchain/core/messages";
+import { BaseChatModel, BaseChatModelCallOptions } from "@langchain/core/language_models/chat_models";
+import { ChatResult } from "@langchain/core/outputs";
+import { tool } from "@langchain/core/tools";
+import { Command, getCurrentTaskInput } from "@langchain/langgraph";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { createSwarm } from "@langchain/langgraph-swarm";
+import { z } from "zod";
+import { AgentEvent, AgentStatus, EventType, createUlid, requestIdFromEvent } from "../../events/types.js";
+import { contentGenerationPrompt, platformTuningPrompt, styleExtractionPrompt, styleRefinementPrompt } from "../prompts.js";
+import { MintStyleInput, AgentChain, AgentCompute, AgentStorage, KeeperHubClient } from "../../infra/types.js";
+import {
+  VoicesAgentName,
+  VoicesSwarmState,
+  VoicesSwarmStateValue,
+  VoicesSwarmUpdate,
+  VoicesWorkflowKind,
+  appendAgentMessage
+} from "./state.js";
+import { ZeroGCheckpointSaver } from "./zero-g-checkpointer.js";
+
+type LangGraphSwarmDeps = {
+  storage: AgentStorage;
+  compute: AgentCompute;
+  chain: AgentChain;
+  keeperhub: KeeperHubClient;
+  publish: (event: AgentEvent) => Promise<AgentEvent>;
+};
+
+type AgentMeta = {
+  displayName: string;
+  graphName: VoicesAgentName;
+  subscribedEvents: readonly EventType[];
+  status: AgentStatus;
+  lastError?: string;
+};
+
+type AgentActivityStatus = "started" | "completed" | "failed" | "handoff";
+
+const MIN_SAMPLE_BYTES = 1024;
+const MAX_SAMPLE_BYTES = 1024 * 1024;
+const DEFAULT_STYLE_SAMPLE_CHAR_BUDGET = 12_000;
+const DENYLIST = ["paul graham", "j.k. rowling", "jk rowling", "stephen king"];
+
+export class VoicesLangGraphSwarm {
+  private readonly checkpointer: ZeroGCheckpointSaver;
+  private readonly app: ReturnType<ReturnType<typeof createSwarm>["compile"]>;
+  private readonly inFlight = new Set<Promise<void>>();
+  private readonly agents: AgentMeta[] = [
+    {
+      displayName: "Style Curator",
+      graphName: "style_curator",
+      subscribedEvents: ["style.uploaded", "feedback.received"],
+      status: "stopped"
+    },
+    {
+      displayName: "Content Creator",
+      graphName: "content_creator",
+      subscribedEvents: ["generation.requested", "style.refined"],
+      status: "stopped"
+    },
+    {
+      displayName: "Distribution Manager",
+      graphName: "distribution_mgr",
+      subscribedEvents: ["generation.drafted", "credit.low"],
+      status: "stopped"
+    }
+  ];
+
+  private started = false;
+
+  constructor(private readonly deps: LangGraphSwarmDeps) {
+    this.checkpointer = new ZeroGCheckpointSaver(deps.storage);
+    const styleCurator = createReactAgent({
+      llm: createPlannerModel("style_curator", deps.compute),
+      tools: [
+        this.verifyAttestationTool(),
+        this.encryptAndStoreSamplesTool(),
+        this.extractStyleProfileTool(),
+        this.mintInftTool(),
+        this.refineProfileFromFeedbackTool(),
+        this.handoffToContentCreatorTool()
+      ],
+      prompt: STYLE_CURATOR_PROMPT,
+      name: "style_curator",
+      stateSchema: VoicesSwarmState
+    });
+    const contentCreator = createReactAgent({
+      llm: createPlannerModel("content_creator", deps.compute),
+      tools: [
+        this.checkCreditBalanceTool(),
+        this.readStyleProfileTool(),
+        this.pullRelevantSamplesTool(),
+        this.generateWithVoiceTool(),
+        this.logDraftTool(),
+        this.handoffToDistributionTool()
+      ],
+      prompt: CONTENT_CREATOR_PROMPT,
+      name: "content_creator",
+      stateSchema: VoicesSwarmState
+    });
+    const distributionMgr = createReactAgent({
+      llm: createPlannerModel("distribution_mgr", deps.compute),
+      tools: [
+        this.tuneForPlatformTool(),
+        this.checkDistributionCreditBalanceTool(),
+        this.deductCreditViaKeeperTool(),
+        this.depositRoyaltyViaKeeperTool(),
+        this.topupCreditsViaKeeperTool(),
+        this.handoffToCuratorTool()
+      ],
+      prompt: DISTRIBUTION_MANAGER_PROMPT,
+      name: "distribution_mgr",
+      stateSchema: VoicesSwarmState
+    });
+    this.app = createSwarm<typeof VoicesSwarmState>({
+      agents: [styleCurator, contentCreator, distributionMgr] as never,
+      defaultActiveAgent: "style_curator",
+      stateSchema: VoicesSwarmState
+    }).compile({ checkpointer: this.checkpointer, name: "voices_langgraph_swarm" });
+  }
+
+  private verifyAttestationTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        await this.publishToolActivity(state, "style_curator", "verify_attestation", "started", "Verifying the wallet-signed EIP-191 attestation.");
+        try {
+          validateAttestation(event.actor, stringValue(event.payload.attestationMessage, ""), stringValue(event.payload.attestationSignature, ""));
+          await this.publishToolActivity(state, "style_curator", "verify_attestation", "completed", "Attestation signature matches the creator wallet.");
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", "Creator attestation verified."),
+              requestId,
+              creatorAddress: event.actor,
+              attestationVerified: true,
+              lastError: undefined
+            }
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publishToolActivity(state, "style_curator", "verify_attestation", "failed", reason);
+          await this.publishStyleFailure(event, requestId, reason);
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Attestation rejected: ${reason}`),
+              requestId,
+              attestationVerified: false,
+              lastEventType: "style.failed",
+              lastError: reason
+            }
+          });
+        }
+      },
+      {
+        name: "verify_attestation",
+        description: "Deterministically verify the creator wallet's EIP-191 attestation signature before any style work.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private encryptAndStoreSamplesTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        await this.publishToolActivity(state, "style_curator", "encrypt_and_store_samples", "started", "Checking sample size, denylist, and encrypting the creator samples.");
+        try {
+          if (state.attestationVerified === false) {
+            throw new Error("Cannot store samples after failed attestation");
+          }
+          const samples = stringArray(event.payload.samples);
+          validateSamples(samples);
+          const encryptionKey = stringValue(event.payload.attestationSignature, "") || process.env.OG_STORAGE_ENCRYPTION_KEY;
+          const rawSamples = Buffer.from(samples.join("\n\n--- sample break ---\n\n"), "utf8");
+          const upload = await this.deps.storage.uploadEncrypted(rawSamples, encryptionKey);
+          await this.publishToolActivity(state, "style_curator", "encrypt_and_store_samples", "completed", "Encrypted samples were written through 0G Storage.", {
+            rootHash: upload.rootHash,
+            txHash: upload.txHash
+          });
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Encrypted samples stored at ${upload.rootHash}.`),
+              requestId,
+              samplesRootHash: upload.rootHash,
+              storageTxHash: upload.txHash,
+              selectedSamples: budgetSamplesForExtraction(samples),
+              lastError: undefined
+            }
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publishToolActivity(state, "style_curator", "encrypt_and_store_samples", "failed", reason);
+          await this.publishStyleFailure(event, requestId, reason);
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Sample storage failed: ${reason}`),
+              requestId,
+              lastEventType: "style.failed",
+              lastError: reason
+            }
+          });
+        }
+      },
+      {
+        name: "encrypt_and_store_samples",
+        description: "Validate sample size and denylist, encrypt the raw samples, and upload the encrypted bytes to 0G Storage.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private extractStyleProfileTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        await this.publishToolActivity(state, "style_curator", "extract_style_profile", "started", "Calling 0G Compute to extract the structured voice profile.");
+        try {
+          if (!state.samplesRootHash) {
+            throw new Error("Samples must be encrypted and stored before profile extraction");
+          }
+          const samples = state.selectedSamples.length > 0 ? state.selectedSamples : budgetSamplesForExtraction(stringArray(event.payload.samples));
+          const compute = await this.extractProfile(samples, {
+            wallet: event.actor,
+            language: stringValue(event.payload.language, "en"),
+            genres: stringArray(event.payload.genres),
+            sourceSampleCount: stringArray(event.payload.samples).length,
+            promptSampleCount: samples.length,
+            sampleBudget: "low-cost-demo"
+          });
+          const profile = parseTaggedJson(compute.content, "style_profile");
+          const styleId = state.currentStyleId ?? state.pendingStyleId ?? `pending:${event.id}`;
+          const profileKey = `style:${styleId}:profile`;
+          const enrichedProfile = {
+            ...profile,
+            sampleExcerpts: normalizeSampleExcerpts(profile, stringArray(event.payload.samples)),
+            samplesRootHash: state.samplesRootHash,
+            teeVerified: compute.verified,
+            langGraphThread: `voices:${requestId}`,
+            updatedAt: Date.now()
+          };
+          await this.deps.storage.kvSet(profileKey, enrichedProfile);
+          await this.publishToolActivity(state, "style_curator", "extract_style_profile", "completed", "Profile JSON was extracted and stored in 0G KV.", {
+            profileKey,
+            teeVerified: compute.verified
+          });
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Structured style profile extracted for ${styleId}.`),
+              requestId,
+              pendingStyleId: styleId,
+              currentStyleId: styleId,
+              creatorAddress: event.actor,
+              styleProfile: enrichedProfile,
+              profileKey,
+              teeVerified: compute.verified,
+              lastError: undefined
+            }
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publishToolActivity(state, "style_curator", "extract_style_profile", "failed", reason);
+          await this.publishStyleFailure(event, requestId, reason);
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Style extraction failed: ${reason}`),
+              requestId,
+              lastEventType: "style.failed",
+              lastError: reason
+            }
+          });
+        }
+      },
+      {
+        name: "extract_style_profile",
+        description: "Call 0G Compute with the detailed style extraction prompt and persist the structured profile to 0G Storage KV.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private mintInftTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        await this.publishToolActivity(state, "style_curator", "mint_inft", "started", "Preparing the StyleRegistry mint transaction intent for the creator wallet.");
+        try {
+          if (!state.profileKey || !state.samplesRootHash || !state.styleProfile) {
+            throw new Error("Profile and encrypted samples are required before minting");
+          }
+          const styleId = state.currentStyleId ?? state.pendingStyleId ?? `pending:${event.id}`;
+          const mintInput: MintStyleInput = {
+            tokenMetadataURI: stringValue(event.payload.tokenMetadataURI, ""),
+            encryptedSamplesURI: `0g://storage/${state.samplesRootHash}`,
+            profileURI: `0g://kv/${state.profileKey}`,
+            metadataHash: ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(state.styleProfile))),
+            sealedKey: ethers.hexlify(ethers.toUtf8Bytes("server-side-demo-sealed-key")),
+            royaltyWei: stringValue(event.payload.royaltyWei, "1000000000000000"),
+            sampleCount: stringArray(event.payload.samples).length,
+            language: stringValue(event.payload.language, "en"),
+            genres: stringArray(event.payload.genres).join(","),
+            attestationURI: `eip191://${ethers.keccak256(ethers.toUtf8Bytes(stringValue(event.payload.attestationMessage, "")))}`
+          };
+          const transactionIntent = this.deps.chain.mintStyleIntent(mintInput);
+          await this.deps.publish({
+            id: `${event.id}:style.mint.intent.created`,
+            type: "style.mint.intent.created",
+            timestamp: Date.now(),
+            actor: "system",
+            styleId,
+            payload: {
+              requestId,
+              status: "awaiting_wallet_signature",
+              profileKey: state.profileKey,
+              samplesRootHash: state.samplesRootHash,
+              storageTxHash: state.storageTxHash,
+              teeVerified: state.teeVerified,
+              transactionIntent,
+              langGraphThread: `voices:${requestId}`
+            }
+          });
+          await this.publishToolActivity(state, "style_curator", "mint_inft", "completed", "Mint transaction intent is ready for MetaMask.", {
+            styleId,
+            to: transactionIntent.to
+          });
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Mint intent prepared for ${styleId}.`),
+              requestId,
+              pendingStyleId: styleId,
+              currentStyleId: styleId,
+              creatorAddress: event.actor,
+              mintIntent: transactionIntent,
+              lastEventType: "style.mint.intent.created",
+              lastError: undefined
+            }
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publishToolActivity(state, "style_curator", "mint_inft", "failed", reason);
+          await this.publishStyleFailure(event, requestId, reason);
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `Mint intent failed: ${reason}`),
+              requestId,
+              lastEventType: "style.failed",
+              lastError: reason
+            }
+          });
+        }
+      },
+      {
+        name: "mint_inft",
+        description: "Prepare the real StyleRegistry mint transaction intent for the creator wallet to sign on 0G Chain.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private refineProfileFromFeedbackTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "started", "Checking feedback for meaningful voice changes.");
+        return new Command({ update: await this.refineStyle(state, event) });
+      },
+      {
+        name: "refine_profile_from_feedback",
+        description: "Read recent feedback and generation history, then update the stored style profile only if the feedback is meaningful.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private handoffToContentCreatorTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        if (!state.consumerAddress || !state.prompt) {
+          await this.publishToolActivity(state, "style_curator", "handoff_to_content_creator", "completed", "No consumer context is present, so the creator path stops after mint intent creation.");
+          return "No consumer context is present; the creator upload path stops after mint intent creation.";
+        }
+        await this.publishToolActivity(state, "style_curator", "handoff_to_content_creator", "handoff", "Handing the workflow to the Content Creator agent.");
+        return new Command({
+          goto: "content_creator",
+          graph: Command.PARENT,
+          update: {
+            ...appendAgentMessage("style_curator", "Handing off to Content Creator."),
+            activeAgent: "content_creator",
+            workflowKind: "generation"
+          }
+        });
+      },
+      {
+        name: "handoff_to_content_creator",
+        description: "Command handoff from Style Curator to Content Creator when a workflow includes consumer generation context.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private checkCreditBalanceTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        await this.publishToolActivity(state, "content_creator", "check_credit_balance", "started", "Reading the consumer credit balance from CreditSystem.", {
+          consumerAddress
+        });
+        const credits = await this.deps.chain.credits(consumerAddress);
+        if (credits === 0n) {
+          await this.deps.publish({
+            id: `${event.id}:credit.low`,
+            type: "credit.low",
+            timestamp: Date.now(),
+            actor: "system",
+            styleId,
+            consumerAddress,
+            payload: { requestId, reason: "no_credits", langGraphThread: `voices:${requestId}` }
+          });
+          await this.publishToolActivity(state, "content_creator", "check_credit_balance", "completed", "No credits found; emitted credit.low and handed off to Distribution Manager.", {
+            consumerAddress,
+            credits: "0"
+          });
+          return new Command({
+            goto: "distribution_mgr",
+            graph: Command.PARENT,
+            update: {
+              ...appendAgentMessage("content_creator", `No credits available for ${consumerAddress}; handing off for top-up policy.`),
+              activeAgent: "distribution_mgr",
+              workflowKind: "credit_low",
+              currentStyleId: styleId,
+              consumerAddress,
+              creditBalance: "0",
+              lastEventType: "credit.low"
+            }
+          });
+        }
+        await this.publishToolActivity(state, "content_creator", "check_credit_balance", "completed", "Consumer has credits available for generation.", {
+          consumerAddress,
+          credits: credits.toString()
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("content_creator", `${consumerAddress} has ${credits.toString()} generation credit(s).`),
+            currentStyleId: styleId,
+            consumerAddress,
+            creditBalance: credits.toString(),
+            lastError: undefined
+          }
+        });
+      },
+      {
+        name: "check_credit_balance",
+        description: "Read CreditSystem.credits for the consumer and emit credit.low when no credits are available.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private readStyleProfileTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        await this.publishToolActivity(state, "content_creator", "read_style_profile", "started", "Reading StyleRegistry and the 0G KV profile for the selected iNFT.", {
+          styleId
+        });
+        const style = await this.deps.chain.styleOf(styleId);
+        if (!style.listed) {
+          await this.publishGenerationFailure(event, requestId, "Style is no longer listed");
+          await this.publishToolActivity(state, "content_creator", "read_style_profile", "failed", "Style is no longer listed.", { styleId });
+          return new Command({
+            update: {
+              ...appendAgentMessage("content_creator", `Style ${styleId} is no longer listed.`),
+              lastEventType: "generation.failed",
+              lastError: "Style is no longer listed"
+            }
+          });
+        }
+        const profile = await this.getProfile(styleId, style.profileURI);
+        await this.publishToolActivity(state, "content_creator", "read_style_profile", "completed", "Style profile loaded from 0G KV.", {
+          styleId,
+          creatorAddress: style.creator
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("content_creator", `Loaded style profile for ${styleId}.`),
+            currentStyleId: styleId,
+            creatorAddress: style.creator,
+            royaltyAmount: style.royaltyWei.toString(),
+            styleProfile: profile,
+            profileKey: style.profileURI.startsWith("0g://kv/") ? style.profileURI.replace("0g://kv/", "") : style.profileURI,
+            lastError: undefined
+          }
+        });
+      },
+      {
+        name: "read_style_profile",
+        description: "Read StyleRegistry.styleOf and the 0G Storage KV profile for the chosen iNFT style.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private pullRelevantSamplesTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const profile = state.styleProfile ?? {};
+        const selectedSamples = stringArray(profile.sampleExcerpts).slice(0, 5);
+        await this.publishToolActivity(state, "content_creator", "pull_relevant_samples", "completed", `Selected ${selectedSamples.length} style-only excerpt(s) for low-cost conditioning.`, {
+          sampleCount: selectedSamples.length
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("content_creator", `Selected ${selectedSamples.length} voice example(s) for few-shot conditioning.`),
+            selectedSamples,
+            lastError: undefined
+          }
+        });
+      },
+      {
+        name: "pull_relevant_samples",
+        description: "Select the most useful stored sample excerpts for the generation prompt while keeping token cost low.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private generateWithVoiceTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const prompt = state.prompt ?? stringValue(event.payload.prompt, "");
+        await this.publishToolActivity(state, "content_creator", "generate_with_voice", "started", "Calling 0G Compute for a voice-matched draft with strict sample-boundary rules.", {
+          styleId,
+          prompt: prompt.slice(0, 160)
+        });
+        try {
+          const compute = await this.deps.compute.chat(
+            contentGenerationPrompt({
+              styleProfile: state.styleProfile ?? {},
+              prompt,
+              excerpts: state.selectedSamples.length > 0 ? state.selectedSamples : stringArray(state.styleProfile?.sampleExcerpts).slice(0, 5)
+            }),
+            { maxRetries: 1, maxTokens: 500 }
+          );
+          const rawDraft = extractTagged(compute.content, "draft");
+          const draft = guardGeneratedDraft(rawDraft, prompt, state.styleProfile ?? {});
+          await this.publishToolActivity(state, "content_creator", "generate_with_voice", "completed", "Draft generated and checked for sample-content leakage.", {
+            styleId,
+            teeVerified: compute.verified,
+            qualityGuard: draft === rawDraft.trim() ? "passed" : "fallback_rewrite"
+          });
+          return new Command({
+            update: {
+              ...appendAgentMessage("content_creator", `Draft generated for style ${styleId}.`),
+              requestId,
+              currentStyleId: styleId,
+              prompt,
+              draftText: draft,
+              teeVerified: compute.verified,
+              lastError: undefined
+            }
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publishToolActivity(state, "content_creator", "generate_with_voice", "failed", reason);
+          await this.publishGenerationFailure(event, requestId, reason);
+          return new Command({
+            update: {
+              ...appendAgentMessage("content_creator", `Generation failed: ${reason}`),
+              lastEventType: "generation.failed",
+              lastError: reason
+            }
+          });
+        }
+      },
+      {
+        name: "generate_with_voice",
+        description: "Call 0G Compute with the detailed voice-matching prompt and produce a draft wrapped in draft tags.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private logDraftTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        const draft = state.draftText ?? "";
+        await this.publishToolActivity(state, "content_creator", "log_draft", "started", "Writing the draft to the consumer 0G history log.", {
+          styleId,
+          consumerAddress
+        });
+        await this.deps.storage.logAppend(`consumer:${consumerAddress}:history`, `gen:${event.id}`, {
+          styleId,
+          draft,
+          prompt: state.prompt ?? stringValue(event.payload.prompt, ""),
+          teeVerified: state.teeVerified,
+          langGraphThread: `voices:${requestId}`,
+          timestamp: Date.now()
+        });
+        await this.deps.publish({
+          id: `${event.id}:generation.drafted`,
+          type: "generation.drafted",
+          timestamp: Date.now(),
+          actor: "system",
+          styleId,
+          consumerAddress,
+          payload: {
+            requestId,
+            draft,
+            prompt: state.prompt ?? stringValue(event.payload.prompt, ""),
+            platforms: state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
+            teeVerified: state.teeVerified,
+            langGraphThread: `voices:${requestId}`
+          }
+        });
+        await this.publishToolActivity(state, "content_creator", "log_draft", "completed", "Draft log entry written and generation.drafted emitted.", {
+          styleId,
+          consumerAddress
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("content_creator", "Draft written to 0G Storage Log and generation.drafted emitted."),
+            currentStyleId: styleId,
+            consumerAddress,
+            lastEventType: "generation.drafted"
+          }
+        });
+      },
+      {
+        name: "log_draft",
+        description: "Append the draft to the consumer history log and emit generation.drafted.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private handoffToDistributionTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        await this.publishToolActivity(state, "content_creator", "handoff_to_distribution", "handoff", "Handing the draft to Distribution Manager for platform variants and settlement intent.", {
+          styleId,
+          consumerAddress
+        });
+        return new Command({
+          goto: "distribution_mgr",
+          graph: Command.PARENT,
+          update: {
+            ...appendAgentMessage("content_creator", `Handing off style ${styleId} draft to Distribution Manager.`),
+            activeAgent: "distribution_mgr",
+            workflowKind: "generation",
+            currentStyleId: styleId,
+            consumerAddress,
+            targetPlatforms: state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
+            draftText: state.draftText,
+            royaltyAmount: state.royaltyAmount,
+            lastEventType: "generation.drafted"
+          }
+        });
+      },
+      {
+        name: "handoff_to_distribution",
+        description: "Command handoff from Content Creator to Distribution Manager after the draft is logged.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private tuneForPlatformTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        const draft = state.draftText ?? stringValue(event.payload.draft, "");
+        const platforms = state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]);
+        await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "started", "Calling 0G Compute once to create platform variants.", {
+          styleId,
+          platforms
+        });
+        const compute = await this.deps.compute.chat(platformTuningPrompt(draft, platforms), {
+          maxRetries: 1,
+          maxTokens: 650
+        });
+        const variants = parseVariants(compute.content, draft, platforms);
+        const spendIntent = this.deps.chain.spendCreditIntent(styleId);
+        await this.deps.storage.logAppend(`consumer:${consumerAddress}:history`, `published:${event.id}`, {
+          styleId,
+          variants,
+          teeVerified: compute.verified,
+          langGraphThread: `voices:${requestId}`,
+          timestamp: Date.now()
+        });
+        await this.deps.publish({
+          id: `${event.id}:generation.published`,
+          type: "generation.published",
+          timestamp: Date.now(),
+          actor: "system",
+          styleId,
+          consumerAddress,
+          payload: {
+            requestId,
+            variants,
+            teeVerified: compute.verified,
+            settlementStatus: "awaiting_wallet_signature",
+            spendIntent,
+            langGraphThread: `voices:${requestId}`
+          }
+        });
+        await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "completed", "Variants written to the consumer log and spend-credit intent prepared.", {
+          styleId,
+          platforms,
+          teeVerified: compute.verified
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("distribution_mgr", "Platform variants created in one 0G Compute call."),
+            platformVariants: variants,
+            spendIntent,
+            teeVerified: compute.verified,
+            lastEventType: "generation.published",
+            lastError: undefined
+          }
+        });
+      },
+      {
+        name: "tune_for_platform",
+        description: "Produce X, LinkedIn, and Instagram variants in one 0G Compute call and write them to the consumer log.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private checkDistributionCreditBalanceTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        await this.publishToolActivity(state, "distribution_mgr", "check_credit_balance", "started", "Rechecking credits before settlement.");
+        const credits = await this.deps.chain.credits(consumerAddress);
+        await this.publishToolActivity(state, "distribution_mgr", "check_credit_balance", "completed", "Settlement credit balance read.", {
+          consumerAddress,
+          credits: credits.toString()
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("distribution_mgr", `Settlement check sees ${credits.toString()} credit(s).`),
+            consumerAddress,
+            creditBalance: credits.toString(),
+            lastError: undefined
+          }
+        });
+      },
+      {
+        name: "check_credit_balance",
+        description: "Read the consumer credit balance during Distribution Manager settlement and auto-top-up reasoning.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private deductCreditViaKeeperTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        const spendIntent = state.spendIntent ?? this.deps.chain.spendCreditIntent(styleId);
+        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "started", "Creating the user-signed spend-credit transaction intent. KeeperHub is reserved for autonomous refill calls.", {
+          styleId,
+          consumerAddress
+        });
+        await this.deps.publish({
+          id: `${event.id}:settlement.intent.created`,
+          type: "settlement.intent.created",
+          timestamp: Date.now(),
+          actor: "system",
+          styleId,
+          consumerAddress,
+          payload: { requestId, spendIntent, langGraphThread: `voices:${requestId}` }
+        });
+        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "completed", "Spend-credit intent is ready for MetaMask. This path is user-mediated, not KeeperHub-mediated.", {
+          styleId,
+          consumerAddress,
+          to: spendIntent.to
+        });
+        return new Command({
+          update: {
+            ...appendAgentMessage("distribution_mgr", "Credit spend intent prepared for the consumer wallet."),
+            spendIntent,
+            settlementStatus: "awaiting_wallet_signature",
+            lastEventType: "settlement.intent.created",
+            lastError: undefined
+          }
+        });
+      },
+      {
+        name: "deduct_credit_via_keeper",
+        description: "Create the current CreditSystem.spendCredit transaction intent for the user wallet. KeeperHub is not used for user-mediated settlement.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private depositRoyaltyViaKeeperTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        await this.publishToolActivity(state, "distribution_mgr", "deposit_royalty_via_keeper", "started", "Checking whether the atomic spendCredit path confirmed royalty settlement.", {
+          styleId,
+          consumerAddress
+        });
+        if (state.settlementStatus === "confirmed") {
+          await this.deps.publish({
+            id: `${event.id}:royalty.settled`,
+            type: "royalty.settled",
+            timestamp: Date.now(),
+            actor: "system",
+            styleId,
+            consumerAddress,
+            payload: { requestId, workflowId: state.keeperHubWorkflowId, langGraphThread: `voices:${requestId}` }
+          });
+        }
+        await this.publishToolActivity(
+          state,
+          "distribution_mgr",
+          "deposit_royalty_via_keeper",
+          "completed",
+          state.settlementStatus === "confirmed"
+            ? "Royalty settlement confirmed through spendCredit."
+            : "Royalty settlement is pending wallet or KeeperHub confirmation.",
+          { styleId, consumerAddress, settlementStatus: state.settlementStatus }
+        );
+        return new Command({
+          update: {
+            ...appendAgentMessage(
+              "distribution_mgr",
+              state.settlementStatus === "confirmed"
+                ? "Royalty settlement confirmed through the atomic spendCredit path."
+                : "Royalty settlement is pending wallet/KeeperHub confirmation."
+            ),
+            lastEventType: state.settlementStatus === "confirmed" ? "royalty.settled" : "settlement.intent.created"
+          }
+        });
+      },
+      {
+        name: "deposit_royalty_via_keeper",
+        description: "Record royalty settlement once the atomic spendCredit path confirms creator payment.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private topupCreditsViaKeeperTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "started", "Checking auto-top-up settings for this consumer.");
+        return new Command({ update: await this.handleCreditLow(state, event) });
+      },
+      {
+        name: "topup_credits_via_keeper",
+        description: "If consumer settings enable auto-top-up, prepare or submit a buyCredits transaction through KeeperHub.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  private handoffToCuratorTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        await this.publishToolActivity(state, "distribution_mgr", "handoff_to_curator", "handoff", "Routing feedback context back to Style Curator.");
+        return new Command({
+          goto: "style_curator",
+          graph: Command.PARENT,
+          update: {
+            ...appendAgentMessage("distribution_mgr", "Handing feedback context back to Style Curator."),
+            activeAgent: "style_curator",
+            workflowKind: "feedback_refinement"
+          }
+        });
+      },
+      {
+        name: "handoff_to_curator",
+        description: "Command handoff back to Style Curator when feedback severity warrants profile refinement.",
+        schema: z.object({})
+      }
+    );
+  }
+
+  start(): void {
+    this.started = true;
+    for (const agent of this.agents) {
+      agent.status = "idle";
+      agent.lastError = undefined;
+    }
+  }
+
+  stop(): void {
+    this.started = false;
+    for (const agent of this.agents) {
+      agent.status = "stopped";
+    }
+  }
+
+  canHandle(event: AgentEvent): boolean {
+    return event.type === "style.uploaded" || event.type === "generation.requested" || event.type === "feedback.received" || event.type === "credit.low";
+  }
+
+  handleEvent(event: AgentEvent): void {
+    if (!this.started || !this.canHandle(event)) {
+      return;
+    }
+
+    const activeAgent = activeAgentForEvent(event);
+    const task = this.invokeForEvent(event, activeAgent)
+      .catch(async (error) => {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.markError(activeAgent, reason);
+        await this.publishAgentFailure(event, activeAgent, reason);
+      })
+      .finally(() => {
+        this.markIdle(activeAgent);
+        this.inFlight.delete(task);
+      });
+    this.inFlight.add(task);
+  }
+
+  async drain(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.all([...this.inFlight]);
+    }
+  }
+
+  status(): { started: boolean; agents: Array<{ name: string; status: AgentStatus; subscribedEvents: readonly EventType[]; lastError?: string }> } {
+    return {
+      started: this.started,
+      agents: this.agents.map((agent) => ({
+        name: agent.displayName,
+        status: agent.status,
+        subscribedEvents: agent.subscribedEvents,
+        lastError: agent.lastError
+      }))
+    };
+  }
+
+  private async publishToolActivity(
+    state: VoicesSwarmStateValue,
+    agent: VoicesAgentName,
+    toolName: string,
+    status: AgentActivityStatus,
+    message: string,
+    details: Record<string, unknown> = {}
+  ): Promise<void> {
+    const event = requireIncomingEvent(state);
+    const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+    await this.deps.publish({
+      id: `${event.id}:agent.activity:${createUlid()}`,
+      type: "agent.activity",
+      timestamp: Date.now(),
+      actor: agent,
+      styleId: state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, undefined),
+      consumerAddress: state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
+      payload: {
+        requestId,
+        sourceEventId: event.id,
+        agent,
+        agentLabel: agentLabel(agent),
+        tool: toolName,
+        status,
+        message,
+        langGraphThread: `voices:${requestId}`,
+        ...details
+      }
+    });
+  }
+
+  private async invokeForEvent(event: AgentEvent, activeAgent: VoicesAgentName): Promise<void> {
+    this.markBusy(activeAgent);
+    const requestId = requestIdFromEvent(event) ?? event.id;
+    const state = initialStateFromEvent(event, activeAgent);
+    await this.deps.publish({
+      id: `${event.id}:agent.activity:${createUlid()}`,
+      type: "agent.activity",
+      timestamp: Date.now(),
+      actor: activeAgent,
+      styleId: event.styleId ?? stringValue(event.payload.styleId, undefined),
+      consumerAddress: event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
+      payload: {
+        requestId,
+        sourceEventId: event.id,
+        agent: activeAgent,
+        agentLabel: agentLabel(activeAgent),
+        tool: "langgraph.invoke",
+        status: "started",
+        message: `${agentLabel(activeAgent)} accepted ${event.type}.`,
+        langGraphThread: `voices:${requestId}`
+      }
+    });
+    const stream = await this.app.stream(state, {
+      configurable: {
+        thread_id: `voices:${requestId}`,
+        checkpoint_ns: "runtime"
+      },
+      streamMode: "updates"
+    });
+    let streamStep = 0;
+    for await (const chunk of stream) {
+      streamStep += 1;
+      await this.publishStreamUpdate(event, activeAgent, requestId, streamStep, chunk);
+    }
+    await this.deps.publish({
+      id: `${event.id}:agent.activity:${createUlid()}`,
+      type: "agent.activity",
+      timestamp: Date.now(),
+      actor: activeAgent,
+      styleId: event.styleId ?? stringValue(event.payload.styleId, undefined),
+      consumerAddress: event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
+      payload: {
+        requestId,
+        sourceEventId: event.id,
+        agent: activeAgent,
+        agentLabel: agentLabel(activeAgent),
+        tool: "langgraph.invoke",
+        status: "completed",
+        message: `${agentLabel(activeAgent)} finished the LangGraph run.`,
+        langGraphThread: `voices:${requestId}`
+      }
+    });
+  }
+
+  private async publishStreamUpdate(
+    event: AgentEvent,
+    fallbackAgent: VoicesAgentName,
+    requestId: string,
+    streamStep: number,
+    chunk: unknown
+  ): Promise<void> {
+    const agent = agentFromStreamChunk(chunk, fallbackAgent);
+    const loggableChunk = toLoggable(chunk, 16_000);
+    await this.deps.publish({
+      id: `${event.id}:agent.activity:${createUlid()}`,
+      type: "agent.activity",
+      timestamp: Date.now(),
+      actor: agent,
+      styleId: event.styleId ?? stringValue(event.payload.styleId, undefined),
+      consumerAddress: event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
+      payload: {
+        requestId,
+        sourceEventId: event.id,
+        agent,
+        agentLabel: agentLabel(agent),
+        tool: "langgraph.stream",
+        status: "completed",
+        message: streamSummary(chunk, streamStep),
+        langGraphThread: `voices:${requestId}`,
+        streamStep,
+        streamMode: "updates",
+        rawUpdate: loggableChunk
+      }
+    });
+  }
+
+  private async refineStyle(state: VoicesSwarmStateValue, event: AgentEvent): Promise<VoicesSwarmUpdate> {
+    const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+    const styleId = event.styleId ?? stringValue(event.payload.styleId, "");
+    const feedback = feedbackText(event.payload);
+    if (!styleId || !isMeaningfulFeedback(feedback, event.payload)) {
+      await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "completed", "Feedback was not specific enough to change the profile.");
+      return appendAgentMessage("style_curator", "Feedback was not specific enough to refine the style profile.");
+    }
+
+    const profileKey = await this.resolveProfileKey(styleId);
+    const existing = await this.deps.storage.kvGet<Record<string, unknown>>(profileKey);
+    if (!existing) {
+      await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "failed", `No profile found for style ${styleId}.`, {
+        styleId
+      });
+      return {
+        ...appendAgentMessage("style_curator", `No profile found for style ${styleId}; refinement skipped.`),
+        lastError: `Missing style profile for ${styleId}`
+      };
+    }
+
+    const consumerAddress = event.consumerAddress ?? stringValue(event.payload.consumerAddress, "");
+    const recentHistory = consumerAddress
+      ? await this.deps.storage.logScan(`consumer:${consumerAddress}:history`, "", undefined)
+      : [];
+    const compute = await this.deps.compute.chat(
+      styleRefinementPrompt({ existingProfile: existing, feedback, recentHistory: recentHistory.slice(-8) }),
+      { maxRetries: 1, maxTokens: 500 }
+    );
+    const delta = parseTaggedJson(compute.content, "style_profile_delta");
+    if (delta.meaningful_change === false) {
+      await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "completed", "0G Compute judged the feedback too weak for a profile update.", {
+        styleId,
+        teeVerified: compute.verified
+      });
+      return appendAgentMessage("style_curator", "Feedback did not justify a profile update.");
+    }
+
+    const refined = {
+      ...existing,
+      ...recordValue(delta.updated_profile_patch),
+      recentFeedback: feedback,
+      lastRefinementReason: stringValue(delta.reason, "feedback.received"),
+      lastRefinementQualitySignal: stringValue(delta.quality_signal, "mixed"),
+      lastRefinementTeeVerified: compute.verified,
+      refinementCount: Number(existing.refinementCount ?? 0) + 1,
+      langGraphThread: `voices:${requestId}`,
+      updatedAt: Date.now()
+    };
+    await this.deps.storage.kvSet(profileKey, refined);
+    await this.deps.publish({
+      id: `${event.id}:style.refined`,
+      type: "style.refined",
+      timestamp: Date.now(),
+      actor: "system",
+      styleId,
+      payload: { requestId, profileKey, reason: "feedback.received", langGraphThread: `voices:${requestId}` }
+    });
+    await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "completed", "Profile patch stored and style.refined emitted.", {
+      styleId,
+      profileKey,
+      teeVerified: compute.verified
+    });
+
+    return {
+      ...appendAgentMessage("style_curator", `Profile ${styleId} refined from feedback.`),
+      currentStyleId: styleId,
+      lastEventType: "style.refined",
+      lastError: undefined
+    };
+  }
+
+  private async handleCreditLow(state: VoicesSwarmStateValue, event: AgentEvent): Promise<VoicesSwarmUpdate> {
+    const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+    const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+    const [credits, creditPrice, config] = await Promise.all([
+      this.deps.chain.credits(consumerAddress),
+      this.deps.chain.creditPrice(),
+      this.deps.chain.autoRefillOf(consumerAddress)
+    ]);
+
+    if (!config.supported) {
+      await this.deps.publish({
+        id: `${event.id}:credit.replenish_failed`,
+        type: "credit.replenish_failed",
+        timestamp: Date.now(),
+        actor: "distribution_mgr",
+        styleId: state.currentStyleId ?? event.styleId,
+        consumerAddress,
+        payload: {
+          requestId,
+          reason: "auto_refill_contract_not_deployed",
+          langGraphThread: `voices:${requestId}`
+        }
+      });
+      await this.publishToolActivity(
+        state,
+        "distribution_mgr",
+        "topup_credits_via_keeper",
+        "failed",
+        "The deployed CreditSystem does not expose auto-refill yet. Redeploy the upgraded contract before KeeperHub can refill credits.",
+        { consumerAddress }
+      );
+      return {
+        ...appendAgentMessage("distribution_mgr", "Auto-refill contract method is not deployed yet."),
+        lastEventType: "credit.replenish_failed",
+        lastError: "auto_refill_contract_not_deployed"
+      };
+    }
+
+    if (!config.enabled) {
+      await this.publishToolActivity(
+        state,
+        "distribution_mgr",
+        "topup_credits_via_keeper",
+        "completed",
+        "On-chain auto-refill is disabled, so KeeperHub was not called.",
+        { consumerAddress, credits: credits.toString() }
+      );
+      return appendAgentMessage("distribution_mgr", `Auto-refill is disabled for ${consumerAddress}; no KeeperHub call was made.`);
+    }
+
+    if (credits > config.threshold) {
+      await this.publishToolActivity(
+        state,
+        "distribution_mgr",
+        "topup_credits_via_keeper",
+        "completed",
+        "Credit balance is above the auto-refill threshold, so KeeperHub was not called.",
+        { consumerAddress, credits: credits.toString(), threshold: config.threshold.toString() }
+      );
+      return appendAgentMessage("distribution_mgr", `Credits are above threshold for ${consumerAddress}; no refill needed.`);
+    }
+
+    const refillCost = config.perRefill * creditPrice;
+    const remainingBudget = config.maxBudget > config.spent ? config.maxBudget - config.spent : 0n;
+    if (remainingBudget < refillCost) {
+      await this.deps.publish({
+        id: `${event.id}:credit.replenish_failed`,
+        type: "credit.replenish_failed",
+        timestamp: Date.now(),
+        actor: "distribution_mgr",
+        styleId: state.currentStyleId ?? event.styleId,
+        consumerAddress,
+        payload: {
+          requestId,
+          reason: "auto_refill_budget_exhausted",
+          remainingBudget: remainingBudget.toString(),
+          refillCost: refillCost.toString(),
+          langGraphThread: `voices:${requestId}`
+        }
+      });
+      await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "failed", "Auto-refill budget is exhausted.", {
+        consumerAddress,
+        remainingBudget: remainingBudget.toString(),
+        refillCost: refillCost.toString()
+      });
+      return {
+        ...appendAgentMessage("distribution_mgr", `Auto-refill budget is exhausted for ${consumerAddress}.`),
+        lastEventType: "credit.replenish_failed",
+        lastError: "auto_refill_budget_exhausted"
+      };
+    }
+
+    const refillCall = this.deps.chain.refillFromAllowanceCall(consumerAddress);
+    await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "started", "Calling KeeperHub Direct Execution for CreditSystem.refillFromAllowance.", {
+      consumerAddress,
+      threshold: config.threshold.toString(),
+      perRefill: config.perRefill.toString(),
+      remainingBudget: remainingBudget.toString()
+    });
+    const result = await this.deps.keeperhub.executeContractCall(refillCall);
+    const eventType = result.status === "confirmed" ? "credit.replenished" : "credit.replenish_failed";
+    await this.deps.publish({
+      id: `${event.id}:${eventType}`,
+      type: eventType,
+      timestamp: Date.now(),
+      actor: "distribution_mgr",
+      styleId: state.currentStyleId ?? event.styleId,
+      consumerAddress,
+      payload: {
+        requestId,
+        status: result.status,
+        workflowId: result.workflowId,
+        txHash: result.txHash,
+        blockExplorerUrl: result.blockExplorerUrl,
+        reason: result.reason,
+        refillCall,
+        autoRefill: stringifyAutoRefillConfig(config),
+        langGraphThread: `voices:${requestId}`
+      }
+    });
+    await this.publishToolActivity(
+      state,
+      "distribution_mgr",
+      "topup_credits_via_keeper",
+      result.status === "confirmed" ? "completed" : "failed",
+      result.status === "confirmed"
+        ? "KeeperHub confirmed the autonomous credit refill."
+        : "KeeperHub could not execute the autonomous credit refill.",
+      {
+      consumerAddress,
+      status: result.status,
+      workflowId: result.workflowId,
+      txHash: result.txHash,
+      reason: result.reason
+      }
+    );
+    return {
+      ...appendAgentMessage(
+        "distribution_mgr",
+        result.status === "confirmed"
+          ? `KeeperHub refilled ${consumerAddress} with ${config.perRefill.toString()} credit(s).`
+          : `KeeperHub refill could not complete for ${consumerAddress}: ${result.reason ?? result.status}.`
+      ),
+      keeperHubWorkflowId: result.workflowId,
+      lastEventType: eventType,
+      lastError: result.status === "confirmed" ? undefined : result.reason ?? result.status
+    };
+  }
+
+  private async extractProfile(samples: string[], metadata: Record<string, unknown>) {
+    try {
+      return await this.deps.compute.chat(styleExtractionPrompt(samples, metadata), { maxRetries: 1, maxTokens: 900 });
+    } catch (error) {
+      const smallerWindow = samples.slice(0, Math.max(1, Math.min(samples.length, 3)));
+      if (smallerWindow.length === samples.length) {
+        throw error;
+      }
+      return this.deps.compute.chat(styleExtractionPrompt(smallerWindow, { ...metadata, retry: "short_sample_window" }), {
+        maxRetries: 1,
+        maxTokens: 700
+      });
+    }
+  }
+
+  private async resolveProfileKey(styleId: string): Promise<string> {
+    const defaultKey = `style:${styleId}:profile`;
+    if (await this.deps.storage.kvGet<Record<string, unknown>>(defaultKey)) {
+      return defaultKey;
+    }
+    try {
+      const style = await this.deps.chain.styleOf(styleId);
+      return style.profileURI.startsWith("0g://kv/") ? style.profileURI.replace("0g://kv/", "") : style.profileURI;
+    } catch {
+      return defaultKey;
+    }
+  }
+
+  private async getProfile(styleId: string, profileURI: string): Promise<Record<string, unknown>> {
+    const candidateKeys = [
+      profileURI.startsWith("0g://kv/") ? profileURI.replace("0g://kv/", "") : profileURI,
+      `style:${styleId}:profile`
+    ].filter(Boolean);
+    for (const key of candidateKeys) {
+      const profile = await this.deps.storage.kvGet<Record<string, unknown>>(key);
+      if (profile) {
+        return profile;
+      }
+    }
+    throw new Error(`Missing style profile for ${styleId}`);
+  }
+
+  private async publishStyleFailure(event: AgentEvent, requestId: string, reason: string): Promise<void> {
+    await this.deps.publish({
+      id: `${event.id}:style.failed`,
+      type: "style.failed",
+      timestamp: Date.now(),
+      actor: "system",
+      styleId: event.styleId,
+      consumerAddress: event.consumerAddress,
+      payload: { requestId, sourceEventId: event.id, agent: "Style Curator", reason }
+    });
+  }
+
+  private async publishGenerationFailure(event: AgentEvent, requestId: string, reason: string): Promise<void> {
+    await this.deps.publish({
+      id: `${event.id}:generation.failed`,
+      type: "generation.failed",
+      timestamp: Date.now(),
+      actor: "system",
+      styleId: event.styleId,
+      consumerAddress: event.consumerAddress,
+      payload: { requestId, sourceEventId: event.id, agent: "Content Creator", reason }
+    });
+  }
+
+  private async publishAgentFailure(event: AgentEvent, activeAgent: VoicesAgentName, reason: string): Promise<void> {
+    if (activeAgent === "content_creator") {
+      await this.publishGenerationFailure(event, requestIdFromEvent(event) ?? event.id, reason);
+      return;
+    }
+    await this.publishStyleFailure(event, requestIdFromEvent(event) ?? event.id, reason);
+  }
+
+  private markBusy(agentName: VoicesAgentName): void {
+    const agent = this.agents.find((item) => item.graphName === agentName);
+    if (agent) {
+      agent.status = "busy";
+      agent.lastError = undefined;
+    }
+  }
+
+  private markIdle(agentName: VoicesAgentName): void {
+    const agent = this.agents.find((item) => item.graphName === agentName);
+    if (agent && agent.status !== "error") {
+      agent.status = this.started ? "idle" : "stopped";
+    }
+  }
+
+  private markError(agentName: VoicesAgentName, reason: string): void {
+    const agent = this.agents.find((item) => item.graphName === agentName);
+    if (agent) {
+      agent.status = "error";
+      agent.lastError = reason;
+    }
+  }
+}
+
+class VoicesPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
+  private readonly toolNames: string[];
+
+  constructor(private readonly agentName: VoicesAgentName, toolNames: string[] = []) {
+    super({});
+    this.toolNames = toolNames;
+  }
+
+  _llmType(): string {
+    return "voices-langgraph-planner";
+  }
+
+  _combineLLMOutput(): never[] {
+    return [];
+  }
+
+  bindTools(tools: Array<{ name?: string }>): VoicesPlannerModel {
+    return new VoicesPlannerModel(
+      this.agentName,
+      tools.map((candidate) => candidate.name).filter((name): name is string => typeof name === "string")
+    );
+  }
+
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+    const nextTool = this.nextTool(messages);
+    const message = nextTool
+      ? new AIMessage({
+          content: `${this.agentName} is calling ${nextTool}.`,
+          tool_calls: [
+            {
+              id: `${this.agentName}_${Date.now()}`,
+              name: nextTool,
+              args: {},
+              type: "tool_call"
+            }
+          ]
+        })
+      : new AIMessage({ content: `${this.agentName} completed its current step.` });
+
+    return {
+      generations: [
+        {
+          text: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+          message
+        }
+      ]
+    };
+  }
+
+  private nextTool(messages: BaseMessage[]): string | undefined {
+    const transcript = messagesToPlannerText(messages);
+    const workflowOrder = preferredToolOrder(this.agentName, transcript).filter((toolName) =>
+      this.toolNames.includes(toolName)
+    );
+    for (const candidate of workflowOrder) {
+      if (!toolHasRun(candidate, messages, transcript)) {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+}
+
+class ZeroGToolPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
+  private readonly toolNames: string[];
+
+  constructor(
+    private readonly agentName: VoicesAgentName,
+    private readonly compute: AgentCompute,
+    toolNames: string[] = []
+  ) {
+    super({});
+    this.toolNames = toolNames;
+  }
+
+  _llmType(): string {
+    return "0g-compute-tool-planner";
+  }
+
+  _combineLLMOutput(): never[] {
+    return [];
+  }
+
+  bindTools(tools: Array<{ name?: string }>): ZeroGToolPlannerModel {
+    return new ZeroGToolPlannerModel(
+      this.agentName,
+      this.compute,
+      tools.map((candidate) => candidate.name).filter((name): name is string => typeof name === "string")
+    );
+  }
+
+  async _generate(messages: BaseMessage[]): Promise<ChatResult> {
+    const unusedTools = this.toolNames.filter(
+      (toolName) => !messages.some((message) => isToolMessage(message) && message.name === toolName)
+    );
+    if (unusedTools.length === 0) {
+      return toChatResult(new AIMessage({ content: `${this.agentName} completed its current step.` }));
+    }
+
+    const result = await this.compute.chat(
+      [
+        {
+          role: "system",
+          content: [
+            "You are selecting the next LangGraph ReAct tool call.",
+            "Return only JSON. Use this schema: {\"tool\":\"tool_name_or_final\",\"args\":{},\"final\":\"optional final response\"}.",
+            "Only choose a tool from the available tool list. Choose final only when the current step is complete.",
+            `Agent: ${this.agentName}`,
+            `Available tools: ${JSON.stringify(unusedTools)}`
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: messagesToPlannerText(messages)
+        }
+      ],
+      { maxRetries: 1, maxTokens: 220 }
+    );
+
+    const decision = parsePlannerDecision(result.content);
+    if (decision.tool && unusedTools.includes(decision.tool)) {
+      return toChatResult(
+        new AIMessage({
+          content: `${this.agentName} chose ${decision.tool}.`,
+          tool_calls: [
+            {
+              id: `${this.agentName}_${Date.now()}`,
+              name: decision.tool,
+              args: decision.args ?? {},
+              type: "tool_call"
+            }
+          ]
+        })
+      );
+    }
+
+    return toChatResult(new AIMessage({ content: decision.final || result.content || `${this.agentName} completed.` }));
+  }
+}
+
+function createPlannerModel(agentName: VoicesAgentName, compute: AgentCompute): BaseChatModel {
+  const plannerMode = process.env.AGENT_LANGGRAPH_PLANNER_MODE;
+  const useZeroGPlanner = plannerMode === "0g";
+  return useZeroGPlanner ? new ZeroGToolPlannerModel(agentName, compute) : new VoicesPlannerModel(agentName);
+}
+
+function preferredToolOrder(agentName: VoicesAgentName, transcript: string): string[] {
+  if (agentName === "style_curator") {
+    if (transcript.includes("feedback.received")) {
+      return ["refine_profile_from_feedback"];
+    }
+    return ["verify_attestation", "encrypt_and_store_samples", "extract_style_profile", "mint_inft"];
+  }
+
+  if (agentName === "content_creator") {
+    return [
+      "check_credit_balance",
+      "read_style_profile",
+      "pull_relevant_samples",
+      "generate_with_voice",
+      "log_draft",
+      "handoff_to_distribution"
+    ];
+  }
+
+  if (transcript.includes("credit.low")) {
+    return ["check_credit_balance", "topup_credits_via_keeper"];
+  }
+
+  return ["tune_for_platform", "check_credit_balance", "deduct_credit_via_keeper", "deposit_royalty_via_keeper"];
+}
+
+function toolHasRun(toolName: string, messages: BaseMessage[], transcript: string): boolean {
+  if (messages.some((message) => isToolMessage(message) && message.name === toolName)) {
+    return true;
+  }
+
+  const markers: Record<string, string[]> = {
+    verify_attestation: ["Creator attestation verified", "Attestation rejected"],
+    encrypt_and_store_samples: ["Encrypted samples stored", "Sample storage failed"],
+    extract_style_profile: ["Structured style profile extracted", "Style extraction failed"],
+    mint_inft: ["Mint intent prepared", "Mint intent failed"],
+    refine_profile_from_feedback: ["refined from feedback", "refinement skipped", "Feedback was not specific"],
+    check_credit_balance: ["generation credit", "No credits available", "Settlement check sees"],
+    read_style_profile: ["Loaded style profile", "is no longer listed"],
+    pull_relevant_samples: ["voice example"],
+    generate_with_voice: ["Draft generated", "Generation failed"],
+    log_draft: ["generation.drafted emitted"],
+    handoff_to_distribution: ["Handing off style"],
+    tune_for_platform: ["Platform variants created"],
+    deduct_credit_via_keeper: ["Credit spend submitted", "Credit spend intent prepared"],
+    deposit_royalty_via_keeper: ["Royalty settlement"],
+    topup_credits_via_keeper: ["Auto-top-up"],
+    handoff_to_content_creator: ["Handing off to Content Creator"],
+    handoff_to_curator: ["Handing feedback context back"]
+  };
+
+  return (markers[toolName] ?? []).some((marker) => transcript.includes(marker));
+}
+
+function toChatResult(message: AIMessage): ChatResult {
+  return {
+    generations: [
+      {
+        text: typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+        message
+      }
+    ]
+  };
+}
+
+function messagesToPlannerText(messages: BaseMessage[]): string {
+  return messages
+    .slice(-10)
+    .map((message) => {
+      const name = "name" in message && typeof message.name === "string" ? `${message.name}: ` : "";
+      const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+      return `${message.getType()} ${name}${content}`;
+    })
+    .join("\n\n");
+}
+
+function agentFromStreamChunk(chunk: unknown, fallback: VoicesAgentName): VoicesAgentName {
+  const keys = objectKeys(chunk);
+  if (keys.includes("style_curator")) {
+    return "style_curator";
+  }
+  if (keys.includes("content_creator")) {
+    return "content_creator";
+  }
+  if (keys.includes("distribution_mgr")) {
+    return "distribution_mgr";
+  }
+  return fallback;
+}
+
+function streamSummary(chunk: unknown, step: number): string {
+  const keys = objectKeys(chunk);
+  if (keys.length > 0) {
+    return `LangGraph streamed update ${step} from ${keys.join(", ")}. Click to inspect raw state.`;
+  }
+  return `LangGraph streamed update ${step}. Click to inspect raw state.`;
+}
+
+function objectKeys(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+  return Object.keys(value as Record<string, unknown>);
+}
+
+function toLoggable(value: unknown, maxChars: number): unknown {
+  try {
+    const serialized = JSON.stringify(value, (_key, candidate) => {
+      if (typeof candidate === "bigint") {
+        return candidate.toString();
+      }
+      if (candidate instanceof Error) {
+        return { name: candidate.name, message: candidate.message, stack: candidate.stack };
+      }
+      if (typeof candidate === "function") {
+        return `[function ${candidate.name || "anonymous"}]`;
+      }
+      return candidate;
+    });
+    if (!serialized) {
+      return null;
+    }
+    if (serialized.length > maxChars) {
+      return {
+        truncated: true,
+        originalCharacters: serialized.length,
+        preview: serialized.slice(0, maxChars)
+      };
+    }
+    return JSON.parse(serialized) as unknown;
+  } catch (error) {
+    return { unserializable: true, value: String(value), error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function parsePlannerDecision(content: string): { tool?: string; args?: Record<string, unknown>; final?: string } {
+  try {
+    const parsed = JSON.parse(extractFirstJsonObject(stripCodeFence(content))) as Record<string, unknown>;
+    return {
+      tool: typeof parsed.tool === "string" ? parsed.tool : undefined,
+      args: recordValue(parsed.args),
+      final: typeof parsed.final === "string" ? parsed.final : undefined
+    };
+  } catch {
+    return { final: content };
+  }
+}
+
+const STYLE_CURATOR_PROMPT = [
+  "You are the Style Curator agent for Voices on 0G.",
+  "Verify creator attestation before any style work. When samples are insufficient or attestation is invalid, stop with a clear error.",
+  "Use tools for deterministic crypto checks, encrypted 0G Storage writes, 0G Compute style extraction, profile refinement, and mint intent preparation.",
+  "Do not call the Content Creator directly. State transitions and handoffs happen through LangGraph state and Command objects."
+].join("\n");
+
+const CONTENT_CREATOR_PROMPT = [
+  "You are the Content Creator agent for Voices on 0G.",
+  "Read the style profile, choose relevant sample excerpts, generate a fresh draft with 0G Compute, and never invent facts not supplied by the user.",
+  "After a draft is ready, hand off to the Distribution Manager through LangGraph Command routing."
+].join("\n");
+
+const DISTRIBUTION_MANAGER_PROMPT = [
+  "You are the Distribution Manager agent for Voices on 0G.",
+  "Tune drafts for X, LinkedIn, and Instagram in one 0G Compute call where possible.",
+  "Prepare user-mediated CreditSystem.spendCredit settlement intents without pretending a wallet signature happened.",
+  "KeeperHub is only for autonomous execution: when credit.low arrives, read the on-chain autoRefill config and call topup_credits_via_keeper only when enabled, balance is at or below threshold, and budget remains.",
+  "Never call KeeperHub for normal MetaMask settlement. Do call KeeperHub for permissionless CreditSystem.refillFromAllowance so the agent can refill credits without a user click."
+].join("\n");
+
+function agentLabel(agent: VoicesAgentName): string {
+  if (agent === "style_curator") {
+    return "Style Curator";
+  }
+  if (agent === "content_creator") {
+    return "Content Creator";
+  }
+  return "Distribution Manager";
+}
+
+function activeAgentForEvent(event: AgentEvent): VoicesAgentName {
+  if (event.type === "generation.requested") {
+    return "content_creator";
+  }
+  if (event.type === "credit.low") {
+    return "distribution_mgr";
+  }
+  return "style_curator";
+}
+
+function workflowKindForEvent(event: AgentEvent): VoicesWorkflowKind {
+  if (event.type === "generation.requested") {
+    return "generation";
+  }
+  if (event.type === "feedback.received") {
+    return "feedback_refinement";
+  }
+  if (event.type === "credit.low") {
+    return "credit_low";
+  }
+  return "style_upload";
+}
+
+function initialStateFromEvent(event: AgentEvent, activeAgent: VoicesAgentName): Partial<VoicesSwarmStateValue> {
+  const requestId = requestIdFromEvent(event) ?? event.id;
+  return {
+    messages: [new HumanMessage({ content: `${event.type}: ${event.id}` })],
+    activeAgent,
+    workflowKind: workflowKindForEvent(event),
+    incomingEvent: event,
+    requestId,
+    currentStyleId: event.styleId ?? stringValue(event.payload.styleId, undefined),
+    pendingStyleId: undefined,
+    consumerAddress: event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
+    creatorAddress: event.type === "style.uploaded" ? event.actor : undefined,
+    prompt: stringValue(event.payload.prompt, undefined),
+    targetPlatforms: arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
+    draftText: stringValue(event.payload.draft, undefined),
+    lastEventType: event.type,
+    lastError: undefined
+  };
+}
+
+function requireIncomingEvent(state: VoicesSwarmStateValue): AgentEvent {
+  if (!state.incomingEvent) {
+    throw new Error("LangGraph state is missing incomingEvent");
+  }
+  return state.incomingEvent;
+}
+
+function validateAttestation(actor: string, message: string, signature: string): void {
+  if (!message || !signature) {
+    throw new Error("Missing wallet-signed attestation");
+  }
+  const recovered = ethers.verifyMessage(message, signature);
+  if (recovered.toLowerCase() !== actor.toLowerCase()) {
+    throw new Error("Attestation signature does not match creator wallet");
+  }
+}
+
+function validateSamples(samples: string[]): void {
+  const text = samples.join("\n");
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes < MIN_SAMPLE_BYTES) {
+    throw new Error("Writing sample must be at least 1KB of text");
+  }
+  if (bytes > MAX_SAMPLE_BYTES) {
+    throw new Error("Writing sample must be under 1MB of text");
+  }
+  const lower = text.toLowerCase();
+  if (DENYLIST.some((author) => lower.includes(author))) {
+    throw new Error("Sample matches a known-author denylist entry");
+  }
+}
+
+function parseTaggedJson(content: string, tag: string): Record<string, unknown> {
+  const cleaned = stripCodeFence(content);
+  const tagged = matchTaggedContent(cleaned, tag);
+  const candidate = extractFirstJsonObject(stripCodeFence(tagged ?? cleaned));
+
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Tagged response was not a JSON object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    const snippet = cleaned.replace(/\s+/g, " ").slice(0, 240);
+    const reason = error instanceof Error ? error.message : "unknown parse error";
+    throw new Error(`Could not parse ${tag} JSON from 0G Compute response: ${reason}. Response starts: ${snippet}`);
+  }
+}
+
+function parseVariants(content: string, draft: string, platforms: string[]): Record<string, string> {
+  try {
+    const parsed = JSON.parse(extractFirstJsonObject(stripCodeFence(content))) as Record<string, string>;
+    return Object.fromEntries(
+      platforms.map((platform) => [
+        platform,
+        enforcePlatformLimit(guardVariant(parsed[platform] ?? tuneFallback(draft, platform), draft, platform), platform)
+      ])
+    );
+  } catch {
+    return Object.fromEntries(platforms.map((platform) => [platform, tuneFallback(draft, platform)]));
+  }
+}
+
+const SAMPLE_BLEED_TERMS = [
+  "agent demo",
+  "agent workflow",
+  "workflow trail",
+  "style profile",
+  "profile hash",
+  "encrypted sample",
+  "encrypted samples",
+  "0g",
+  "inft",
+  "wallet",
+  "transaction",
+  "settlement",
+  "royalty",
+  "credit spend",
+  "event log",
+  "event trail",
+  "langgraph",
+  "keeperhub",
+  "creditsystem"
+];
+
+function guardGeneratedDraft(draft: string, prompt: string, styleProfile: unknown): string {
+  const cleaned = draft.trim();
+  if (!cleaned) {
+    return fallbackVoiceDraft(prompt, styleProfile);
+  }
+  if (leaksSampleMatter(cleaned, prompt) || hasUnsupportedPrecision(cleaned, prompt) || containsMetaInstruction(cleaned)) {
+    return fallbackVoiceDraft(prompt, styleProfile);
+  }
+  return cleaned;
+}
+
+function guardVariant(variant: string, draft: string, platform: string): string {
+  const cleaned = variant.trim();
+  if (!cleaned || leaksSampleMatter(cleaned, draft) || hasUnsupportedPrecision(cleaned, draft) || containsMetaInstruction(cleaned) || hasUnsupportedHashtags(cleaned, draft)) {
+    return tuneFallback(draft, platform);
+  }
+  return cleaned;
+}
+
+function leaksSampleMatter(text: string, allowedContext: string): boolean {
+  const lowerText = text.toLowerCase();
+  const lowerAllowed = allowedContext.toLowerCase();
+  return SAMPLE_BLEED_TERMS.some((term) => lowerText.includes(term) && !lowerAllowed.includes(term));
+}
+
+function hasUnsupportedPrecision(text: string, allowedContext: string): boolean {
+  const lowerAllowed = allowedContext.toLowerCase();
+  if (/[#$€£]\s?\d/.test(text) && !/[#$€£]\s?\d/.test(allowedContext)) {
+    return true;
+  }
+  if (/\b\d+(?:\.\d+)?\s*(?:billion|million|trillion|percent|%)\b/i.test(text) && !/\b\d+(?:\.\d+)?\s*(?:billion|million|trillion|percent|%)\b/i.test(allowedContext)) {
+    return true;
+  }
+  return /\b(?:according to|reportedly|sources say|it is widely reported)\b/i.test(text) && !/\b(?:according to|reportedly|sources say|widely reported)\b/i.test(lowerAllowed);
+}
+
+function containsMetaInstruction(text: string): boolean {
+  return /\b(?:the voice should|voice should|style should|draft turns|output should|write in the voice|keep the claim careful)\b/i.test(text);
+}
+
+function hasUnsupportedHashtags(text: string, allowedContext: string): boolean {
+  return /#[\p{L}\p{N}_]+/u.test(text) && !/#[\p{L}\p{N}_]+/u.test(allowedContext);
+}
+
+function fallbackVoiceDraft(prompt: string, styleProfile: unknown): string {
+  const subject = normalizePromptSubject(prompt);
+  const profile = recordValue(styleProfile);
+  const tone = recordValue(profile.tone);
+  const primaryTone = stringValue(tone.primary, "clear");
+  const voiceEssence = stringValue(profile.voice_essence, stringValue(profile.voiceEssence, ""));
+  const finalBeat = voiceEssence || primaryTone
+    ? "No fake precision, no invented motives, no pretending the consequences are settled."
+    : "No fake precision. No invented motives. No pretending the consequences are settled.";
+
+  return [
+    `${subject} is bigger than the headline. The useful question is what changed, who had to react, and which assumptions stopped being safe.`,
+    "The concrete part matters most: ownership changed, incentives shifted, and people who depended on the platform had to re-check what they could trust.",
+    `${finalBeat} Say the visible mechanism plainly, then stop before speculation starts sounding like evidence.`
+  ].join("\n\n");
+}
+
+function normalizePromptSubject(prompt: string): string {
+  const stripped = prompt
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(write|draft|create|make)\s+(me\s+)?(a\s+|an\s+)?(post|tweet|thread|caption|linkedin post|article)?\s*(about|on|for)?\s*/i, "")
+    .replace(/^about\s+/i, "")
+    .replace(/[.?!]+$/, "")
+    .trim();
+  const normalized = rephraseHowSubject(stripped)
+    .replace(/\belon\s+(?:much|mush|musk)\b/gi, "Elon Musk")
+    .replace(/\bthe\s+x\b/gi, "X")
+    .replace(/\bx\b/gi, "X")
+    .replace(/\belon\s+mush\b/gi, "Elon Musk")
+    .replace(/\belon\s+musk\b/gi, "Elon Musk")
+    .replace(/\bthe\s+twitter\b/gi, "Twitter")
+    .replace(/\btwitter\b/gi, "Twitter");
+  const subject = normalized || "This topic";
+  return subject.charAt(0).toUpperCase() + subject.slice(1);
+}
+
+function rephraseHowSubject(input: string): string {
+  const match = input.match(/^how\s+(.+?)\s+(bought|acquired)\s+(.+)$/i);
+  if (!match) {
+    return input;
+  }
+  return `${match[1]} ${match[2].toLowerCase() === "acquired" ? "acquiring" : "buying"} ${match[3]}`;
+}
+
+function matchTaggedContent(content: string, tag: string): string | undefined {
+  const pattern = new RegExp(`<\\s*${tag}\\b[^>]*>([\\s\\S]*?)<\\s*\\/\\s*${tag}\\s*>`, "i");
+  return content.match(pattern)?.[1]?.trim();
+}
+
+function extractTagged(content: string, tag: string): string {
+  const cleaned = stripCodeFence(content);
+  const match = cleaned.match(new RegExp(`<\\s*${tag}\\b[^>]*>([\\s\\S]*?)<\\s*\\/\\s*${tag}\\s*>`, "i"));
+  return stripCodeFence(match?.[1] ?? cleaned).trim();
+}
+
+function stripCodeFence(content: string): string {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json|xml|text)?\s*([\s\S]*?)\s*```$/i);
+  return (fenced?.[1] ?? trimmed).trim();
+}
+
+function extractFirstJsonObject(content: string): string {
+  const start = content.indexOf("{");
+  if (start === -1) {
+    return content.trim();
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return content.slice(start, index + 1).trim();
+      }
+    }
+  }
+
+  return content.slice(start).trim();
+}
+
+function normalizeSampleExcerpts(profile: Record<string, unknown>, samples: string[]): string[] {
+  const fromProfile = stringArray(profile.sample_excerpts).concat(stringArray(profile.sampleExcerpts));
+  if (fromProfile.length > 0) {
+    return fromProfile.slice(0, 5);
+  }
+  return samples
+    .map((sample) => sample.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .map((sample) => sample.slice(0, 240));
+}
+
+function budgetSamplesForExtraction(samples: string[]): string[] {
+  const budget = Number(process.env.OG_AGENT_STYLE_SAMPLE_CHAR_BUDGET ?? DEFAULT_STYLE_SAMPLE_CHAR_BUDGET);
+  const safeBudget = Number.isFinite(budget) && budget > 1_000 ? budget : DEFAULT_STYLE_SAMPLE_CHAR_BUDGET;
+  const normalized = samples.map((sample) => sample.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const chunkBudget = Math.max(800, Math.floor(safeBudget / Math.min(normalized.length || 1, 8)));
+  const chunks: string[] = [];
+
+  for (const sample of normalized) {
+    if (chunks.join("").length >= safeBudget || chunks.length >= 8) {
+      break;
+    }
+    chunks.push(sample.slice(0, chunkBudget));
+  }
+
+  return chunks.length > 0 ? chunks : samples.slice(0, 1);
+}
+
+function isMeaningfulFeedback(feedback: string, payload: Record<string, unknown>): boolean {
+  if (feedback.trim().length >= 20) {
+    return true;
+  }
+  return Boolean(payload.editedDraft || payload.rejected || payload.rating === "negative");
+}
+
+function feedbackText(payload: Record<string, unknown>): string {
+  return [
+    stringValue(payload.feedback, ""),
+    stringValue(payload.editSummary, ""),
+    stringValue(payload.rejectionReason, ""),
+    stringValue(payload.editedDraft, "")
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function tuneFallback(draft: string, platform: string): string {
+  const cleaned = draft.replace(/\s+/g, " ").trim();
+  if (platform === "x") {
+    return truncate(cleaned, 280);
+  }
+  if (platform === "instagram") {
+    return cleaned;
+  }
+  return cleaned;
+}
+
+function enforcePlatformLimit(value: string, platform: string): string {
+  const cleaned = value.trim();
+  if (platform === "x") {
+    return truncate(cleaned, 280);
+  }
+  if (platform === "linkedin") {
+    return truncate(cleaned, 900);
+  }
+  return cleaned;
+}
+
+function truncate(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  const sliced = value.slice(0, Math.max(0, maxLength - 1)).trimEnd();
+  const lastSpace = sliced.lastIndexOf(" ");
+  const compact = lastSpace > 120 ? sliced.slice(0, lastSpace) : sliced;
+  return `${compact.replace(/[.,;:!?-]+$/, "")}…`;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function stringValue(value: unknown, fallback: string): string;
+function stringValue(value: unknown, fallback: undefined): string | undefined;
+function stringValue(value: unknown, fallback: string | undefined): string | undefined {
+  return typeof value === "string" ? value : fallback;
+}
+
+function arrayValue(value: unknown, fallback: string[]): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : fallback;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function stringifyAutoRefillConfig(config: {
+  maxBudget: bigint;
+  spent: bigint;
+  threshold: bigint;
+  perRefill: bigint;
+  enabled: boolean;
+  supported: boolean;
+}): Record<string, string | boolean> {
+  return {
+    maxBudget: config.maxBudget.toString(),
+    spent: config.spent.toString(),
+    threshold: config.threshold.toString(),
+    perRefill: config.perRefill.toString(),
+    enabled: config.enabled,
+    supported: config.supported
+  };
+}

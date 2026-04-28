@@ -8,6 +8,9 @@
     "test": "pnpm --filter contracts test",
     "deploy:0g": "pnpm --filter contracts deploy:0g",
     "mint:0g": "pnpm --filter contracts mint:0g",
+    "backend:mock": "pnpm --filter backend start:mock",
+    "frontend:dev": "BACKEND_URL=http://127.0.0.1:4317 pnpm --filter frontend exec next dev -p 3000",
+    "smoke:agents": "pnpm --filter backend smoke:agents",
     "storage:hello": "pnpm --filter backend storage:hello",
     "compute:hello": "pnpm --filter backend compute:hello"
   }
