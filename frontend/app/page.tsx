@@ -155,7 +155,7 @@ export default function Page() {
           </div>
         </section>
 
-        <section className="creatorStripSection" id="creators">
+        <section className="creatorStripSection" aria-label="Featured creator styles">
           <div className="container">
             <div className="creatorStrip" aria-label="Featured creator styles">
               <div className="creatorTrack">
@@ -241,7 +241,7 @@ export default function Page() {
           </div>
         </section>
 
-        <section className="section" id="creators">
+        <section className="section marketplaceSection" id="creators">
           <div className="container">
             <div className="kicker">Marketplace</div>
             <h2 className="sectionTitle">Creators you can license</h2>
@@ -364,4 +364,3 @@ export default function Page() {
     </div>
   );
 }
-

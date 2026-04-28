@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Alegreya, DM_Sans, Instrument_Serif } from "next/font/google";
+import { DM_Sans, Instrument_Serif } from "next/font/google";
 import "./globals.css";
 
 const dmSans = DM_Sans({
@@ -14,12 +14,6 @@ const instrumentSerif = Instrument_Serif({
   variable: "--font-display",
 });
 
-const alegreya = Alegreya({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700", "800"],
-  variable: "--font-head",
-});
-
 export const metadata: Metadata = {
   title: "Voices — Marketplace for Writing Styles",
   description:
@@ -32,10 +26,9 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className={`${dmSans.variable} ${instrumentSerif.variable} ${alegreya.variable}`}>
+      <body className={`${dmSans.variable} ${instrumentSerif.variable}`}>
         {children}
       </body>
     </html>
   );
 }
-
