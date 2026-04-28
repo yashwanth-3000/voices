@@ -22,11 +22,25 @@ export type TransactionIntent = {
   description: string;
 };
 
+export type ContractCallInput = {
+  contractAddress: string;
+  network?: string;
+  chainId?: number;
+  functionName: string;
+  functionArgs?: unknown[];
+  abi?: string;
+  value?: string;
+  gasLimitMultiplier?: string;
+  description: string;
+};
+
 export type KeeperHubResult = {
   status: "confirmed" | "pending_keeperhub" | "failed";
   workflowId?: string;
   txHash?: string;
+  blockExplorerUrl?: string;
   reason?: string;
+  raw?: unknown;
 };
 
 export type StyleInfo = {
@@ -41,6 +55,15 @@ export type StyleInfo = {
   genres: string;
   attestationURI: string;
   metadataHash: string;
+};
+
+export type AutoRefillConfig = {
+  maxBudget: bigint;
+  spent: bigint;
+  threshold: bigint;
+  perRefill: bigint;
+  enabled: boolean;
+  supported: boolean;
 };
 
 export type MintStyleInput = {
@@ -75,15 +98,25 @@ export interface AgentCompute {
 export interface AgentChain {
   mintStyleIntent(input: MintStyleInput): TransactionIntent;
   buyCreditsIntent(amount: bigint): Promise<TransactionIntent>;
+  setAutoRefillIntent(input: {
+    consumerAddress: string;
+    maxBudget: bigint;
+    threshold: bigint;
+    perRefill: bigint;
+  }): Promise<TransactionIntent>;
   spendCreditIntent(tokenId: string): TransactionIntent;
+  refillFromAllowanceCall(consumerAddress: string): ContractCallInput;
   creditPrice(): Promise<bigint>;
   credits(address: string): Promise<bigint>;
+  autoRefillOf(address: string): Promise<AutoRefillConfig>;
   styleOf(tokenId: string): Promise<StyleInfo>;
   creatorOf(tokenId: string): Promise<string>;
   royaltyOf(tokenId: string): Promise<bigint>;
 }
 
 export interface KeeperHubClient {
+  isChainSupported(chainId: number): Promise<{ supported: boolean; network?: string; supportedChains?: string[]; reason?: string }>;
+  executeContractCall(input: ContractCallInput): Promise<KeeperHubResult>;
   executeTransaction(intent: TransactionIntent): Promise<KeeperHubResult>;
   pollWorkflow(workflowId: string): Promise<KeeperHubResult>;
 }

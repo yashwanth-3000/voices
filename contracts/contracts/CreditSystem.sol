@@ -13,6 +13,14 @@ interface IRoyaltyVault {
 }
 
 contract CreditSystem is Ownable {
+    struct AutoRefillConfig {
+        uint256 maxBudget;
+        uint256 spent;
+        uint256 threshold;
+        uint256 perRefill;
+        bool enabled;
+    }
+
     IRoyaltyVault public royaltyVault;
     IStyleRegistryForCredits public styleRegistry;
     uint256 public creditPriceWei;
@@ -20,9 +28,18 @@ contract CreditSystem is Ownable {
     mapping(address => uint256) public credits;
     mapping(address => uint256) public lifetimeCreditsPurchased;
     mapping(address => uint256) public lifetimeCreditsSpent;
+    mapping(address => AutoRefillConfig) public autoRefill;
 
     event CreditsPurchased(address indexed buyer, uint256 credits, uint256 paid);
     event CreditSpent(address indexed user, uint256 indexed tokenId, address indexed creator, uint256 royaltyWei);
+    event AutoRefillConfigured(
+        address indexed consumer,
+        uint256 maxBudget,
+        uint256 threshold,
+        uint256 perRefill,
+        uint256 newlyFunded
+    );
+    event AutoRefillTriggered(address indexed consumer, uint256 creditsAdded, uint256 costWei, uint256 newBalance);
     event CreditPriceUpdated(uint256 creditPriceWei);
     event ContractsUpdated(address royaltyVault, address styleRegistry);
 
@@ -32,6 +49,12 @@ contract CreditSystem is Ownable {
     error InsufficientCredits();
     error RoyaltyExceedsBacking();
     error RefundFailed();
+    error InvalidAutoRefillConfig();
+    error AutoRefillFundingMismatch();
+    error AutoRefillBudgetCannotDecrease();
+    error AutoRefillDisabled();
+    error AutoRefillThresholdNotMet();
+    error AutoRefillBudgetExhausted();
 
     constructor(
         address royaltyVaultAddress,
@@ -60,6 +83,49 @@ contract CreditSystem is Ownable {
         }
 
         emit CreditsPurchased(msg.sender, amount, cost);
+    }
+
+    function setAutoRefill(uint256 maxBudget, uint256 threshold, uint256 perRefill) external payable {
+        if (maxBudget == 0 || perRefill == 0) revert InvalidAutoRefillConfig();
+
+        AutoRefillConfig storage config = autoRefill[msg.sender];
+        if (maxBudget < config.maxBudget) revert AutoRefillBudgetCannotDecrease();
+        if (maxBudget != config.maxBudget + msg.value) revert AutoRefillFundingMismatch();
+        if (maxBudget < config.spent + (perRefill * creditPriceWei)) revert InvalidAutoRefillConfig();
+
+        config.maxBudget = maxBudget;
+        config.threshold = threshold;
+        config.perRefill = perRefill;
+        config.enabled = true;
+
+        emit AutoRefillConfigured(msg.sender, maxBudget, threshold, perRefill, msg.value);
+    }
+
+    function disableAutoRefill() external {
+        autoRefill[msg.sender].enabled = false;
+        emit AutoRefillConfigured(
+            msg.sender,
+            autoRefill[msg.sender].maxBudget,
+            autoRefill[msg.sender].threshold,
+            autoRefill[msg.sender].perRefill,
+            0
+        );
+    }
+
+    function refillFromAllowance(address consumer) external {
+        AutoRefillConfig storage config = autoRefill[consumer];
+        if (!config.enabled) revert AutoRefillDisabled();
+        if (credits[consumer] > config.threshold) revert AutoRefillThresholdNotMet();
+
+        uint256 cost = config.perRefill * creditPriceWei;
+        if (config.spent + cost > config.maxBudget) revert AutoRefillBudgetExhausted();
+
+        config.spent += cost;
+        credits[consumer] += config.perRefill;
+        lifetimeCreditsPurchased[consumer] += config.perRefill;
+
+        emit CreditsPurchased(consumer, config.perRefill, cost);
+        emit AutoRefillTriggered(consumer, config.perRefill, cost, credits[consumer]);
     }
 
     function spendCredit(uint256 tokenId) external {

@@ -12,6 +12,7 @@
     "smoke:agents": "AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx src/smoke-agents.ts",
     "storage:hello": "tsx src/storage-hello.ts",
     "compute:hello": "tsx src/compute-hello.ts",
+    "keeperhub:hello": "tsx src/keeperhub-hello.ts",
     "test": "tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },

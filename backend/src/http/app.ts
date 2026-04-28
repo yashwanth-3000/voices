@@ -24,6 +24,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get("/admin/health", async () => ({
     status: "ok",
     runtime: runtimeModes(),
+    keeperhub: await keeperHubStatus(orchestrator),
     orchestrator: orchestrator.status()
   }));
 
@@ -99,15 +100,30 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   app.get("/credits/:address", async (request) => {
     const params = request.params as { address: string };
-    const [credits, creditPriceWei] = await Promise.all([
+    const [credits, creditPriceWei, autoRefill] = await Promise.all([
       orchestrator.chain.credits(params.address),
-      orchestrator.chain.creditPrice()
+      orchestrator.chain.creditPrice(),
+      orchestrator.chain.autoRefillOf(params.address)
     ]);
     return {
       address: params.address,
       credits: credits.toString(),
-      creditPriceWei: creditPriceWei.toString()
+      creditPriceWei: creditPriceWei.toString(),
+      autoRefill: {
+        maxBudget: autoRefill.maxBudget.toString(),
+        spent: autoRefill.spent.toString(),
+        remainingBudget: (autoRefill.maxBudget > autoRefill.spent ? autoRefill.maxBudget - autoRefill.spent : 0n).toString(),
+        threshold: autoRefill.threshold.toString(),
+        perRefill: autoRefill.perRefill.toString(),
+        enabled: autoRefill.enabled,
+        supported: autoRefill.supported
+      }
     };
+  });
+
+  app.get("/keeperhub/chains", async () => {
+    const chainId = Number(process.env.KEEPERHUB_CHAIN_ID || process.env.OG_CHAIN_ID || 16602);
+    return orchestrator.keeperhub.isChainSupported(chainId);
   });
 
   app.post("/credits/buy-intent", async (request, reply) => {
@@ -138,6 +154,59 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       actor: "system",
       consumerAddress: walletAddress,
       payload: { requestId, amount, txHash, explorerUrl: explorerTxUrl(txHash), status: "confirmed_onchain" }
+    });
+    return reply.send({ ok: true, eventId: event.id });
+  });
+
+  app.post("/credits/auto-refill-intent", async (request, reply) => {
+    const body = asRecord(request.body);
+    const walletAddress = requireString(body.walletAddress, "walletAddress");
+    const maxBudget = BigInt(requireString(body.maxBudgetWei, "maxBudgetWei"));
+    const threshold = BigInt(requireString(body.threshold, "threshold"));
+    const perRefill = BigInt(requireString(body.perRefill, "perRefill"));
+    const requestId = typeof body.requestId === "string" ? body.requestId : createUlid();
+    const intent = await orchestrator.chain.setAutoRefillIntent({
+      consumerAddress: walletAddress,
+      maxBudget,
+      threshold,
+      perRefill
+    });
+    await orchestrator.publish({
+      id: `${requestId}:credit.auto_refill.intent.created`,
+      type: "credit.auto_refill.intent.created",
+      actor: "system",
+      consumerAddress: walletAddress,
+      payload: { requestId, maxBudgetWei: maxBudget.toString(), threshold: threshold.toString(), perRefill: perRefill.toString(), intent }
+    });
+    return reply.code(202).send({ requestId, intent });
+  });
+
+  app.post("/credits/confirm-auto-refill", async (request, reply) => {
+    const body = asRecord(request.body);
+    const requestId = requireString(body.requestId, "requestId");
+    const walletAddress = requireString(body.walletAddress, "walletAddress");
+    const txHash = requireString(body.txHash, "txHash");
+    const config = await orchestrator.chain.autoRefillOf(walletAddress);
+    const event = await orchestrator.publish({
+      id: `${requestId}:credit.auto_refill.configured:${txHash}`,
+      type: "credit.auto_refill.configured",
+      actor: "system",
+      consumerAddress: walletAddress,
+      payload: {
+        requestId,
+        txHash,
+        explorerUrl: explorerTxUrl(txHash),
+        status: "confirmed_onchain",
+        autoRefill: {
+          maxBudget: config.maxBudget.toString(),
+          spent: config.spent.toString(),
+          remainingBudget: (config.maxBudget > config.spent ? config.maxBudget - config.spent : 0n).toString(),
+          threshold: config.threshold.toString(),
+          perRefill: config.perRefill.toString(),
+          enabled: config.enabled,
+          supported: config.supported
+        }
+      }
     });
     return reply.send({ ok: true, eventId: event.id });
   });
@@ -205,6 +274,34 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       consumerAddress: walletAddress,
       payload: { requestId, txHash, explorerUrl: explorerTxUrl(txHash), status: "confirmed_onchain" }
     });
+    const [credits, autoRefill] = await Promise.all([
+      orchestrator.chain.credits(walletAddress),
+      orchestrator.chain.autoRefillOf(walletAddress)
+    ]);
+    if (autoRefill.enabled && credits <= autoRefill.threshold) {
+      await orchestrator.publish({
+        id: `${requestId}:credit.low:auto-refill:${txHash}`,
+        type: "credit.low",
+        actor: "system",
+        styleId,
+        consumerAddress: walletAddress,
+        payload: {
+          requestId,
+          reason: "post_settlement_threshold",
+          credits: credits.toString(),
+          threshold: autoRefill.threshold.toString(),
+          autoRefill: {
+            maxBudget: autoRefill.maxBudget.toString(),
+            spent: autoRefill.spent.toString(),
+            remainingBudget: (autoRefill.maxBudget > autoRefill.spent ? autoRefill.maxBudget - autoRefill.spent : 0n).toString(),
+            threshold: autoRefill.threshold.toString(),
+            perRefill: autoRefill.perRefill.toString(),
+            enabled: autoRefill.enabled,
+            supported: autoRefill.supported
+          }
+        }
+      });
+    }
     return reply.send({ ok: true, eventId: event.id });
   });
 
@@ -220,12 +317,17 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
       "X-Accel-Buffering": "no"
     });
+    raw.write(`: connected ${Date.now()}\n\n`);
 
     const send = (event: unknown) => {
       raw.write(`data: ${JSON.stringify(event)}\n\n`);
     };
+    const heartbeat = setInterval(() => {
+      raw.write(`: keepalive ${Date.now()}\n\n`);
+    }, 15_000);
     for (const event of orchestrator.eventsForRequest(params.requestId)) {
       send(event);
     }
@@ -234,7 +336,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         send(event);
       }
     });
-    request.raw.on("close", unsubscribe);
+    request.raw.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
   });
 
   return app;
@@ -281,4 +386,13 @@ function runtimeModes() {
 function explorerTxUrl(txHash: string): string {
   const explorer = process.env.OG_EXPLORER_URL?.replace(/\/$/, "") ?? "https://chainscan-galileo.0g.ai";
   return `${explorer}/tx/${txHash}`;
+}
+
+async function keeperHubStatus(orchestrator: Orchestrator) {
+  const chainId = Number(process.env.KEEPERHUB_CHAIN_ID || process.env.OG_CHAIN_ID || 16602);
+  try {
+    return await orchestrator.keeperhub.isChainSupported(chainId);
+  } catch (error) {
+    return { supported: false, chainId, reason: error instanceof Error ? error.message : String(error) };
+  }
 }

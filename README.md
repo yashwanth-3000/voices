@@ -88,3 +88,27 @@ pnpm --filter backend typecheck
 pnpm --filter backend test
 pnpm --filter backend start:mock
 ```
+
+## KeeperHub auto-refill path
+
+KeeperHub is now reserved for the part of the product that actually needs autonomous execution: credit auto-refill. Normal minting, credit purchase, and settlement remain user-signed MetaMask transactions. The agent does not pretend it can spend from the user's wallet.
+
+The upgraded `CreditSystem` adds:
+
+- `setAutoRefill(maxBudget, threshold, perRefill)` - user pre-funds a native 0G budget once.
+- `refillFromAllowance(consumer)` - permissionless call that adds credits when balance is at or below the configured threshold.
+
+The Distribution Manager calls KeeperHub Direct Execution for `refillFromAllowance(consumer)` only when:
+
+- auto-refill is enabled on-chain,
+- credits are at or below threshold,
+- the pre-funded budget can cover the refill,
+- KeeperHub supports the configured chain.
+
+As of the latest check, KeeperHub's public chains endpoint does not list 0G Galileo chain `16602`, so the app fails honestly with `credit.replenish_failed` instead of faking a successful KeeperHub run. Run the support check with:
+
+```bash
+pnpm --filter backend keeperhub:hello
+```
+
+The deployed Galileo `CreditSystem` address in `contracts/deployments/0g-galileo.json` predates this auto-refill upgrade. Redeploy `CreditSystem` before using the auto-refill UI on 0G.

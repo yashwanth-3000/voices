@@ -1,16 +1,28 @@
 import { EventLog } from "../events/event-log.js";
 import { MockChainClient } from "../infra/chain.js";
 import { MockComputeClient } from "../infra/compute.js";
-import { KeeperHubRestClient } from "../infra/keeperhub.js";
 import { MemoryStorageClient } from "../infra/storage.js";
-import { AgentCompute } from "../infra/types.js";
+import { AgentCompute, KeeperHubClient } from "../infra/types.js";
 import { Orchestrator } from "../orchestrator/index.js";
 
-export function createTestOrchestrator(overrides: { compute?: AgentCompute } = {}) {
+export function createTestOrchestrator(overrides: { compute?: AgentCompute; keeperhub?: KeeperHubClient } = {}) {
   const storage = new MemoryStorageClient();
   const compute = overrides.compute ?? new MockComputeClient();
   const chain = new MockChainClient();
-  const keeperhub = new KeeperHubRestClient();
+  const keeperhub = overrides.keeperhub ?? {
+    async isChainSupported() {
+      return { supported: false, reason: "KeeperHub disabled in tests" };
+    },
+    async executeContractCall() {
+      return { status: "pending_keeperhub" as const, reason: "KeeperHub disabled in tests" };
+    },
+    async executeTransaction() {
+      return { status: "pending_keeperhub" as const, reason: "KeeperHub disabled in tests" };
+    },
+    async pollWorkflow() {
+      return { status: "pending_keeperhub" as const, reason: "KeeperHub disabled in tests" };
+    }
+  };
   const eventLog = new EventLog({ storage });
   const orchestrator = new Orchestrator({ storage, compute, chain, keeperhub, eventLog });
   return { orchestrator, storage, compute, chain, keeperhub, eventLog };
