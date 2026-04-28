@@ -136,10 +136,10 @@ export default function Page() {
               </p>
 
               <div className="row ctaRow heroActions" role="group" aria-label="Primary actions">
-                <Button href="#creators" variant="primary">
+                <Button href="/styles" variant="primary">
                   Explore writing styles
                 </Button>
-                <Button href="#upload" variant="secondary">
+                <Button href="/upload" variant="secondary">
                   Upload your style <span aria-hidden="true">↑</span>
                 </Button>
               </div>

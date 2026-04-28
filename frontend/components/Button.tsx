@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 type ButtonProps = {
   children: ReactNode;
-  variant?: "primary" | "secondary";
+  variant?: "primary" | "secondary" | "dark";
   href?: string;
   onClick?: () => void;
   className?: string;
@@ -17,9 +17,15 @@ export function Button({
   className,
   ariaLabel,
 }: ButtonProps) {
+  const variantClass =
+    variant === "primary"
+      ? "btnPrimary"
+      : variant === "dark"
+        ? "btnDark"
+        : "btnSecondary";
   const cls =
     "btn " +
-    (variant === "primary" ? "btnPrimary" : "btnSecondary") +
+    variantClass +
     (className ? ` ${className}` : "");
 
   if (href) {

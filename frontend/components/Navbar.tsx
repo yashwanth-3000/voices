@@ -5,26 +5,36 @@ export function Navbar() {
     <header className="topbar">
       <div className="container">
         <div className="topbarInner">
-          <a className="brand" href="#top" aria-label="Go to top">
+          <a className="brand" href="/" aria-label="Go to home">
             <span className="brandMark" aria-hidden="true" />
             <span>ContentHub</span>
           </a>
 
           <nav className="navLinks hideMobile" aria-label="Primary">
-            <a href="#how">How it works</a>
-            <a href="#featured">Featured styles</a>
-            <a href="#creators">Creators</a>
-            <a href="#explorers">Explore</a>
+            <a href="/styles">
+              <span>Styles</span>
+              <span className="navIcon" aria-hidden="true">
+                ✎
+              </span>
+            </a>
+            <a href="/upload">
+              <span>Upload</span>
+              <span className="navIcon" aria-hidden="true">
+                +
+              </span>
+            </a>
+            <a href="/#creators">
+              <span>Creators</span>
+              <span className="navIcon" aria-hidden="true">
+                ⌘
+              </span>
+            </a>
+            <a href="/#how">How it works</a>
           </nav>
 
-          <div className="row">
-            <Button href="#creators" variant="secondary" ariaLabel="Explore styles">
-              Explore Styles
-            </Button>
-            <Button href="#upload" variant="primary" ariaLabel="Upload your style">
-              Upload Your Style
-            </Button>
-          </div>
+          <Button href="/signin" variant="dark" ariaLabel="Sign in">
+            Sign in
+          </Button>
         </div>
       </div>
     </header>
