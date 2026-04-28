@@ -541,6 +541,7 @@ button{font-family:inherit}
   font-size:13px;
   line-height:1.66;
   display:-webkit-box;
+  line-clamp:3;
   -webkit-line-clamp:3;
   -webkit-box-orient:vertical;
   overflow:hidden;
@@ -690,6 +691,8 @@ button{font-family:inherit}
   box-shadow: 0 10px 26px rgba(130,94,68,.08);
   transition: transform .18s ease, border-color .18s ease, background .18s ease;
   min-height: 260px;
+  display:flex;
+  flex-direction:column;
 }
 .styleListing:hover{
   transform: translateY(-2px);
@@ -734,9 +737,192 @@ button{font-family:inherit}
   font-size:13px;
   line-height:1.65;
   display:-webkit-box;
+  line-clamp:4;
   -webkit-line-clamp:4;
   -webkit-box-orient:vertical;
   overflow:hidden;
+}
+
+.styleListingFill{
+  margin-top:10px;
+  color:rgba(24,18,13,.60);
+  font-size:12.5px;
+  line-height:1.6;
+  display:-webkit-box;
+  line-clamp:3;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+
+.styleListingTags{
+  margin-top:auto;
+}
+
+.styleHeader{
+  display:flex;
+  align-items:flex-end;
+  justify-content:space-between;
+  gap:18px;
+  flex-wrap:wrap;
+}
+
+.styleTraitGrid{
+  display:grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap:12px;
+}
+
+.styleTrait{
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.40);
+  border-radius:16px;
+  padding:12px 12px;
+}
+
+.styleTraitLabel{
+  color:var(--muted2);
+  font-size:11px;
+  font-weight:650;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+
+.styleTraitValue{
+  margin-top:8px;
+  color:var(--text);
+  font-size:13px;
+  line-height:1.5;
+}
+
+.chatShell{
+  border:1px solid var(--line);
+  background: rgba(255,250,244,.82);
+  border-radius: var(--radius2);
+  box-shadow: var(--shadow);
+  overflow:hidden;
+}
+
+.chatHeader{
+  padding:12px 14px;
+  border-bottom:1px solid rgba(76,49,31,.10);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+}
+
+.chatTitle{
+  font-size:12px;
+  color:var(--muted);
+  font-weight:600;
+}
+
+.chatAccent{
+  color: var(--text);
+}
+
+.chatPill{
+  border-radius:999px;
+  padding:6px 10px;
+  border:1px solid rgba(243,109,56,.14);
+  background:rgba(243,109,56,.08);
+  color:#f36d38;
+  font-weight:650;
+  font-size:11px;
+  white-space:nowrap;
+}
+
+.chatBody{
+  padding:14px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  background:
+    radial-gradient(900px 520px at 50% 0%, rgba(243,109,56,.07), transparent 60%),
+    rgba(255,252,247,.72);
+  min-height: 360px;
+  max-height: 440px;
+  overflow:auto;
+}
+
+.chatMsg{
+  display:flex;
+}
+
+.chatUser{
+  justify-content:flex-end;
+}
+
+.chatAssistant{
+  justify-content:flex-start;
+}
+
+.chatBubble{
+  max-width: 78ch;
+  white-space:pre-wrap;
+  border-radius: 18px;
+  padding:10px 12px;
+  border:1px solid rgba(76,49,31,.10);
+  background: rgba(255,255,255,.66);
+  color: rgba(24,18,13,.86);
+  font-size:13px;
+  line-height:1.65;
+}
+
+.chatUser .chatBubble{
+  background: rgba(243,109,56,.12);
+  border-color: rgba(243,109,56,.18);
+}
+
+.chatSuggestions{
+  padding:12px 14px;
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  border-top:1px solid rgba(76,49,31,.08);
+  background: rgba(255,250,244,.84);
+}
+
+.chatSuggestion{
+  border-radius:999px;
+  padding:8px 10px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.55);
+  color: var(--muted);
+  font-size:12px;
+  cursor:pointer;
+  transition: transform .15s ease, background .15s ease, border-color .15s ease;
+}
+
+.chatSuggestion:hover{
+  transform: translateY(-1px);
+  border-color: var(--line2);
+  background: rgba(255,255,255,.78);
+}
+
+.chatComposer{
+  padding:12px 14px 14px;
+  border-top:1px solid rgba(76,49,31,.08);
+  background: rgba(255,250,244,.90);
+}
+
+.chatInput{
+  width:100%;
+  min-height: 92px;
+  resize:vertical;
+  border-radius:16px;
+  padding:12px 12px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.62);
+  color: var(--text);
+  outline:none;
+  line-height:1.55;
+}
+
+.chatInput:focus{
+  border-color: rgba(243,109,56,.30);
+  box-shadow: 0 0 0 4px rgba(243,109,56,.10);
 }
 
 .textArea{
@@ -772,7 +958,8 @@ button{font-family:inherit}
   .twoCol,
   .creatorGrid,
   .previewColumns,
-  .styleGallery{
+  .styleGallery,
+  .styleTraitGrid{
     grid-template-columns:1fr;
   }
   .creatorStrip{

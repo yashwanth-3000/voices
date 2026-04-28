@@ -1,20 +1,26 @@
+import Link from "next/link";
+
 type StyleListingCardProps = {
+  href: string;
   title: string;
   creator: string;
   price: string;
   tags: string[];
   blurb: string;
+  fillText: string;
 };
 
 export function StyleListingCard({
+  href,
   title,
   creator,
   price,
   tags,
   blurb,
+  fillText,
 }: StyleListingCardProps) {
   return (
-    <div className="styleListing">
+    <Link className="styleListing" href={href} aria-label={`Open style: ${title}`}>
       <div className="styleListingTop">
         <div>
           <div className="styleListingTitle">{title}</div>
@@ -22,15 +28,18 @@ export function StyleListingCard({
         </div>
         <div className="styleListingPrice">{price}</div>
       </div>
+
       <div className="styleListingBlurb">“{blurb}”</div>
-      <div className="chips" aria-label="Style tags">
+      <div className="styleListingFill">{fillText}</div>
+
+      <div className="chips styleListingTags" aria-label="Style tags">
         {tags.map((t) => (
           <span className="chip" key={t}>
             {t}
           </span>
         ))}
       </div>
-    </div>
+    </Link>
   );
 }
 

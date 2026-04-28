@@ -1,80 +1,12 @@
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { StyleListingCard } from "../../components/StyleListingCard";
+import { styles } from "../../lib/styles";
 
-type Listing = {
-  title: string;
-  creator: string;
-  price: string;
-  tags: string[];
-  blurb: string;
-};
-
-const listings: Listing[] = [
-  {
-    title: "Witty & conversational",
-    creator: "Romi Chen · @romi",
-    price: "$0.02 / gen",
-    tags: ["playful", "casual", "millennial"],
-    blurb:
-      "Okay, so here’s the thing: clarity is cute, but personality is what people remember.",
-  },
-  {
-    title: "Formal & analytical",
-    creator: "Jules Park · @jules.memos",
-    price: "$0.09 / gen",
-    tags: ["memos", "evidence", "structured"],
-    blurb:
-      "This proposal increases expected value under conservative assumptions while preserving downside protections.",
-  },
-  {
-    title: "Minimal & poetic",
-    creator: "Noor S. · @noor.poetry",
-    price: "$0.06 / gen",
-    tags: ["brand", "cadence", "minimal"],
-    blurb:
-      "A quiet sentence can hold a loud idea—if you let the air do some work.",
-  },
-  {
-    title: "Viral social voice",
-    creator: "Saoirse Doyle · @saoirse",
-    price: "$0.08 / gen",
-    tags: ["hooks", "short-form", "punchy"],
-    blurb:
-      "We shipped it. It’s faster. It’s cleaner. And yes—your future self will thank you.",
-  },
-  {
-    title: "Contrarian finance",
-    creator: "Devansh Patel · @dev.p",
-    price: "$0.06 / gen",
-    tags: ["analytical", "contrarian", "concise"],
-    blurb:
-      "The consensus is comfortable. That’s precisely why it’s expensive.",
-  },
-  {
-    title: "Observational essay",
-    creator: "Lin Halverson · @lin.h",
-    price: "$0.06 / gen",
-    tags: ["observational", "tender", "essay"],
-    blurb:
-      "The small detail isn’t small—it’s the hinge the whole moment swings on.",
-  },
-  {
-    title: "Lyrical literary",
-    creator: "Maren Vasquez · @maren.v",
-    price: "$0.06 / gen",
-    tags: ["lyrical", "quiet", "literary"],
-    blurb:
-      "The paragraph listened first; only then did it decide what it could afford to say.",
-  },
-  {
-    title: "Crisp product copy",
-    creator: "Amina Rao · @amina.ink",
-    price: "$0.07 / gen",
-    tags: ["product-led", "clear", "confident"],
-    blurb:
-      "Less clicking. Fewer tabs. More done. The feature disappears—because the friction does.",
-  },
+const fillLines = [
+  "Includes tone traits, cadence notes, and sample outputs for fast comparison.",
+  "Optimized for consistent voice across posts, memos, landing pages, and threads.",
+  "Preview hooks, structure, and phrasing patterns before you generate.",
 ];
 
 export default function StylesPage() {
@@ -94,14 +26,16 @@ export default function StylesPage() {
             </p>
 
             <div className="styleGallery" style={{ marginTop: 18 }}>
-              {listings.map((l) => (
+              {styles.map((s, i) => (
                 <StyleListingCard
-                  key={`${l.title}-${l.creator}`}
-                  title={l.title}
-                  creator={l.creator}
-                  price={l.price}
-                  tags={l.tags}
-                  blurb={l.blurb}
+                  key={s.slug}
+                  href={`/styles/${s.slug}`}
+                  title={s.title}
+                  creator={`${s.creatorName} · @${s.creatorHandle}`}
+                  price={s.price}
+                  tags={s.tags}
+                  blurb={s.blurb}
+                  fillText={fillLines[i % fillLines.length]}
                 />
               ))}
             </div>
