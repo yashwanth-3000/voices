@@ -140,56 +140,6 @@ test("ContentCreator emits credit.low when consumer has no credits", async () =>
   assert.equal(orchestrator.eventsForRequest("req-low").some((event) => event.type === "credit.low"), true);
 });
 
-test("DistributionManager uses KeeperHub for autonomous auto-refill when on-chain config allows it", async () => {
-  const keeperhub = {
-    async isChainSupported() {
-      return { supported: true, network: "sepolia" };
-    },
-    async executeContractCall() {
-      return {
-        status: "confirmed" as const,
-        workflowId: "direct_refill_1",
-        txHash: "0xrefill",
-        blockExplorerUrl: "https://example.test/tx/0xrefill"
-      };
-    },
-    async executeTransaction() {
-      return { status: "pending_keeperhub" as const };
-    },
-    async pollWorkflow() {
-      return { status: "confirmed" as const, workflowId: "direct_refill_1", txHash: "0xrefill" };
-    }
-  };
-  const { orchestrator, chain } = createTestOrchestrator({ keeperhub });
-  const consumer = "0x00000000000000000000000000000000000000d1";
-  chain.setCredits(consumer, 1n);
-  chain.setAutoRefill(consumer, {
-    maxBudget: 5000000000000000n,
-    spent: 0n,
-    threshold: 1n,
-    perRefill: 5n,
-    enabled: true,
-    supported: true
-  });
-  await orchestrator.start();
-
-  await orchestrator.publish({
-    id: "credit-low-1",
-    type: "credit.low",
-    timestamp: Date.now(),
-    actor: "system",
-    consumerAddress: consumer,
-    payload: { requestId: "req-refill", reason: "post_settlement_threshold" }
-  });
-  await orchestrator.drain();
-
-  const events = orchestrator.eventsForRequest("req-refill");
-  const replenished = events.find((event) => event.type === "credit.replenished");
-  assert.ok(replenished);
-  assert.equal(replenished.payload.workflowId, "direct_refill_1");
-  assert.equal(replenished.payload.txHash, "0xrefill");
-});
-
 test("StyleCurator refines a profile from feedback without direct agent calls", async () => {
   const { orchestrator, storage } = createTestOrchestrator();
   await storage.kvSet("style:1:profile", {

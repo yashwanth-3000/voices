@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import { optionalEnv } from "../config.js";
-import { AgentChain, AutoRefillConfig, ContractCallInput, MintStyleInput, StyleInfo, TransactionIntent } from "./types.js";
+import { AgentChain, MintStyleInput, StyleInfo, TransactionIntent } from "./types.js";
 
 const STYLE_REGISTRY_ABI = [
   "function mintStyle(string,string,string,bytes32,bytes,uint256,uint32,string,string,string) returns (uint256)",
@@ -12,19 +12,13 @@ const STYLE_REGISTRY_ABI = [
 const CREDIT_SYSTEM_ABI = [
   "function buyCredits(uint256 amount) payable",
   "function spendCredit(uint256 tokenId)",
-  "function setAutoRefill(uint256 maxBudget,uint256 threshold,uint256 perRefill) payable",
-  "function refillFromAllowance(address consumer)",
-  "function autoRefill(address consumer) view returns (uint256 maxBudget,uint256 spent,uint256 threshold,uint256 perRefill,bool enabled)",
   "function credits(address) view returns (uint256)",
   "function creditPriceWei() view returns (uint256)"
 ];
 
-const CREDIT_SYSTEM_JSON_ABI = new ethers.Interface(CREDIT_SYSTEM_ABI).formatJson();
-
 export class MockChainClient implements AgentChain {
   private readonly creditBalances = new Map<string, bigint>();
   private readonly styles = new Map<string, StyleInfo>();
-  private readonly autoRefillConfigs = new Map<string, AutoRefillConfig>();
 
   constructor() {
     this.creditBalances.set("default", 10n);
@@ -38,10 +32,6 @@ export class MockChainClient implements AgentChain {
     this.styles.set(tokenId, style);
   }
 
-  setAutoRefill(address: string, config: AutoRefillConfig): void {
-    this.autoRefillConfigs.set(address.toLowerCase(), config);
-  }
-
   mintStyleIntent(input: MintStyleInput): TransactionIntent {
     return { to: "mock-style-registry", data: JSON.stringify(input), value: "0", description: "mintStyle" };
   }
@@ -50,50 +40,8 @@ export class MockChainClient implements AgentChain {
     return { to: "mock-credit-system", data: amount.toString(), value: "0", description: "buyCredits" };
   }
 
-  async setAutoRefillIntent(input: {
-    consumerAddress: string;
-    maxBudget: bigint;
-    threshold: bigint;
-    perRefill: bigint;
-  }): Promise<TransactionIntent> {
-    const current = await this.autoRefillOf(input.consumerAddress);
-    const value = input.maxBudget > current.maxBudget ? input.maxBudget - current.maxBudget : 0n;
-    this.autoRefillConfigs.set(input.consumerAddress.toLowerCase(), {
-      maxBudget: input.maxBudget,
-      spent: current.spent,
-      threshold: input.threshold,
-      perRefill: input.perRefill,
-      enabled: true,
-      supported: true
-    });
-    return {
-      to: "mock-credit-system",
-      data: JSON.stringify({
-        functionName: "setAutoRefill",
-        consumerAddress: input.consumerAddress,
-        maxBudget: input.maxBudget.toString(),
-        threshold: input.threshold.toString(),
-        perRefill: input.perRefill.toString()
-      }),
-      value: value.toString(),
-      description: "CreditSystem.setAutoRefill"
-    };
-  }
-
   spendCreditIntent(tokenId: string): TransactionIntent {
     return { to: "mock-credit-system", data: tokenId, value: "0", description: "spendCredit" };
-  }
-
-  refillFromAllowanceCall(consumerAddress: string): ContractCallInput {
-    return {
-      contractAddress: "mock-credit-system",
-      chainId: Number(process.env.OG_CHAIN_ID || 16602),
-      functionName: "refillFromAllowance",
-      functionArgs: [consumerAddress],
-      abi: CREDIT_SYSTEM_JSON_ABI,
-      value: "0",
-      description: "CreditSystem.refillFromAllowance"
-    };
   }
 
   async credits(address: string): Promise<bigint> {
@@ -101,20 +49,7 @@ export class MockChainClient implements AgentChain {
   }
 
   async creditPrice(): Promise<bigint> {
-    return 1000000000000000n;
-  }
-
-  async autoRefillOf(address: string): Promise<AutoRefillConfig> {
-    return (
-      this.autoRefillConfigs.get(address.toLowerCase()) ?? {
-        maxBudget: 0n,
-        spent: 0n,
-        threshold: 0n,
-        perRefill: 0n,
-        enabled: false,
-        supported: true
-      }
-    );
+    return 0n;
   }
 
   async styleOf(tokenId: string): Promise<StyleInfo> {
@@ -184,32 +119,6 @@ export class EthersChainClient implements AgentChain {
     };
   }
 
-  async setAutoRefillIntent(input: {
-    consumerAddress: string;
-    maxBudget: bigint;
-    threshold: bigint;
-    perRefill: bigint;
-  }): Promise<TransactionIntent> {
-    const current = await this.autoRefillOf(input.consumerAddress);
-    if (!current.supported) {
-      throw new Error("Current CreditSystem deployment does not support auto-refill. Redeploy the upgraded contract first.");
-    }
-    if (input.maxBudget < current.maxBudget) {
-      throw new Error("Auto-refill budget cannot be decreased from the UI; disable and redeploy config if needed");
-    }
-    const newlyFunded = input.maxBudget - current.maxBudget;
-    return {
-      to: this.creditSystem.target.toString(),
-      data: this.creditInterface.encodeFunctionData("setAutoRefill", [
-        input.maxBudget,
-        input.threshold,
-        input.perRefill
-      ]),
-      value: newlyFunded.toString(),
-      description: "CreditSystem.setAutoRefill"
-    };
-  }
-
   spendCreditIntent(tokenId: string): TransactionIntent {
     return {
       to: this.creditSystem.target.toString(),
@@ -219,49 +128,12 @@ export class EthersChainClient implements AgentChain {
     };
   }
 
-  refillFromAllowanceCall(consumerAddress: string): ContractCallInput {
-    return {
-      contractAddress: this.creditSystem.target.toString(),
-      network: process.env.KEEPERHUB_NETWORK,
-      chainId: Number(process.env.KEEPERHUB_CHAIN_ID || process.env.OG_CHAIN_ID || 16602),
-      functionName: "refillFromAllowance",
-      functionArgs: [consumerAddress],
-      abi: CREDIT_SYSTEM_JSON_ABI,
-      value: "0",
-      gasLimitMultiplier: "1.2",
-      description: "CreditSystem.refillFromAllowance"
-    };
-  }
-
   async credits(address: string): Promise<bigint> {
     return this.creditSystem.credits(address) as Promise<bigint>;
   }
 
   async creditPrice(): Promise<bigint> {
     return this.creditSystem.creditPriceWei() as Promise<bigint>;
-  }
-
-  async autoRefillOf(address: string): Promise<AutoRefillConfig> {
-    try {
-      const config = await this.creditSystem.autoRefill(address);
-      return {
-        maxBudget: config.maxBudget,
-        spent: config.spent,
-        threshold: config.threshold,
-        perRefill: config.perRefill,
-        enabled: config.enabled,
-        supported: true
-      };
-    } catch {
-      return {
-        maxBudget: 0n,
-        spent: 0n,
-        threshold: 0n,
-        perRefill: 0n,
-        enabled: false,
-        supported: false
-      };
-    }
   }
 
   async styleOf(tokenId: string): Promise<StyleInfo> {

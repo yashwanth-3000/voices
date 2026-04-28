@@ -21,16 +21,6 @@ type TransactionIntent = {
   description: string;
 };
 
-type AutoRefillStatus = {
-  maxBudget: string;
-  spent: string;
-  remainingBudget: string;
-  threshold: string;
-  perRefill: string;
-  enabled: boolean;
-  supported: boolean;
-};
-
 type StepState = "waiting" | "running" | "done" | "error";
 type FlowStep = { label: string; state: StepState; detail?: string };
 
@@ -70,10 +60,6 @@ export function TestPageClient() {
   const [spendIntent, setSpendIntent] = useState<TransactionIntent | null>(null);
   const [creditBalance, setCreditBalance] = useState("");
   const [creditPriceWei, setCreditPriceWei] = useState("");
-  const [autoRefill, setAutoRefill] = useState<AutoRefillStatus | null>(null);
-  const [autoBudgetOg, setAutoBudgetOg] = useState("0.01");
-  const [autoThreshold, setAutoThreshold] = useState("1");
-  const [autoPerRefill, setAutoPerRefill] = useState("5");
   const [lastTxHash, setLastTxHash] = useState("");
   const [busyAction, setBusyAction] = useState("");
   const [error, setError] = useState("");
@@ -89,11 +75,7 @@ export function TestPageClient() {
   const latestDraft = [...events].reverse().find((event) => event.type === "generation.drafted");
   const latestPublished = [...events].reverse().find((event) => event.type === "generation.published");
   const latestRefined = [...events].reverse().find((event) => event.type === "style.refined");
-  const latestAutoRefillConfigured = [...events].reverse().find((event) => event.type === "credit.auto_refill.configured");
-  const latestAutoRefill = [...events].reverse().find((event) => event.type === "credit.replenished");
-  const latestAutoRefillFailure = [...events].reverse().find((event) => event.type === "credit.replenish_failed");
   const liveMode = runtime?.costProfile === "live_0g";
-  const keeperhub = health?.keeperhub as { supported?: boolean; reason?: string; network?: string; supportedChains?: string[] } | undefined;
   const walletReady = Boolean(walletAddress && chainId === "16602");
   const signedReady = Boolean(attestationMessage && attestationSignature);
   const uploadReady = walletReady && signedReady && sampleCharacters >= 1024;
@@ -122,7 +104,7 @@ export function TestPageClient() {
     }));
   }, [events, requestIds]);
   const activityEvents = useMemo(
-    () => events.filter((event) => event.type === "agent.activity").reverse(),
+    () => events.filter((event) => event.type === "agent.activity").slice(-18).reverse(),
     [events]
   );
   const selectedEvent = useMemo(
@@ -288,36 +270,6 @@ export function TestPageClient() {
     });
   }
 
-  async function enableAutoRefill() {
-    await runAction("auto-refill", async () => {
-      const status = await apiGet<{ credits: string; creditPriceWei: string; autoRefill?: AutoRefillStatus }>(
-        `/credits/${requireValue(walletAddress, "Wallet")}`
-      );
-      setCreditBalance(status.credits);
-      setCreditPriceWei(status.creditPriceWei);
-      setAutoRefill(status.autoRefill ?? null);
-      if (status.autoRefill?.supported === false) {
-        throw new Error("This deployed CreditSystem does not expose auto-refill yet. Redeploy the upgraded CreditSystem before enabling it.");
-      }
-      const budgetWei = ethers.parseEther(requireValue(autoBudgetOg, "Auto-refill budget")).toString();
-      const setup = await apiPost<{ requestId: string; intent: TransactionIntent }>("/credits/auto-refill-intent", {
-        walletAddress: requireValue(walletAddress, "Wallet"),
-        maxBudgetWei: budgetWei,
-        threshold: requireValue(autoThreshold, "Refill threshold"),
-        perRefill: requireValue(autoPerRefill, "Per-refill credits")
-      });
-      rememberRequest(setup.requestId);
-      const receipt = await sendIntent(setup.intent);
-      await apiPost("/credits/confirm-auto-refill", {
-        requestId: setup.requestId,
-        walletAddress,
-        txHash: receipt.hash
-      });
-      setLastTxHash(receipt.hash);
-      await refreshCredits(walletAddress);
-    });
-  }
-
   async function generateContent() {
     await runAction("generate", async () => {
       markStep(1, "running", "Waiting for draft");
@@ -379,10 +331,9 @@ export function TestPageClient() {
 
   async function refreshCredits(address = walletAddress) {
     if (!address) return;
-    const data = await apiGet<{ credits: string; creditPriceWei: string; autoRefill?: AutoRefillStatus }>(`/credits/${address}`);
+    const data = await apiGet<{ credits: string; creditPriceWei: string }>(`/credits/${address}`);
     setCreditBalance(data.credits);
     setCreditPriceWei(data.creditPriceWei);
-    setAutoRefill(data.autoRefill ?? null);
   }
 
   async function checkHealth() {
@@ -454,12 +405,7 @@ export function TestPageClient() {
     const found = data.events.find((event) => types.includes(event.type));
     if (found) return found;
 
-    const latestEvent = [...eventsRef.current]
-      .reverse()
-      .find((event) => belongsToRequest(event, requestId));
-    throw new Error(
-      `Timed out waiting for ${types.join(" or ")}. Latest event for this request: ${latestEvent?.type ?? "none"}.`
-    );
+    throw new Error(`Timed out waiting for ${types.join(" or ")}`);
   }
 
   function openEventStream(requestId: string) {
@@ -476,6 +422,7 @@ export function TestPageClient() {
     };
     source.onerror = () => {
       setStreamStatus((current) => ({ ...current, [requestId]: "error" }));
+      source.close();
     };
     streams.current.set(requestId, source);
   }
@@ -508,173 +455,111 @@ export function TestPageClient() {
 
   return (
     <main className="test-shell">
-      <section className="console-topbar">
-        <div className="brand-block">
-          <p className="eyebrow">Voices test bench</p>
-          <h1 className="console-title">0G LangGraph swarm console</h1>
-          <p className="header-copy">Run the real creator-to-consumer flow, inspect every agent step, and verify the on-chain transaction trail.</p>
+      <section className="test-header">
+        <div>
+          <p className="eyebrow">Voices live console</p>
+          <h1>On-chain 0G agent workflow</h1>
+          <p className="header-copy">Wallet-signed style upload, live agent events, on-chain minting, credit spend, and royalty settlement.</p>
         </div>
-        <div className="topbar-actions">
+        <div className="header-actions">
           <button type="button" onClick={checkHealth} disabled={busy}>Health</button>
           <button type="button" className="primary" onClick={connectWallet} disabled={busy}>{walletAddress ? "Wallet connected" : "Connect wallet"}</button>
         </div>
       </section>
 
-      <section className="command-center">
-        <div className="next-action-card">
-          <span>Next action</span>
-          <strong>{nextAction}</strong>
-          {error ? <p className="inline-error">{error}</p> : <p>Work left to right. The right rail shows the agent evidence and raw payload for anything you click.</p>}
+      <section className="cost-strip">
+        <div>
+          <strong>{runtime?.costProfile === "live_0g" ? "Live 0G mode" : "Not live yet"}</strong>
+          <span>{runtime?.costProfile === "live_0g" ? "This can spend OG. Every on-chain step is signed in MetaMask." : "Start backend with 0G modes before expecting on-chain writes."}</span>
         </div>
-        <div className="readiness-grid">
-          <ReadinessItem ok={liveMode} label="Backend" detail={liveMode ? "0G storage / compute / chain" : "Not in live 0G mode"} />
-          <ReadinessItem ok={walletReady} label="Wallet" detail={walletReady ? `${short(walletAddress)} on Galileo` : "Connect chain 16602"} />
-          <ReadinessItem ok={sampleCharacters >= 1024} label="Samples" detail={`${sampleCharacters.toLocaleString()} characters`} />
-          <ReadinessItem ok={signedReady} label="Attestation" detail={signedReady ? "Signed by wallet" : "Signature needed"} />
-          <ReadinessItem ok={Boolean(styleId)} label="Style token" detail={styleId ? `iNFT #${styleId}` : pendingStyleId || "Waiting"} />
-          <ReadinessItem ok={hasCredits} label="Credits" detail={creditBalance ? `${creditBalance} available` : "Unknown"} />
+        <div>
+          <strong>Backend modes</strong>
+          <span>storage {runtime?.storage ?? "unknown"} / compute {runtime?.compute ?? "unknown"} / chain {runtime?.chain ?? "unknown"}</span>
+        </div>
+        <div>
+          <strong>Wallet</strong>
+          <span>{walletAddress ? `${short(walletAddress)} on chain ${chainId || "unknown"}` : "Connect MetaMask on 0G Galileo"}</span>
         </div>
       </section>
 
-      <section className="workflow-layout">
-        <div className="operator-column">
-          <article className="workflow-card">
-            <div className="workflow-head">
-              <span className="step-number">01</span>
+      <section className="runbook-strip">
+        <div className="next-action-card">
+          <span>Next action</span>
+          <strong>{nextAction}</strong>
+        </div>
+        <div className="readiness-grid">
+          <ReadinessItem ok={liveMode} label="Backend live" detail={liveMode ? "0G storage, compute, and chain modes" : "Run backend in 0G modes"} />
+          <ReadinessItem ok={walletReady} label="Wallet ready" detail={walletReady ? `${short(walletAddress)} on Galileo` : "Connect MetaMask to chain 16602"} />
+          <ReadinessItem ok={sampleCharacters >= 1024} label="Samples ready" detail={`${sampleCharacters.toLocaleString()} characters`} />
+          <ReadinessItem ok={signedReady} label="Attestation signed" detail={signedReady ? "Signature captured" : "Sign before upload"} />
+          <ReadinessItem ok={Boolean(styleId)} label="iNFT minted" detail={styleId ? `Token ${styleId}` : pendingStyleId || "Waiting"} />
+          <ReadinessItem ok={hasCredits} label="Credits ready" detail={creditBalance ? `${creditBalance} credit(s)` : "Refresh credits"} />
+        </div>
+      </section>
+
+      <section className="main-grid">
+        <div className="stack">
+          <div className="panel controls-panel">
+            <div className="panel-heading">
               <div>
-                <h2>Creator style setup</h2>
-                <p>Paste creator-owned samples, sign the attestation, profile with 0G Compute, then mint the style iNFT.</p>
+                <div className="panel-title">1. Style upload</div>
+                <p>Paste real samples, sign the attestation, then let the backend store/profile them before you mint.</p>
               </div>
             </div>
             <label>Writing samples<textarea className="sample-textarea" placeholder="Paste creator-owned writing samples here. Minimum about 1KB." value={samplesText} onChange={(event) => setSamplesText(event.target.value)} /></label>
-            <div className="meter-row"><span>{sampleCharacters.toLocaleString()} characters</span><span>{sampleCharacters < 1024 ? "Need about 1KB" : "Enough for upload"}</span></div>
-            <div className="two-field-grid">
-              <label>Attestation message<textarea value={attestationMessage} onChange={(event) => setAttestationMessage(event.target.value)} /></label>
-              <label>Attestation signature<input value={attestationSignature} onChange={(event) => setAttestationSignature(event.target.value)} /></label>
-            </div>
-            <div className="action-row">
+            <div className="meter-row"><span>{sampleCharacters.toLocaleString()} characters</span><span>{sampleCharacters < 1024 ? "Need at least about 1KB" : "Enough for upload"}</span></div>
+            <label>Attestation message<textarea value={attestationMessage} onChange={(event) => setAttestationMessage(event.target.value)} /></label>
+            <label>Attestation signature<input value={attestationSignature} onChange={(event) => setAttestationSignature(event.target.value)} /></label>
+            <div className="button-row multi-actions">
               <button type="button" onClick={signAttestation} disabled={busy || !walletAddress || !samplesText}>Sign attestation</button>
-              <button type="button" className="primary" onClick={uploadStyle} disabled={busy || !uploadReady}>{busyAction === "upload" ? "Profiling..." : "Upload + profile"}</button>
+              <button type="button" className="primary" onClick={uploadStyle} disabled={busy || !uploadReady}>{busyAction === "upload" ? "Uploading..." : "Upload + profile"}</button>
               <button type="button" className="primary" onClick={mintOnChain} disabled={busy || !mintIntent}>{busyAction === "mint" ? "Minting..." : "Mint on-chain"}</button>
             </div>
             <div className="resume-row">
-              <input placeholder="Paste request ID to resume a prior upload" value={resumeRequestId} onChange={(event) => setResumeRequestId(event.target.value)} />
+              <input placeholder="Paste request ID to resume without uploading again" value={resumeRequestId} onChange={(event) => setResumeRequestId(event.target.value)} />
               <button type="button" onClick={resumeRequest} disabled={busy || !resumeRequestId}>Load request</button>
             </div>
-            <div className="key-value-row"><span>Style ID</span><code>{styleId || pendingStyleId || "waiting"}</code></div>
-          </article>
+            <div className="field-row"><span>Style ID</span><code>{styleId || pendingStyleId || "waiting"}</code></div>
+          </div>
 
-          <article className="workflow-card compact-card">
-            <div className="workflow-head">
-              <span className="step-number">02</span>
-              <div>
-                <h2>Credits and autonomous refill</h2>
-                <p>Generation is gated by on-chain credits. Optional auto-refill pre-funds a budget for the Distribution Manager path.</p>
-              </div>
-            </div>
-            <div className="metric-grid">
+          <div className="panel controls-panel">
+            <div className="panel-heading"><div><div className="panel-title">2. Credits + generation</div><p>Generation only runs when the connected wallet has credits in the deployed CreditSystem.</p></div></div>
+            <div className="result-list">
               <div><span>Credits</span><strong>{creditBalance || "unknown"}</strong></div>
               <div><span>Credit price</span><strong>{creditPriceWei ? `${ethers.formatEther(creditPriceWei)} OG` : "unknown"}</strong></div>
-              <div><span>KeeperHub</span><strong>{keeperhub?.supported ? keeperhub.network ?? "supported" : "not on Galileo"}</strong></div>
             </div>
-            <div className="action-row">
+            <div className="button-row multi-actions">
               <button type="button" onClick={() => refreshCredits()} disabled={busy || !walletAddress}>Refresh credits</button>
               <button type="button" onClick={buyOneCredit} disabled={busy || !walletAddress}>{busyAction === "credit" ? "Buying..." : "Buy 1 credit"}</button>
             </div>
-            <div className="auto-refill-box" data-state={autoRefill?.enabled ? "enabled" : "waiting"}>
-              <div className="auto-refill-head">
-                <div>
-                  <strong>Auto-refill rule</strong>
-                  <span>
-                    {autoRefill?.supported === false
-                      ? "The upgraded contract path is present, but KeeperHub does not currently list 0G Galileo."
-                      : autoRefill?.enabled
-                        ? "Enabled on-chain. The agent can request a refill when credits are low."
-                        : "Pre-fund once, then the agent can refill without another wallet click."}
-                  </span>
-                </div>
-              </div>
-              <div className="auto-refill-grid">
-                <label>Budget<input value={autoBudgetOg} onChange={(event) => setAutoBudgetOg(event.target.value)} inputMode="decimal" /></label>
-                <label>Threshold<input value={autoThreshold} onChange={(event) => setAutoThreshold(event.target.value)} inputMode="numeric" /></label>
-                <label>Per refill<input value={autoPerRefill} onChange={(event) => setAutoPerRefill(event.target.value)} inputMode="numeric" /></label>
-              </div>
-              <div className="metric-grid compact-results">
-                <div><span>Enabled</span><strong>{autoRefill?.enabled ? "yes" : "no"}</strong></div>
-                <div><span>Remaining</span><strong>{autoRefill ? `${ethers.formatEther(autoRefill.remainingBudget || "0")} OG` : "unknown"}</strong></div>
-                <div><span>Rule</span><strong>{autoRefill?.enabled ? `<= ${autoRefill.threshold} then +${autoRefill.perRefill}` : "not configured"}</strong></div>
-              </div>
-              <div className="action-row">
-                <button type="button" className="primary" onClick={enableAutoRefill} disabled={busy || !walletAddress || autoRefill?.supported === false}>
-                  {busyAction === "auto-refill" ? "Configuring..." : "Enable auto-refill"}
-                </button>
-              </div>
-              {keeperhub?.supported === false ? <p className="status-note">KeeperHub does not list 0G Galileo chain 16602 yet. The UI shows this honestly so the demo does not pretend an unsupported workflow ran.</p> : null}
-              {latestAutoRefillFailure ? <p className="status-note danger-note">Latest refill attempt: {String(latestAutoRefillFailure.payload.reason ?? "failed")}</p> : null}
-            </div>
-          </article>
-
-          <article className="workflow-card">
-            <div className="workflow-head">
-              <span className="step-number">03</span>
-              <div>
-                <h2>Generate and settle</h2>
-                <p>The Content Creator drafts from the minted style. Distribution Manager tunes variants and prepares settlement.</p>
-              </div>
-            </div>
             <label>Generation prompt<textarea placeholder="What should the agent write?" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
             <div className="checkbox-row">{["x", "linkedin", "instagram"].map((platform) => <label className="checkbox-label" key={platform}><input checked={platforms.includes(platform)} onChange={() => togglePlatform(platform)} type="checkbox" />{platform}</label>)}</div>
-            <div className="action-row">
+            <div className="button-row multi-actions">
               <button type="button" className="primary" onClick={generateContent} disabled={busy || !styleId || !prompt.trim()}>{busyAction === "generate" ? "Generating..." : "Generate"}</button>
               <button type="button" className="primary" onClick={settleOnChain} disabled={busy || !spendIntent}>{busyAction === "settle" ? "Settling..." : "Spend credit + settle royalty"}</button>
             </div>
-          </article>
+          </div>
 
-          <article className="workflow-card compact-card">
-            <div className="workflow-head">
-              <span className="step-number">04</span>
-              <div>
-                <h2>Feedback refinement</h2>
-                <p>Feedback writes an event. The Style Curator refines the style profile from that event.</p>
-              </div>
-            </div>
+          <div className="panel controls-panel">
+            <div className="panel-heading"><div><div className="panel-title">3. Feedback refinement</div><p>Feedback writes an event. The Style Curator refines the profile from that event.</p></div></div>
             <label>Feedback<textarea placeholder="Tell the agent what was off about the generated voice." value={feedback} onChange={(event) => setFeedback(event.target.value)} /></label>
-            <div className="action-row"><button type="button" className="primary" onClick={sendFeedback} disabled={busy || !styleId || !feedback}>{busyAction === "feedback" ? "Sending..." : "Send feedback"}</button></div>
-          </article>
+            <div className="button-row"><button type="button" className="primary" onClick={sendFeedback} disabled={busy || !styleId || !feedback}>{busyAction === "feedback" ? "Sending..." : "Send feedback"}</button></div>
+            {error ? <div className="error-box">{error}</div> : null}
+          </div>
         </div>
 
-        <aside className="observability-rail">
-          {error ? (
-            <div className="panel error-panel">
-              <div className="panel-title">Action error</div>
-              <p>{error}</p>
-            </div>
-          ) : null}
+        <div className="stack sticky-stack">
+          <div className="panel"><div className="panel-title">What happened</div><div className="explain-list">
+            <Explain done={Boolean(latestMinted)} title="Style minted" waiting="Upload, sign, then mint the iNFT on-chain." doneText="The style profile exists and the wallet confirmed the iNFT mint on-chain." />
+            <Explain done={Boolean(latestDraft)} title="Draft generated" waiting="Buy credits, then generate." doneText="The Content Creator produced a draft from the confirmed style token." />
+            <Explain done={Boolean(latestPublished && spendIntent)} title="Settlement ready" waiting="Generate to create a spend-credit transaction." doneText="A real CreditSystem.spendCredit transaction is ready for MetaMask." />
+            <Explain done={Boolean(latestRefined)} title="Feedback refined" waiting="Send feedback after generation." doneText="The Style Curator refined the profile from a feedback event." />
+          </div></div>
 
-          <div className="panel">
-            <div className="panel-heading-line">
-              <div className="panel-title">Run state</div>
-              <span className="tiny-pill">{busyAction || "idle"}</span>
-            </div>
-            <div className="steps">{steps.map((step) => <div className="step" data-state={step.state} key={step.label}><span className="step-dot" /><div><strong>{step.label}</strong><span>{step.detail ?? step.state}</span></div></div>)}</div>
-          </div>
-
-          <div className="panel">
-            <div className="panel-title">Milestones</div>
-            <div className="explain-list">
-              <Explain done={Boolean(latestMinted)} title="Style minted" waiting="Upload, sign, then mint on-chain." doneText="The style profile exists and the wallet confirmed the iNFT." />
-              <Explain done={Boolean(latestDraft)} title="Draft generated" waiting="Buy credits, then generate." doneText="The Content Creator produced a style-conditioned draft." />
-              <Explain done={Boolean(latestPublished && spendIntent)} title="Settlement ready" waiting="Generate to create a spend-credit transaction." doneText="A real CreditSystem.spendCredit transaction is ready." />
-              <Explain done={Boolean(latestAutoRefillConfigured || latestAutoRefill)} title="Auto-refill" waiting="Optional: pre-fund a refill budget." doneText={latestAutoRefill ? "The autonomous refill path emitted an event." : "Auto-refill budget is configured on-chain."} />
-              <Explain done={Boolean(latestRefined)} title="Feedback refined" waiting="Send feedback after generation." doneText="The Style Curator refined the profile from feedback." />
-            </div>
-          </div>
+          <div className="panel"><div className="panel-title">Lifecycle</div><div className="steps">{steps.map((step) => <div className="step" data-state={step.state} key={step.label}><span className="step-dot" /><div><strong>{step.label}</strong><span>{step.detail ?? step.state}</span></div></div>)}</div></div>
 
           <div className="panel activity-panel">
-            <div className="panel-heading-line">
-              <div className="panel-title">Live agent activity</div>
-              <span className="tiny-pill">{activityEvents.length} events</span>
-            </div>
+            <div className="panel-title">Live agent activity</div>
             <div className="activity-list">
               {activityEvents.length === 0 ? <p className="muted">No agent activity yet. Start upload or generation.</p> : null}
               {activityEvents.map((event) => (
@@ -699,9 +584,9 @@ export function TestPageClient() {
           </div>
 
           <div className="panel raw-panel">
-            <div className="panel-heading-line">
-              <div className="panel-title">Raw inspector</div>
-              {selectedEvent ? <button type="button" className="ghost-small" onClick={() => setSelectedEventId("")}>Clear</button> : null}
+            <div className="raw-heading">
+              <div className="panel-title">Raw selected log</div>
+              {selectedEvent ? <button type="button" onClick={() => setSelectedEventId("")}>Clear</button> : null}
             </div>
             {selectedEvent ? (
               <div className="raw-content">
@@ -712,7 +597,7 @@ export function TestPageClient() {
                 <pre className="json-box raw-json">{JSON.stringify(selectedEvent, null, 2)}</pre>
               </div>
             ) : (
-              <p className="muted">Click any activity row or ledger row to expand the exact event envelope and payload.</p>
+              <p className="muted">Click any activity row or event log row to inspect the exact raw event payload.</p>
             )}
           </div>
 
@@ -724,21 +609,18 @@ export function TestPageClient() {
             </div>
           </div>
 
-          <div className="panel"><div className="panel-title">Latest on-chain tx</div><div className="output-box tx-box">{lastTxHash ? <a href={`${GALILEO_EXPLORER}/tx/${lastTxHash}`} rel="noreferrer" target="_blank">{lastTxHash}</a> : "No transaction sent yet."}</div></div>
-          <div className="panel"><div className="panel-title">Backend health</div><pre className="json-box health-json">{health ? JSON.stringify(health, null, 2) : "No health check yet."}</pre></div>
-        </aside>
+          <div className="panel"><div className="panel-title">Latest on-chain tx</div><div className="output-box">{lastTxHash ? <a href={`${GALILEO_EXPLORER}/tx/${lastTxHash}`} rel="noreferrer" target="_blank">{lastTxHash}</a> : "No transaction sent yet."}</div></div>
+          <div className="panel"><div className="panel-title">Agents</div><pre className="json-box">{health ? JSON.stringify(health, null, 2) : "No health check yet."}</pre></div>
+        </div>
       </section>
 
-      <section className="results-board">
-        <div className="panel result-panel"><div className="panel-title">Generated draft</div><div className="output-box">{generatedDraft || "No draft yet."}</div></div>
-        <div className="panel result-panel"><div className="panel-title">Platform variants</div>{Object.keys(platformVariants).length === 0 ? <p className="muted">No variants yet.</p> : <div className="variant-list">{Object.entries(platformVariants).map(([platform, variant]) => <div key={platform}><strong>{platform}</strong><p>{variant}</p></div>)}</div>}</div>
+      <section className="output-grid">
+        <div className="panel"><div className="panel-title">Generated draft</div><div className="output-box">{generatedDraft || "No draft yet."}</div></div>
+        <div className="panel"><div className="panel-title">Platform variants</div>{Object.keys(platformVariants).length === 0 ? <p className="muted">No variants yet.</p> : <div className="variant-list">{Object.entries(platformVariants).map(([platform, variant]) => <div key={platform}><strong>{platform}</strong><p>{variant}</p></div>)}</div>}</div>
       </section>
 
       <section className="panel events-panel">
-        <div className="panel-heading-line">
-          <div className="panel-title">Real-time event ledger</div>
-          <span className="tiny-pill">{events.length} events</span>
-        </div>
+        <div className="panel-title">Real-time event log</div>
         <div className="event-list">{eventGroups.length === 0 ? <p className="muted">No events yet.</p> : null}{eventGroups.map((group) => <div className="event-group" key={group.requestId}><div className="event-group-head"><code>{group.requestId}</code><span data-state={streamStatus[group.requestId] ?? "closed"}>{streamStatus[group.requestId] ?? "closed"}</span></div>{group.events.map((event) => <button aria-pressed={selectedEventId === event.id} className="event-row" data-selected={selectedEventId === event.id} data-type={event.type === "agent.activity" ? "activity" : "event"} key={event.id} onClick={() => setSelectedEventId(event.id)} type="button"><span>{event.type}</span><small>{eventExplanation(event)}</small><time>{formatTime(event.timestamp)}</time></button>)}</div>)}</div>
       </section>
     </main>
@@ -868,10 +750,6 @@ function eventExplanation(event: AgentEvent): string {
   if (event.type === "style.minted") return `On-chain mint confirmed: token ${event.styleId}.`;
   if (event.type === "credit.purchase.intent.created") return "Credit purchase transaction created for MetaMask.";
   if (event.type === "credit.purchased") return "Credit purchase confirmed on-chain.";
-  if (event.type === "credit.auto_refill.intent.created") return "Auto-refill configuration transaction created for MetaMask.";
-  if (event.type === "credit.auto_refill.configured") return "Auto-refill budget confirmed on-chain.";
-  if (event.type === "credit.replenished") return "KeeperHub confirmed an autonomous credit refill.";
-  if (event.type === "credit.replenish_failed") return String(event.payload.reason ?? "KeeperHub could not refill credits.");
   if (event.type === "generation.published") return "Variants created; spend-credit transaction is ready.";
   if (event.type === "settlement.intent.created") return "Credit spend and royalty settlement transaction created.";
   if (event.type === "credit.deducted") return "Credit spend confirmed on-chain.";

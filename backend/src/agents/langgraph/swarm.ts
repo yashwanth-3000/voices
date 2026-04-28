@@ -802,7 +802,7 @@ export class VoicesLangGraphSwarm {
         const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
         const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
         const spendIntent = state.spendIntent ?? this.deps.chain.spendCreditIntent(styleId);
-        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "started", "Creating the user-signed spend-credit transaction intent. KeeperHub is reserved for autonomous refill calls.", {
+        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "started", "Creating the spend-credit transaction intent and asking KeeperHub when configured.", {
           styleId,
           consumerAddress
         });
@@ -815,24 +815,39 @@ export class VoicesLangGraphSwarm {
           consumerAddress,
           payload: { requestId, spendIntent, langGraphThread: `voices:${requestId}` }
         });
-        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "completed", "Spend-credit intent is ready for MetaMask. This path is user-mediated, not KeeperHub-mediated.", {
+        const settlement = await this.deps.keeperhub.executeTransaction(spendIntent);
+        if (settlement.status === "confirmed") {
+          await this.deps.publish({
+            id: `${event.id}:credit.deducted`,
+            type: "credit.deducted",
+            timestamp: Date.now(),
+            actor: "system",
+            styleId,
+            consumerAddress,
+            payload: { requestId, txHash: settlement.txHash, langGraphThread: `voices:${requestId}` }
+          });
+        }
+        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "completed", `Settlement status is ${settlement.status}.`, {
           styleId,
           consumerAddress,
-          to: spendIntent.to
+          workflowId: settlement.workflowId,
+          txHash: settlement.txHash,
+          reason: settlement.reason
         });
         return new Command({
           update: {
-            ...appendAgentMessage("distribution_mgr", "Credit spend intent prepared for the consumer wallet."),
+            ...appendAgentMessage("distribution_mgr", `Credit spend submitted with status ${settlement.status}.`),
             spendIntent,
-            settlementStatus: "awaiting_wallet_signature",
-            lastEventType: "settlement.intent.created",
-            lastError: undefined
+            settlementStatus: settlement.status,
+            keeperHubWorkflowId: settlement.workflowId,
+            lastEventType: settlement.status === "confirmed" ? "credit.deducted" : "settlement.intent.created",
+            lastError: settlement.status === "failed" ? settlement.reason : undefined
           }
         });
       },
       {
         name: "deduct_credit_via_keeper",
-        description: "Create the current CreditSystem.spendCredit transaction intent for the user wallet. KeeperHub is not used for user-mediated settlement.",
+        description: "Create the current CreditSystem.spendCredit transaction intent and submit it through KeeperHub when configured.",
         schema: z.object({})
       }
     );
@@ -1044,12 +1059,10 @@ export class VoicesLangGraphSwarm {
         thread_id: `voices:${requestId}`,
         checkpoint_ns: "runtime"
       },
-      streamMode: "updates"
+      streamMode: "values"
     });
-    let streamStep = 0;
-    for await (const chunk of stream) {
-      streamStep += 1;
-      await this.publishStreamUpdate(event, activeAgent, requestId, streamStep, chunk);
+    for await (const _chunk of stream) {
+      // Iterating the stream drives LangGraph execution and persists each checkpoint.
     }
     await this.deps.publish({
       id: `${event.id}:agent.activity:${createUlid()}`,
@@ -1067,38 +1080,6 @@ export class VoicesLangGraphSwarm {
         status: "completed",
         message: `${agentLabel(activeAgent)} finished the LangGraph run.`,
         langGraphThread: `voices:${requestId}`
-      }
-    });
-  }
-
-  private async publishStreamUpdate(
-    event: AgentEvent,
-    fallbackAgent: VoicesAgentName,
-    requestId: string,
-    streamStep: number,
-    chunk: unknown
-  ): Promise<void> {
-    const agent = agentFromStreamChunk(chunk, fallbackAgent);
-    const loggableChunk = toLoggable(chunk, 16_000);
-    await this.deps.publish({
-      id: `${event.id}:agent.activity:${createUlid()}`,
-      type: "agent.activity",
-      timestamp: Date.now(),
-      actor: agent,
-      styleId: event.styleId ?? stringValue(event.payload.styleId, undefined),
-      consumerAddress: event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
-      payload: {
-        requestId,
-        sourceEventId: event.id,
-        agent,
-        agentLabel: agentLabel(agent),
-        tool: "langgraph.stream",
-        status: "completed",
-        message: streamSummary(chunk, streamStep),
-        langGraphThread: `voices:${requestId}`,
-        streamStep,
-        streamMode: "updates",
-        rawUpdate: loggableChunk
       }
     });
   }
@@ -1178,149 +1159,41 @@ export class VoicesLangGraphSwarm {
   private async handleCreditLow(state: VoicesSwarmStateValue, event: AgentEvent): Promise<VoicesSwarmUpdate> {
     const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
     const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
-    const [credits, creditPrice, config] = await Promise.all([
-      this.deps.chain.credits(consumerAddress),
-      this.deps.chain.creditPrice(),
-      this.deps.chain.autoRefillOf(consumerAddress)
-    ]);
-
-    if (!config.supported) {
-      await this.deps.publish({
-        id: `${event.id}:credit.replenish_failed`,
-        type: "credit.replenish_failed",
-        timestamp: Date.now(),
-        actor: "distribution_mgr",
-        styleId: state.currentStyleId ?? event.styleId,
-        consumerAddress,
-        payload: {
-          requestId,
-          reason: "auto_refill_contract_not_deployed",
-          langGraphThread: `voices:${requestId}`
-        }
+    const settings = await this.deps.storage.kvGet<{ autoTopUp?: boolean; topUpCredits?: string }>(
+      `consumer:${consumerAddress}:settings`
+    );
+    if (!settings?.autoTopUp) {
+      await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "completed", "Auto-top-up is disabled, so no transaction was prepared.", {
+        consumerAddress
       });
-      await this.publishToolActivity(
-        state,
-        "distribution_mgr",
-        "topup_credits_via_keeper",
-        "failed",
-        "The deployed CreditSystem does not expose auto-refill yet. Redeploy the upgraded contract before KeeperHub can refill credits.",
-        { consumerAddress }
-      );
-      return {
-        ...appendAgentMessage("distribution_mgr", "Auto-refill contract method is not deployed yet."),
-        lastEventType: "credit.replenish_failed",
-        lastError: "auto_refill_contract_not_deployed"
-      };
+      return appendAgentMessage("distribution_mgr", `Auto-top-up is disabled for ${consumerAddress}; no transaction was prepared.`);
     }
 
-    if (!config.enabled) {
-      await this.publishToolActivity(
-        state,
-        "distribution_mgr",
-        "topup_credits_via_keeper",
-        "completed",
-        "On-chain auto-refill is disabled, so KeeperHub was not called.",
-        { consumerAddress, credits: credits.toString() }
-      );
-      return appendAgentMessage("distribution_mgr", `Auto-refill is disabled for ${consumerAddress}; no KeeperHub call was made.`);
-    }
-
-    if (credits > config.threshold) {
-      await this.publishToolActivity(
-        state,
-        "distribution_mgr",
-        "topup_credits_via_keeper",
-        "completed",
-        "Credit balance is above the auto-refill threshold, so KeeperHub was not called.",
-        { consumerAddress, credits: credits.toString(), threshold: config.threshold.toString() }
-      );
-      return appendAgentMessage("distribution_mgr", `Credits are above threshold for ${consumerAddress}; no refill needed.`);
-    }
-
-    const refillCost = config.perRefill * creditPrice;
-    const remainingBudget = config.maxBudget > config.spent ? config.maxBudget - config.spent : 0n;
-    if (remainingBudget < refillCost) {
-      await this.deps.publish({
-        id: `${event.id}:credit.replenish_failed`,
-        type: "credit.replenish_failed",
-        timestamp: Date.now(),
-        actor: "distribution_mgr",
-        styleId: state.currentStyleId ?? event.styleId,
-        consumerAddress,
-        payload: {
-          requestId,
-          reason: "auto_refill_budget_exhausted",
-          remainingBudget: remainingBudget.toString(),
-          refillCost: refillCost.toString(),
-          langGraphThread: `voices:${requestId}`
-        }
-      });
-      await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "failed", "Auto-refill budget is exhausted.", {
-        consumerAddress,
-        remainingBudget: remainingBudget.toString(),
-        refillCost: refillCost.toString()
-      });
-      return {
-        ...appendAgentMessage("distribution_mgr", `Auto-refill budget is exhausted for ${consumerAddress}.`),
-        lastEventType: "credit.replenish_failed",
-        lastError: "auto_refill_budget_exhausted"
-      };
-    }
-
-    const refillCall = this.deps.chain.refillFromAllowanceCall(consumerAddress);
-    await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "started", "Calling KeeperHub Direct Execution for CreditSystem.refillFromAllowance.", {
-      consumerAddress,
-      threshold: config.threshold.toString(),
-      perRefill: config.perRefill.toString(),
-      remainingBudget: remainingBudget.toString()
-    });
-    const result = await this.deps.keeperhub.executeContractCall(refillCall);
-    const eventType = result.status === "confirmed" ? "credit.replenished" : "credit.replenish_failed";
+    const intent = await this.deps.chain.buyCreditsIntent(BigInt(settings.topUpCredits ?? "5"));
+    const result = await this.deps.keeperhub.executeTransaction(intent);
     await this.deps.publish({
-      id: `${event.id}:${eventType}`,
-      type: eventType,
+      id: `${event.id}:credit.replenished`,
+      type: "credit.replenished",
       timestamp: Date.now(),
-      actor: "distribution_mgr",
+      actor: "system",
       styleId: state.currentStyleId ?? event.styleId,
       consumerAddress,
       payload: {
         requestId,
         status: result.status,
         workflowId: result.workflowId,
-        txHash: result.txHash,
-        blockExplorerUrl: result.blockExplorerUrl,
         reason: result.reason,
-        refillCall,
-        autoRefill: stringifyAutoRefillConfig(config),
         langGraphThread: `voices:${requestId}`
       }
     });
-    await this.publishToolActivity(
-      state,
-      "distribution_mgr",
-      "topup_credits_via_keeper",
-      result.status === "confirmed" ? "completed" : "failed",
-      result.status === "confirmed"
-        ? "KeeperHub confirmed the autonomous credit refill."
-        : "KeeperHub could not execute the autonomous credit refill.",
-      {
+    await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "completed", "Auto-top-up workflow was prepared through KeeperHub.", {
       consumerAddress,
       status: result.status,
-      workflowId: result.workflowId,
-      txHash: result.txHash,
-      reason: result.reason
-      }
-    );
+      workflowId: result.workflowId
+    });
     return {
-      ...appendAgentMessage(
-        "distribution_mgr",
-        result.status === "confirmed"
-          ? `KeeperHub refilled ${consumerAddress} with ${config.perRefill.toString()} credit(s).`
-          : `KeeperHub refill could not complete for ${consumerAddress}: ${result.reason ?? result.status}.`
-      ),
-      keeperHubWorkflowId: result.workflowId,
-      lastEventType: eventType,
-      lastError: result.status === "confirmed" ? undefined : result.reason ?? result.status
+      ...appendAgentMessage("distribution_mgr", `Auto-top-up workflow prepared for ${consumerAddress}.`),
+      lastEventType: "credit.replenished"
     };
   }
 
@@ -1564,7 +1437,8 @@ class ZeroGToolPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
 
 function createPlannerModel(agentName: VoicesAgentName, compute: AgentCompute): BaseChatModel {
   const plannerMode = process.env.AGENT_LANGGRAPH_PLANNER_MODE;
-  const useZeroGPlanner = plannerMode === "0g";
+  const liveCompute = process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live";
+  const useZeroGPlanner = plannerMode === "0g" || (plannerMode !== "deterministic" && liveCompute);
   return useZeroGPlanner ? new ZeroGToolPlannerModel(agentName, compute) : new VoicesPlannerModel(agentName);
 }
 
@@ -1612,7 +1486,7 @@ function toolHasRun(toolName: string, messages: BaseMessage[], transcript: strin
     log_draft: ["generation.drafted emitted"],
     handoff_to_distribution: ["Handing off style"],
     tune_for_platform: ["Platform variants created"],
-    deduct_credit_via_keeper: ["Credit spend submitted", "Credit spend intent prepared"],
+    deduct_credit_via_keeper: ["Credit spend submitted"],
     deposit_royalty_via_keeper: ["Royalty settlement"],
     topup_credits_via_keeper: ["Auto-top-up"],
     handoff_to_content_creator: ["Handing off to Content Creator"],
@@ -1644,65 +1518,6 @@ function messagesToPlannerText(messages: BaseMessage[]): string {
     .join("\n\n");
 }
 
-function agentFromStreamChunk(chunk: unknown, fallback: VoicesAgentName): VoicesAgentName {
-  const keys = objectKeys(chunk);
-  if (keys.includes("style_curator")) {
-    return "style_curator";
-  }
-  if (keys.includes("content_creator")) {
-    return "content_creator";
-  }
-  if (keys.includes("distribution_mgr")) {
-    return "distribution_mgr";
-  }
-  return fallback;
-}
-
-function streamSummary(chunk: unknown, step: number): string {
-  const keys = objectKeys(chunk);
-  if (keys.length > 0) {
-    return `LangGraph streamed update ${step} from ${keys.join(", ")}. Click to inspect raw state.`;
-  }
-  return `LangGraph streamed update ${step}. Click to inspect raw state.`;
-}
-
-function objectKeys(value: unknown): string[] {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return [];
-  }
-  return Object.keys(value as Record<string, unknown>);
-}
-
-function toLoggable(value: unknown, maxChars: number): unknown {
-  try {
-    const serialized = JSON.stringify(value, (_key, candidate) => {
-      if (typeof candidate === "bigint") {
-        return candidate.toString();
-      }
-      if (candidate instanceof Error) {
-        return { name: candidate.name, message: candidate.message, stack: candidate.stack };
-      }
-      if (typeof candidate === "function") {
-        return `[function ${candidate.name || "anonymous"}]`;
-      }
-      return candidate;
-    });
-    if (!serialized) {
-      return null;
-    }
-    if (serialized.length > maxChars) {
-      return {
-        truncated: true,
-        originalCharacters: serialized.length,
-        preview: serialized.slice(0, maxChars)
-      };
-    }
-    return JSON.parse(serialized) as unknown;
-  } catch (error) {
-    return { unserializable: true, value: String(value), error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
 function parsePlannerDecision(content: string): { tool?: string; args?: Record<string, unknown>; final?: string } {
   try {
     const parsed = JSON.parse(extractFirstJsonObject(stripCodeFence(content))) as Record<string, unknown>;
@@ -1732,9 +1547,7 @@ const CONTENT_CREATOR_PROMPT = [
 const DISTRIBUTION_MANAGER_PROMPT = [
   "You are the Distribution Manager agent for Voices on 0G.",
   "Tune drafts for X, LinkedIn, and Instagram in one 0G Compute call where possible.",
-  "Prepare user-mediated CreditSystem.spendCredit settlement intents without pretending a wallet signature happened.",
-  "KeeperHub is only for autonomous execution: when credit.low arrives, read the on-chain autoRefill config and call topup_credits_via_keeper only when enabled, balance is at or below threshold, and budget remains.",
-  "Never call KeeperHub for normal MetaMask settlement. Do call KeeperHub for permissionless CreditSystem.refillFromAllowance so the agent can refill credits without a user click."
+  "Prepare credit spend, royalty settlement, and low-credit top-up intents without pretending a wallet signature or KeeperHub confirmation happened."
 ].join("\n");
 
 function agentLabel(agent: VoicesAgentName): string {
@@ -2118,22 +1931,4 @@ function arrayValue(value: unknown, fallback: string[]): string[] {
 
 function recordValue(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
-}
-
-function stringifyAutoRefillConfig(config: {
-  maxBudget: bigint;
-  spent: bigint;
-  threshold: bigint;
-  perRefill: bigint;
-  enabled: boolean;
-  supported: boolean;
-}): Record<string, string | boolean> {
-  return {
-    maxBudget: config.maxBudget.toString(),
-    spent: config.spent.toString(),
-    threshold: config.threshold.toString(),
-    perRefill: config.perRefill.toString(),
-    enabled: config.enabled,
-    supported: config.supported
-  };
 }

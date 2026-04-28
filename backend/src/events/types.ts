@@ -15,14 +15,11 @@ export type EventType =
   | "generation.published"
   | "generation.failed"
   | "feedback.received"
-  | "credit.auto_refill.intent.created"
-  | "credit.auto_refill.configured"
   | "credit.purchase.intent.created"
   | "credit.purchased"
   | "credit.deducted"
   | "credit.low"
   | "credit.replenished"
-  | "credit.replenish_failed"
   | "royalty.settled";
 
 export type AgentEvent = {
