@@ -7,32 +7,17 @@ export function Navbar() {
         <div className="topbarInner">
           <a className="brand" href="/" aria-label="Go to home">
             <span className="brandMark" aria-hidden="true" />
-            <span>ContentHub</span>
+            <span>Voices</span>
           </a>
 
           <nav className="navLinks hideMobile" aria-label="Primary">
-            <a href="/styles">
-              <span>Styles</span>
-              <span className="navIcon" aria-hidden="true">
-                ✎
-              </span>
-            </a>
-            <a href="/upload">
-              <span>Upload</span>
-              <span className="navIcon" aria-hidden="true">
-                +
-              </span>
-            </a>
-            <a href="/#creators">
-              <span>Creators</span>
-              <span className="navIcon" aria-hidden="true">
-                ⌘
-              </span>
-            </a>
+            <a href="/styles">Styles</a>
+            <a href="/upload">Upload</a>
+            <a href="/#creators">Creators</a>
             <a href="/#how">How it works</a>
           </nav>
 
-          <Button href="/signin" variant="dark" ariaLabel="Sign in">
+          <Button href="/signin" variant="dark" ariaLabel="Sign in" className="navLoginButton">
             Sign in
           </Button>
         </div>

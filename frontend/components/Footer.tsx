@@ -7,7 +7,7 @@ export function Footer() {
           <div>
             <div className="brand">
               <span className="brandMark" aria-hidden="true" />
-              <span>ContentHub</span>
+              <span>Voices</span>
             </div>
             <p className="fine">
               A frontend-only prototype for a marketplace where creators monetize
@@ -23,7 +23,7 @@ export function Footer() {
             <a href="#upload">Upload</a>
           </div>
         </div>
-        <p className="fine">© {new Date().getFullYear()} ContentHub</p>
+        <p className="fine">© {new Date().getFullYear()} Voices</p>
       </div>
     </footer>
   );
