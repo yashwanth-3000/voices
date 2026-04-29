@@ -13,5 +13,8 @@
     "smoke:agents": "pnpm --filter backend smoke:agents",
     "storage:hello": "pnpm --filter backend storage:hello",
     "compute:hello": "pnpm --filter backend compute:hello"
+  },
+  "dependencies": {
+    "ethers": "^6.16.0"
   }
 }
