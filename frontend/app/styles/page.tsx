@@ -1,7 +1,11 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { StyleListingCard } from "../../components/StyleListingCard";
 import { styles } from "../../lib/styles";
+import { readMintedStyles } from "../../lib/mintedStyles";
 
 const fillLines = [
   "Includes tone traits, cadence notes, and sample outputs for fast comparison.",
@@ -10,6 +14,14 @@ const fillLines = [
 ];
 
 export default function StylesPage() {
+  const [minted, setMinted] = useState<typeof styles>([]);
+
+  useEffect(() => {
+    setMinted(readMintedStyles() as typeof styles);
+  }, []);
+
+  const allStyles = useMemo(() => [...styles, ...minted], [minted]);
+
   return (
     <div>
       <Navbar />
@@ -26,7 +38,7 @@ export default function StylesPage() {
             </p>
 
             <div className="styleGallery" style={{ marginTop: 18 }}>
-              {styles.map((s, i) => (
+              {allStyles.map((s, i) => (
                 <StyleListingCard
                   key={s.id}
                   href={`/styles/${s.id}`}

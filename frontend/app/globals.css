@@ -304,6 +304,18 @@ button{font-family:inherit}
   box-shadow:var(--shadow2);
 }
 
+.btn:disabled{
+  opacity:.6;
+  cursor:not-allowed;
+  transform:none !important;
+}
+
+.btn:disabled:hover{
+  background:rgba(255,250,244,.9);
+  border-color:var(--line);
+  box-shadow:none;
+}
+
 .btn:active{transform:translateY(0)}
 
 .btnPrimary{
@@ -1142,6 +1154,213 @@ button{font-family:inherit}
 .textArea:focus{
   border-color: rgba(243,109,56,.30);
   box-shadow: 0 0 0 4px rgba(243,109,56,.10);
+}
+
+/* Upload / mint UI */
+.dropzone{
+  border:1px dashed rgba(76,49,31,.26);
+  background:rgba(255,255,255,.45);
+  border-radius:18px;
+  padding:18px;
+  min-height:132px;
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  align-items:flex-start;
+  gap:10px;
+  transition:background .18s ease,border-color .18s ease, transform .18s ease;
+}
+.dropzoneActive{
+  border-color: rgba(243,109,56,.45);
+  background: rgba(243,109,56,.08);
+  transform: translateY(-2px);
+}
+.dropzoneTitle{
+  font-weight:800;
+  letter-spacing:0;
+  font-size:16px;
+  font-family:var(--font-heading) !important;
+}
+.dropzoneSub{
+  color:var(--muted);
+  font-weight:550;
+  font-size:13px;
+  margin-top:4px;
+}
+.dropzoneAccept{
+  color:var(--muted2);
+  font-size:12.5px;
+  font-weight:650;
+}
+
+.uploadCharRow{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  margin-top:10px;
+}
+.uploadCharHint{
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.35;
+}
+
+.panel .panelBody .field{display:flex;flex-direction:column;gap:8px}
+.fieldLabel{
+  color:var(--muted2);
+  font-size:12px;
+  font-weight:750;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+
+.textInput{
+  width:100%;
+  border-radius:16px;
+  padding:12px 12px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.62);
+  color: var(--text);
+  outline:none;
+  line-height:1.55;
+}
+.textInput:focus{
+  border-color: rgba(243,109,56,.30);
+  box-shadow: 0 0 0 4px rgba(243,109,56,.10);
+}
+
+.segmented{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+}
+.segment{
+  border-radius:999px;
+  padding:10px 12px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.55);
+  color: var(--muted);
+  font-weight:750;
+  font-size:13px;
+  cursor:pointer;
+  transition: transform .18s ease, border-color .18s ease, background .18s ease, color .18s ease;
+}
+.segment:hover{
+  transform: translateY(-1px);
+  border-color: var(--line2);
+  background: rgba(255,255,255,.76);
+  color: var(--text);
+}
+.segmentActive{
+  border-color: rgba(243,109,56,.38);
+  background: rgba(243,109,56,.10);
+  color:#d85a29;
+}
+
+.toggleRow{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.toggleBtn{
+  border-radius:999px;
+  padding:10px 14px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.55);
+  color: var(--muted);
+  font-weight:750;
+  font-size:13px;
+  cursor:pointer;
+  transition: transform .18s ease, border-color .18s ease, background .18s ease, color .18s ease;
+}
+.toggleBtnOn{
+  border-color: rgba(243,109,56,.38);
+  background: rgba(243,109,56,.10);
+  color:#d85a29;
+}
+.toggleBtn:hover{
+  transform: translateY(-1px);
+  border-color: var(--line2);
+  background: rgba(255,255,255,.76);
+  color: var(--text);
+}
+
+.mintActivity{
+  margin-top:14px;
+  padding-top:14px;
+  border-top:1px solid rgba(76,49,31,.08);
+}
+.mintSteps{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.mintStep{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:10px 12px;
+  border-radius:16px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.48);
+}
+.mintStepPending{
+  opacity:.75;
+}
+.mintStepDone{
+  border-color: rgba(243,109,56,.30);
+  background: rgba(243,109,56,.10);
+}
+.mintBullet{
+  width:26px;
+  height:26px;
+  border-radius:12px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border:1px solid rgba(76,49,31,.10);
+  background: rgba(255,255,255,.6);
+  font-weight:900;
+}
+.mintStepDone .mintBullet{
+  border-color: rgba(243,109,56,.30);
+  background: rgba(243,109,56,.12);
+  color:#d85a29;
+}
+.mintStepLabel{
+  font-weight:700;
+  font-size:14px;
+}
+
+.mintSuccess{
+  margin-top:14px;
+}
+
+.uploadPreviewCard{
+  width:100%;
+}
+
+.mintChecks{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.checkRow{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.checkDot{
+  width:12px;
+  height:12px;
+  border-radius:99px;
+  border:1px solid rgba(76,49,31,.18);
+  background: rgba(255,255,255,.55);
+}
+.checkDotOn{
+  border-color: rgba(243,109,56,.35);
+  background: rgba(243,109,56,.12);
 }
 
 @media (max-width: 980px){

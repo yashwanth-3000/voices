@@ -1,8 +1,12 @@
+ "use client";
+
+import { useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../components/Navbar";
 import { Footer } from "../../../components/Footer";
 import { Button } from "../../../components/Button";
 import { PreviewBlock } from "../../../components/PreviewBlock";
 import { getStyle } from "../../../lib/styles";
+import { readMintedStyles } from "../../../lib/mintedStyles";
 
 type PageProps = {
   params: { slug: string };
@@ -10,9 +14,37 @@ type PageProps = {
 
 export default function StyleDetailPage({ params }: PageProps) {
   // Note: the route segment folder is `[slug]`, but we treat it as the style `id`.
-  const style = getStyle(params.slug);
+  const staticStyle = useMemo(() => getStyle(params.slug), [params.slug]);
+  const [mintedStyle, setMintedStyle] = useState<ReturnType<typeof getStyle> | undefined>(undefined);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+    const minted = readMintedStyles().find((s) => s.id === params.slug);
+    setMintedStyle(minted);
+  }, [params.slug]);
+
+  const style = staticStyle ?? mintedStyle;
 
   if (!style) {
+    if (!mounted) {
+      return (
+        <div>
+          <Navbar />
+          <main className="siteShell">
+            <section className="section sectionTightTop">
+              <div className="container">
+                <div className="kicker">Loading</div>
+                <h1 className="sectionTitle" style={{ marginTop: 10 }}>
+                  Finding style…
+                </h1>
+              </div>
+            </section>
+          </main>
+          <Footer />
+        </div>
+      );
+    }
     return (
       <div>
         <Navbar />

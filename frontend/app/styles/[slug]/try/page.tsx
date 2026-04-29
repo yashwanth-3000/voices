@@ -1,10 +1,11 @@
- "use client";
+"use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
 import { Footer } from "../../../../components/Footer";
 import { Button } from "../../../../components/Button";
 import { getStyle } from "../../../../lib/styles";
+import { readMintedStyles } from "../../../../lib/mintedStyles";
 
 type PageProps = {
   params: { slug: string };
@@ -40,18 +41,50 @@ function mockGenerate(styleTitle: string, prompt: string) {
 }
 
 export default function TryStylePage({ params }: PageProps) {
-  const style = useMemo(() => getStyle(params.slug), [params.slug]);
+  const staticStyle = useMemo(() => getStyle(params.slug), [params.slug]);
+  const [mintedStyle, setMintedStyle] = useState<typeof staticStyle | undefined>(undefined);
+  const style = staticStyle ?? mintedStyle;
+
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<Msg[]>(() => {
-    const title = style?.title ?? "this style";
-    return [
+
+  useEffect(() => {
+    const minted = readMintedStyles().find((s) => s.id === params.slug);
+    setMintedStyle(minted);
+  }, [params.slug]);
+
+  useEffect(() => {
+    if (!style) return;
+    setMessages([
       {
         id: "m1",
         role: "assistant",
-        text: `You’re trying “${title}”.\n\nTell me what you want to write (e.g., “Announce a new feature” or “Write a landing page hero”).`,
+        text: `You’re trying “${style.title}”.\n\nTell me what you want to write (e.g., “Announce a new feature” or “Write a landing page hero”).`,
       },
-    ];
-  });
+    ]);
+  }, [style?.id]);
+
+  const suggestions = [
+    "Write a product launch thread for a new feature.",
+    "Rewrite this paragraph in a more confident voice.",
+    "Create a landing page hero + subhead for a writing tool.",
+  ];
+
+  function send(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed || !style) return;
+
+    const now = Date.now().toString(36);
+    const userMsg: Msg = { id: `u-${now}`, role: "user", text: trimmed };
+    const assistantMsg: Msg = {
+      id: `a-${now}`,
+      role: "assistant",
+      text: mockGenerate(style.title, trimmed),
+    };
+
+    setMessages((m) => [...m, userMsg, assistantMsg]);
+    setInput("");
+  }
 
   if (!style) {
     return (
@@ -75,26 +108,6 @@ export default function TryStylePage({ params }: PageProps) {
         <Footer />
       </div>
     );
-  }
-
-  const suggestions = [
-    "Write a product launch thread for a new feature.",
-    "Rewrite this paragraph in a more confident voice.",
-    "Create a landing page hero + subhead for a writing tool.",
-  ];
-
-  function send(text: string) {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    const now = Date.now().toString(36);
-    const userMsg: Msg = { id: `u-${now}`, role: "user", text: trimmed };
-    const assistantMsg: Msg = {
-      id: `a-${now}`,
-      role: "assistant",
-      text: mockGenerate(style!.title, trimmed),
-    };
-    setMessages((m) => [...m, userMsg, assistantMsg]);
-    setInput("");
   }
 
   return (
