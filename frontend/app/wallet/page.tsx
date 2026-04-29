@@ -1,10 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
-import { Button } from "../../components/Button";
 
 const WALLET_KEY = "voices.wallet.v1";
 
@@ -26,6 +25,7 @@ function shortAddress(addr: string) {
 
 export default function WalletPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [address, setAddress] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -44,10 +44,14 @@ export default function WalletPage() {
   function connectDummyWallet() {
     setBusy(true);
     setTimeout(() => {
-      localStorage.setItem(WALLET_KEY, JSON.stringify({ address: fakeAddress }));
+      localStorage.setItem(
+        WALLET_KEY,
+        JSON.stringify({ address: fakeAddress, balance0g: "0.42", credits: 12 }),
+      );
       setAddress(fakeAddress);
       setBusy(false);
-      router.replace("/upload");
+      const returnTo = searchParams.get("returnTo");
+      router.replace(returnTo || "/upload");
     }, 650);
   }
 
