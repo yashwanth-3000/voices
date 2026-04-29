@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
 import { Footer } from "../../../../components/Footer";
 import { Button } from "../../../../components/Button";
@@ -12,6 +12,7 @@ type PageProps = {
 };
 
 type Msg = { id: string; role: "user" | "assistant"; text: string };
+type MsgGroup = { role: "user" | "assistant"; messages: Msg[] };
 
 function mockGenerate(styleTitle: string, prompt: string) {
   const p = prompt.trim();
@@ -47,6 +48,8 @@ export default function TryStylePage({ params }: PageProps) {
 
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     const minted = readMintedStyles().find((s) => s.id === params.slug);
@@ -70,6 +73,12 @@ export default function TryStylePage({ params }: PageProps) {
     "Create a landing page hero + subhead for a writing tool.",
   ];
 
+  const groups = useMemo(() => groupMessages(messages), [messages]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length]);
+
   function send(text: string) {
     const trimmed = text.trim();
     if (!trimmed || !style) return;
@@ -84,6 +93,20 @@ export default function TryStylePage({ params }: PageProps) {
 
     setMessages((m) => [...m, userMsg, assistantMsg]);
     setInput("");
+    if (inputRef.current) {
+      inputRef.current.style.height = "36px";
+    }
+  }
+
+  function handleInputChange(value: string) {
+    setInput(value);
+    const el = inputRef.current;
+    if (!el) return;
+
+    // Auto-grow up to roughly 2 lines, then keep it fixed.
+    el.style.height = "36px";
+    const next = Math.min(el.scrollHeight, 56);
+    el.style.height = `${next}px`;
   }
 
   if (!style) {
@@ -111,38 +134,76 @@ export default function TryStylePage({ params }: PageProps) {
   }
 
   return (
-    <div className="chatPageRoot">
+    <div className="styleTryPageRoot">
       <Navbar />
-      <main className="siteShell chatPageMain">
-        <section className="section sectionTightTop chatPageSection">
-          <div className="container chatPageContainer">
-            <h1 className="chatPageHeading">Generate content in selected style</h1>
-            <div className="chatShell chatShellFull" style={{ marginTop: 14 }}>
-              <div className="chatHeader">
-                <div className="chatTitle">
-                  Writing with <span className="chatAccent">{style.creatorName}</span> · @
-                  {style.creatorHandle}
+      <main className="siteShell styleTryMain">
+        <a href={`/styles/${style.id}`} className="styleTryBackBtn">
+          Back
+        </a>
+
+        <section className="styleTryChatRoot">
+          <div className="styleTryChatScroller">
+            <div className="styleTryChatInner">
+              <div className="styleTryHeaderMeta">
+                <div className="styleTryTitle">
+                  Writing with <span>{style.creatorName}</span> · @{style.creatorHandle}
                 </div>
-                <div className="chatPill">{style.price}</div>
+                <div className="styleTryPricePill">{style.price}</div>
               </div>
 
-              <div className="chatBody" role="log" aria-label="Chat messages">
-                {messages.map((m) => (
+              <div role="log" aria-label="Chat messages">
+                {groups.map((group, groupIndex) => (
                   <div
-                    key={m.id}
-                    className={m.role === "user" ? "chatMsg chatUser" : "chatMsg chatAssistant"}
+                    key={`${group.role}-${groupIndex}`}
+                    className={`styleTryMessageGroup ${
+                      group.role === "user" ? "styleTryMessageGroupUser" : ""
+                    }`}
                   >
-                    <div className="chatBubble">{m.text}</div>
+                    <div
+                      className={
+                        group.role === "user"
+                          ? "styleTryAvatar styleTryAvatarUser"
+                          : "styleTryAvatar styleTryAvatarAi"
+                      }
+                      aria-hidden="true"
+                    >
+                      {group.role === "user" ? "U" : "AI"}
+                    </div>
+
+                    <div
+                      className={
+                        group.role === "user"
+                          ? "styleTryBubbleStack styleTryBubbleStackUser"
+                          : "styleTryBubbleStack"
+                      }
+                    >
+                      {group.messages.map((m) => (
+                        <div
+                          key={m.id}
+                          className={
+                            m.role === "user"
+                              ? "styleTryBubble styleTryBubbleUser"
+                              : "styleTryBubble styleTryBubbleAi"
+                          }
+                        >
+                          {m.text}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
+                <div ref={bottomRef} />
               </div>
+            </div>
+          </div>
 
-              <div className="chatSuggestions" aria-label="Suggestions">
+          <div className="styleTryComposerWrap">
+            <div className="styleTrySuggestions" aria-label="Suggestions">
                 {suggestions.map((s) => (
                   <button
                     key={s}
                     type="button"
-                    className="chatSuggestion"
+                    className="styleTrySuggestion"
                     onClick={() => send(s)}
                   >
                     {s}
@@ -150,36 +211,40 @@ export default function TryStylePage({ params }: PageProps) {
                 ))}
               </div>
 
-              <div className="chatComposer">
+            <div className="styleTryComposer">
                 <textarea
-                  className="chatInput"
+                  ref={inputRef}
+                  className="styleTryInput"
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => handleInputChange(e.target.value)}
                   placeholder="Describe what you want to write…"
                   aria-label="Message input"
                 />
-                <div className="row" style={{ justifyContent: "space-between", marginTop: 10 }}>
-                  <Button
-                    variant="secondary"
-                    href="/styles"
-                    ariaLabel="Back to styles"
-                  >
-                    Back
-                  </Button>
-                  <Button
-                    variant="primary"
-                    onClick={() => send(input)}
-                    ariaLabel="Generate"
-                  >
-                    Generate
-                  </Button>
-                </div>
+              <button
+                type="button"
+                className="styleTrySendBtn"
+                onClick={() => send(input)}
+                aria-label="Generate"
+              >
+                Generate
+              </button>
               </div>
             </div>
-          </div>
         </section>
       </main>
     </div>
   );
+}
+
+function groupMessages(messages: Msg[]): MsgGroup[] {
+  return messages.reduce<MsgGroup[]>((acc, msg) => {
+    const last = acc[acc.length - 1];
+    if (last && last.role === msg.role) {
+      last.messages.push(msg);
+      return acc;
+    }
+    acc.push({ role: msg.role, messages: [msg] });
+    return acc;
+  }, []);
 }
 
