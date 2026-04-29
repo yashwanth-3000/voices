@@ -3,6 +3,15 @@ import Fastify, { FastifyInstance, FastifyReply } from "fastify";
 import { AgentEvent, createUlid } from "../events/types.js";
 import { Orchestrator, createOrchestrator } from "../orchestrator/index.js";
 
+type StyleOutputPreview = {
+  requestId?: string;
+  prompt?: string;
+  draft?: string;
+  variants?: Record<string, string>;
+  teeVerified?: boolean | null;
+  timestamp?: number;
+};
+
 export type BuildAppOptions = {
   orchestrator?: Orchestrator;
   startOrchestrator?: boolean;
@@ -67,6 +76,34 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     } catch {
       return reply.type("text/plain").send(text);
     }
+  });
+
+  app.get("/styles", async (request) => {
+    const query = request.query as { ids?: string; max?: string };
+    const ids = query.ids
+      ? query.ids.split(",").map((id) => id.trim()).filter(Boolean)
+      : Array.from({ length: clampPositiveInteger(query.max, 12, 50) }, (_item, index) => String(index + 1));
+    const styles = await mapWithConcurrency(ids, 4, async (tokenId) => {
+        try {
+          return await styleDetails(orchestrator, tokenId);
+        } catch {
+          return null;
+        }
+      });
+    const discovered = styles.filter((style): style is NonNullable<typeof style> => Boolean(style));
+    discovered.sort(compareMarketplaceStyles);
+    return {
+      source: runtimeModes().chain === "0g" ? "StyleRegistry.styleOf on 0G Chain" : "mock StyleRegistry",
+      scannedTokenIds: ids,
+      profiledCount: discovered.filter((style) => Boolean(style.profile)).length,
+      generatedCount: discovered.filter((style) => style.recentOutputs.length > 0).length,
+      styles: discovered
+    };
+  });
+
+  app.get("/styles/:tokenId", async (request) => {
+    const params = request.params as { tokenId: string };
+    return styleDetails(orchestrator, params.tokenId);
   });
 
   app.post("/styles/upload", async (request, reply) => {
@@ -335,6 +372,149 @@ async function verifyOrFail<T>(reply: FastifyReply, verify: () => Promise<T>): P
     reply.code(400).send({ ok: false, error: "receipt_verification_failed", message });
     return undefined;
   }
+}
+
+async function styleDetails(orchestrator: Orchestrator, tokenId: string) {
+  const style = await orchestrator.chain.styleOf(tokenId);
+  const profileKey = `style:${tokenId}:profile`;
+  const agentBrainKey = `style:${tokenId}:agentBrain`;
+  const [profile, agentBrain, recentOutputs] = await Promise.all([
+    orchestrator.storage.kvGet<Record<string, unknown>>(profileKey),
+    orchestrator.storage.kvGet<Record<string, unknown>>(agentBrainKey),
+    recentOutputsForStyle(orchestrator, tokenId, style.creator)
+  ]);
+  const manifestRootHash =
+    stringField(agentBrain, "manifest_root_hash") ??
+    (style.encryptedSamplesURI.startsWith("0g://agent-brain/")
+      ? style.encryptedSamplesURI.replace("0g://agent-brain/", "")
+      : undefined);
+  const normalizedAgentBrain = agentBrain
+    ? {
+        manifestRootHash,
+        manifestHash: stringField(agentBrain, "manifest_hash"),
+        manifestStorageTxHash: stringField(agentBrain, "manifest_storage_tx_hash"),
+        keyHash: nestedString(agentBrain, ["encryption", "key_hash"]),
+        wrapMode: nestedString(agentBrain, ["encryption", "wrap_mode"]),
+        samplesRootHash: nestedString(agentBrain, ["samples", "encrypted_root_hash"]),
+        profileRootHash: nestedString(agentBrain, ["profile", "encrypted_root_hash"]),
+        memoryLogStream: nestedString(agentBrain, ["memory", "log_stream"]),
+        computeModel: nestedString(agentBrain, ["compute", "model"]),
+        computeProvider: nestedString(agentBrain, ["compute", "provider"]),
+        manifest: agentBrain
+      }
+    : manifestRootHash
+      ? { manifestRootHash }
+      : null;
+  return {
+    tokenId,
+    source: runtimeModes().chain === "0g" ? "onchain" : "mock",
+    chain: {
+      creator: style.creator,
+      royaltyWei: style.royaltyWei.toString(),
+      totalEarnings: style.totalEarnings.toString(),
+      sampleCount: style.sampleCount,
+      listed: style.listed,
+      encryptedSamplesURI: style.encryptedSamplesURI,
+      profileURI: style.profileURI,
+      language: style.language,
+      genres: style.genres,
+      attestationURI: style.attestationURI,
+      metadataHash: style.metadataHash
+    },
+    profileKey,
+    profile,
+    agentBrain: normalizedAgentBrain,
+    marketplace: marketplaceSummary({ tokenId, profile, agentBrain: normalizedAgentBrain, recentOutputs, listed: style.listed }),
+    recentOutputs,
+    evidenceLinks: [
+      manifestRootHash ? { label: "AgentBrain manifest", url: storageBlobUrl(manifestRootHash) } : undefined
+    ].filter(Boolean)
+  };
+}
+
+function marketplaceSummary(input: {
+  tokenId: string;
+  profile: Record<string, unknown> | null;
+  agentBrain: Record<string, unknown> | null;
+  recentOutputs: StyleOutputPreview[];
+  listed: boolean;
+}) {
+  const labels = profileLabels(input.profile);
+  const sampleExcerpts = stringArrayField(input.profile, "sampleExcerpts").slice(0, 3);
+  const primary = stringField(input.profile, "primary") ?? labels[0];
+  const essence =
+    stringField(input.profile, "voice_essence") ??
+    stringField(input.profile, "voiceEssence") ??
+    (labels.length > 0 ? `${labels.join(", ")} voice profile` : undefined);
+  const latestOutput = input.recentOutputs[0];
+  return {
+    title: primary ? `${titleCase(primary)} style` : `Style token ${input.tokenId}`,
+    status: input.profile ? "ready_to_generate" : "onchain_only",
+    statusLabel: input.profile ? "Ready to generate" : "On-chain only",
+    listed: input.listed,
+    summary: essence ?? "This token is listed on-chain, but no stored profile was found for the current backend.",
+    tags: labels,
+    sampleExcerpts,
+    outputPreview: latestOutput?.draft ?? firstVariant(latestOutput?.variants),
+    outputPrompt: latestOutput?.prompt,
+    outputCount: input.recentOutputs.length,
+    hasAgentBrain: Boolean(input.agentBrain?.manifestRootHash),
+    hasProfile: Boolean(input.profile),
+    updatedAt: numberField(input.profile, "updatedAt")
+  };
+}
+
+async function recentOutputsForStyle(orchestrator: Orchestrator, tokenId: string, creator: string): Promise<StyleOutputPreview[]> {
+  const byRequest = new Map<string, StyleOutputPreview>();
+  for (const event of orchestrator.events.allEvents()) {
+    if (event.styleId !== tokenId) {
+      continue;
+    }
+    const requestId = stringField(event.payload, "requestId") ?? event.id;
+    const existing = byRequest.get(requestId) ?? { requestId };
+    if (event.type === "generation.drafted") {
+      existing.prompt = stringField(event.payload, "prompt") ?? existing.prompt;
+      existing.draft = stringField(event.payload, "draft") ?? existing.draft;
+      existing.teeVerified = booleanField(event.payload, "teeVerified") ?? existing.teeVerified;
+      existing.timestamp = Math.max(existing.timestamp ?? 0, event.timestamp);
+    }
+    if (event.type === "generation.published") {
+      existing.variants = stringRecordField(event.payload, "variants") ?? existing.variants;
+      existing.teeVerified = booleanField(event.payload, "teeVerified") ?? existing.teeVerified;
+      existing.timestamp = Math.max(existing.timestamp ?? 0, event.timestamp);
+    }
+    if (event.type === "generation.drafted" || event.type === "generation.published") {
+      byRequest.set(requestId, existing);
+    }
+  }
+
+  try {
+    const history = await orchestrator.storage.logScan<Record<string, unknown>>(`consumer:${creator}:history`);
+    for (const entry of history) {
+      if (stringField(entry.value, "styleId") !== tokenId) {
+        continue;
+      }
+      const requestId = entry.key.replace(/^(gen|published):/, "");
+      const existing = byRequest.get(requestId) ?? { requestId };
+      if (entry.key.startsWith("gen:")) {
+        existing.prompt = stringField(entry.value, "prompt") ?? existing.prompt;
+        existing.draft = stringField(entry.value, "draft") ?? existing.draft;
+      }
+      if (entry.key.startsWith("published:")) {
+        existing.variants = stringRecordField(entry.value, "variants") ?? existing.variants;
+      }
+      existing.teeVerified = booleanField(entry.value, "teeVerified") ?? existing.teeVerified;
+      existing.timestamp = Math.max(existing.timestamp ?? 0, numberField(entry.value, "timestamp") ?? 0);
+      byRequest.set(requestId, existing);
+    }
+  } catch {
+    // Output history is enrichment only; on-chain style browsing should still work if log reads fail.
+  }
+
+  return [...byRequest.values()]
+    .filter((output) => output.draft || output.variants)
+    .sort((left, right) => (right.timestamp ?? 0) - (left.timestamp ?? 0))
+    .slice(0, 5);
 }
 
 async function buildProofBundle(orchestrator: Orchestrator, requestId: string) {
@@ -608,6 +788,101 @@ function requireStringArray(value: unknown, field: string): string[] {
     throw new Error(`Missing required string array: ${field}`);
   }
   return value as string[];
+}
+
+function clampPositiveInteger(value: string | undefined, fallback: number, max: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.min(parsed, max);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(concurrency, 1), items.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function compareMarketplaceStyles(
+  left: Awaited<ReturnType<typeof styleDetails>>,
+  right: Awaited<ReturnType<typeof styleDetails>>
+): number {
+  const leftReady = left.marketplace.hasProfile ? 1 : 0;
+  const rightReady = right.marketplace.hasProfile ? 1 : 0;
+  if (leftReady !== rightReady) return rightReady - leftReady;
+
+  const leftOutputs = left.recentOutputs.length > 0 ? 1 : 0;
+  const rightOutputs = right.recentOutputs.length > 0 ? 1 : 0;
+  if (leftOutputs !== rightOutputs) return rightOutputs - leftOutputs;
+
+  const leftTime = left.marketplace.updatedAt ?? left.recentOutputs[0]?.timestamp ?? 0;
+  const rightTime = right.marketplace.updatedAt ?? right.recentOutputs[0]?.timestamp ?? 0;
+  if (leftTime !== rightTime) return rightTime - leftTime;
+
+  return Number(right.tokenId) - Number(left.tokenId);
+}
+
+function profileLabels(profile: Record<string, unknown> | null): string[] {
+  const labels = [
+    ...stringArrayField(profile, "labels"),
+    stringField(profile, "primary"),
+    ...stringArrayField(profile, "secondary"),
+    ...stringArrayField(profile, "tone")
+  ].filter((value): value is string => Boolean(value));
+  return [...new Set(labels)].slice(0, 8);
+}
+
+function stringArrayField(value: unknown, key: string): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+  const field = (value as Record<string, unknown>)[key];
+  if (Array.isArray(field)) {
+    return field.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  }
+  return typeof field === "string" && field.trim().length > 0 ? [field] : [];
+}
+
+function stringRecordField(value: unknown, key: string): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const field = (value as Record<string, unknown>)[key];
+  if (!field || typeof field !== "object" || Array.isArray(field)) {
+    return undefined;
+  }
+  const entries = Object.entries(field).filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function booleanField(value: unknown, key: string): boolean | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === "boolean" ? field : undefined;
+}
+
+function firstVariant(variants: Record<string, string> | undefined): string | undefined {
+  return variants ? Object.values(variants).find((value) => value.trim().length > 0) : undefined;
+}
+
+function titleCase(value: string): string {
+  return value.replace(/\w\S*/g, (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase());
 }
 
 function runtimeModes() {

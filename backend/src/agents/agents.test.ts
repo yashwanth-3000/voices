@@ -33,6 +33,97 @@ test("StyleCurator extracts profile and emits a mint transaction intent", async 
   assert.ok(intent.payload.transactionIntent);
 });
 
+test("0G planner mode still follows creator onboarding tool order", async () => {
+  const previousPlannerMode = process.env.AGENT_LANGGRAPH_PLANNER_MODE;
+  process.env.AGENT_LANGGRAPH_PLANNER_MODE = "0g";
+  try {
+    const compute: AgentCompute = {
+      async chat(messages) {
+        const prompt = messages.map((message) => message.content).join("\n");
+        if (prompt.includes("selecting the next LangGraph ReAct tool call")) {
+          return {
+            content: JSON.stringify({ tool: "refine_profile_from_feedback", args: {} }),
+            verified: true,
+            model: "planner-adversarial-test"
+          };
+        }
+        return {
+          content: JSON.stringify({
+            tone: { labels: ["technical", "reflective"], primary: "technical" },
+            vocabulary: { distinctive_words: ["agent", "proof", "storage"] },
+            sentence_rhythm: { average_sentence_length: "medium" },
+            sample_excerpts: ["Every useful action leaves a verifiable trace."],
+            voice_essence: "Technical, reflective, and evidence-oriented."
+          }),
+          verified: true,
+          model: "profile-test"
+        };
+      },
+      async verifyResponse() {
+        return true;
+      },
+      async ensureFunds() {}
+    };
+    const { orchestrator } = createTestOrchestrator({ compute });
+    await orchestrator.start();
+
+    const wallet = ethers.Wallet.createRandom();
+    const message = `I confirm this is my own writing, signed by ${wallet.address}`;
+    const signature = await wallet.signMessage(message);
+    await orchestrator.publish({
+      id: "style-upload-planner-order",
+      type: "style.uploaded",
+      timestamp: Date.now(),
+      actor: wallet.address,
+      payload: {
+        requestId: "req-style-planner-order",
+        samples: [longSample()],
+        attestationMessage: message,
+        attestationSignature: signature,
+        genres: ["technical"]
+      }
+    });
+    await orchestrator.drain();
+
+    const events = orchestrator.eventsForRequest("req-style-planner-order");
+    const activityTools = events
+      .filter((event) => event.type === "agent.activity")
+      .map((event) => event.payload.tool);
+    assert.deepEqual(
+      activityTools.filter((tool) =>
+        [
+          "verify_attestation",
+          "encrypt_and_store_samples",
+          "extract_style_profile",
+          "build_and_upload_agent_brain",
+          "mint_inft",
+          "refine_profile_from_feedback"
+        ].includes(String(tool))
+      ),
+      [
+        "verify_attestation",
+        "verify_attestation",
+        "encrypt_and_store_samples",
+        "encrypt_and_store_samples",
+        "extract_style_profile",
+        "extract_style_profile",
+        "build_and_upload_agent_brain",
+        "build_and_upload_agent_brain",
+        "mint_inft",
+        "mint_inft"
+      ]
+    );
+    assert.equal(events.some((event) => event.type === "style.failed"), false);
+    assert.equal(events.some((event) => event.type === "style.mint.intent.created"), true);
+  } finally {
+    if (previousPlannerMode === undefined) {
+      delete process.env.AGENT_LANGGRAPH_PLANNER_MODE;
+    } else {
+      process.env.AGENT_LANGGRAPH_PLANNER_MODE = previousPlannerMode;
+    }
+  }
+});
+
 test("StyleCurator accepts tagged JSON wrapped like live model responses", async () => {
   const compute: AgentCompute = {
     async chat() {

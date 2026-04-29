@@ -1485,6 +1485,9 @@ class VoicesPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
 
   private nextTool(messages: BaseMessage[]): string | undefined {
     const transcript = messagesToPlannerText(messages);
+    if (workflowShouldStop(transcript)) {
+      return undefined;
+    }
     const workflowOrder = preferredToolOrder(this.agentName, transcript).filter((toolName) =>
       this.toolNames.includes(toolName)
     );
@@ -1526,10 +1529,15 @@ class ZeroGToolPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
   }
 
   async _generate(messages: BaseMessage[]): Promise<ChatResult> {
-    const unusedTools = this.toolNames.filter(
-      (toolName) => !messages.some((message) => isToolMessage(message) && message.name === toolName)
-    );
-    if (unusedTools.length === 0) {
+    const transcript = messagesToPlannerText(messages);
+    if (workflowShouldStop(transcript)) {
+      return toChatResult(new AIMessage({ content: `${this.agentName} stopped after a terminal workflow result.` }));
+    }
+    const pendingTools = preferredToolOrder(this.agentName, transcript)
+      .filter((toolName) => this.toolNames.includes(toolName))
+      .filter((toolName) => !toolHasRun(toolName, messages, transcript));
+    const nextRequiredTool = pendingTools[0];
+    if (!nextRequiredTool) {
       return toChatResult(new AIMessage({ content: `${this.agentName} completed its current step.` }));
     }
 
@@ -1540,37 +1548,35 @@ class ZeroGToolPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
           content: [
             "You are selecting the next LangGraph ReAct tool call.",
             "Return only JSON. Use this schema: {\"tool\":\"tool_name_or_final\",\"args\":{},\"final\":\"optional final response\"}.",
-            "Only choose a tool from the available tool list. Choose final only when the current step is complete.",
+            "The workflow order is strict. Choose the required tool exactly. Choose final only when no required tool remains.",
             `Agent: ${this.agentName}`,
-            `Available tools: ${JSON.stringify(unusedTools)}`
+            `Required next tool: ${nextRequiredTool}`,
+            `Remaining workflow tools after this one: ${JSON.stringify(pendingTools.slice(1))}`
           ].join("\n")
         },
         {
           role: "user",
-          content: messagesToPlannerText(messages)
+          content: transcript
         }
       ],
       { maxRetries: 1, maxTokens: 220 }
     );
 
     const decision = parsePlannerDecision(result.content);
-    if (decision.tool && unusedTools.includes(decision.tool)) {
-      return toChatResult(
-        new AIMessage({
-          content: `${this.agentName} chose ${decision.tool}.`,
-          tool_calls: [
-            {
-              id: `${this.agentName}_${Date.now()}`,
-              name: decision.tool,
-              args: decision.args ?? {},
-              type: "tool_call"
-            }
-          ]
-        })
-      );
-    }
-
-    return toChatResult(new AIMessage({ content: decision.final || result.content || `${this.agentName} completed.` }));
+    const toolName = decision.tool === nextRequiredTool ? decision.tool : nextRequiredTool;
+    return toChatResult(
+      new AIMessage({
+        content: `${this.agentName} chose ${toolName}.`,
+        tool_calls: [
+          {
+            id: `${this.agentName}_${Date.now()}`,
+            name: toolName,
+            args: decision.tool === nextRequiredTool ? decision.args ?? {} : {},
+            type: "tool_call"
+          }
+        ]
+      })
+    );
   }
 }
 
@@ -1634,6 +1640,18 @@ function toolHasRun(toolName: string, messages: BaseMessage[], transcript: strin
   };
 
   return (markers[toolName] ?? []).some((marker) => transcript.includes(marker));
+}
+
+function workflowShouldStop(transcript: string): boolean {
+  return [
+    "Attestation rejected",
+    "Sample storage failed",
+    "Style extraction failed",
+    "AgentBrain upload failed",
+    "Mint intent failed",
+    "Generation failed",
+    "Style is no longer listed"
+  ].some((marker) => transcript.includes(marker));
 }
 
 function toChatResult(message: AIMessage): ChatResult {
