@@ -8,7 +8,7 @@ import { Button } from "../../components/Button";
 
 const WALLET_KEY = "voices.wallet.v1";
 
-function readWalletAddress(): string | null {
+function safeReadWallet(): string | null {
   if (typeof window === "undefined") return null;
   try {
     const raw = localStorage.getItem(WALLET_KEY);
@@ -21,7 +21,7 @@ function readWalletAddress(): string | null {
 }
 
 function shortAddress(addr: string) {
-  return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+  return addr.length > 14 ? `${addr.slice(0, 6)}…${addr.slice(-6)}` : addr;
 }
 
 export default function WalletPage() {
@@ -32,22 +32,21 @@ export default function WalletPage() {
   const hasWallet = Boolean(address);
 
   useEffect(() => {
-    setAddress(readWalletAddress());
+    setAddress(safeReadWallet());
   }, []);
 
-  const fakeAddress = useMemo(() => {
-    return "0x7B6a3cD9a2F4aA1B5c8E90bB1d0C2fF4aB9e12a3";
-  }, []);
+  const fakeAddress = useMemo(
+    () => "0x7B6a3cD9a2F4aA1B5c8E90bB1d0C2fF4aB9e12a3",
+    [],
+  );
 
   function connectDummyWallet() {
     setBusy(true);
     setTimeout(() => {
-      const payload = JSON.stringify({ address: fakeAddress });
-      localStorage.setItem(WALLET_KEY, payload);
+      localStorage.setItem(WALLET_KEY, JSON.stringify({ address: fakeAddress }));
       setAddress(fakeAddress);
       setBusy(false);
-      router.replace("/upload");
-    }, 600);
+    }, 650);
   }
 
   return (
@@ -56,77 +55,68 @@ export default function WalletPage() {
       <main className="siteShell">
         <section className="section sectionTightTop">
           <div className="container">
-            <div className="kicker">Wallet</div>
-            <h1 className="sectionTitle" style={{ marginTop: 10 }}>
-              Connect to upload your style
-            </h1>
-            <p className="sectionSub">
-              This demo uses a dummy wallet connection. No real authentication or
-              on-chain wallet calls are made.
-            </p>
+            <div className="walletHero">
+              <div className="kicker">Wallet</div>
+              <h1 className="sectionTitle" style={{ marginTop: 10 }}>
+                Connect to upload your style
+              </h1>
+              <p className="sectionSub">
+                This demo uses a dummy wallet connection. No real authentication or
+                on-chain calls are made.
+              </p>
+            </div>
 
-            <div className="grid twoCol" style={{ marginTop: 18 }}>
-              <div className="panel">
-                <div className="panelHeader">
-                  <h2 className="panelTitle" style={{ marginTop: 8 }}>
-                    Step 1: connect
-                  </h2>
-                  <p className="panelSub">
-                    Required to mint and show an explorer-ready creator address.
-                  </p>
+            <div className="walletGlassCard" role="region" aria-label="Wallet connection">
+              <div className="walletCardTop">
+                <div>
+                  <div className="walletCardTitle">Connection</div>
+                  <div className="walletCardSubtitle">Secure, encrypted, and ready (mock)</div>
                 </div>
-                <div className="panelBody">
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <span className="muted" style={{ fontSize: 14 }}>
-                      {hasWallet ? (
-                        <>
-                          Connected: <strong>{shortAddress(address!)}</strong>
-                        </>
-                      ) : (
-                        "Not connected"
-                      )}
-                    </span>
-                    <Button
-                      variant="primary"
-                      onClick={() => connectDummyWallet()}
-                      ariaLabel="Connect dummy wallet"
-                      disabled={busy}
-                    >
-                      {busy ? "Connecting…" : "Connect wallet"}
-                    </Button>
-                  </div>
-
-                  <div className="divider" style={{ margin: "18px 0" }} />
-
-                  <div className="row" style={{ justifyContent: "flex-end" }}>
-                    <Button
-                      variant="secondary"
-                      href={hasWallet ? "/upload" : "/wallet"}
-                      ariaLabel="Continue"
-                    >
-                      Continue
-                    </Button>
-                  </div>
+                <div className={`walletStatusPill ${hasWallet ? "walletStatusOk" : ""}`}>
+                  {hasWallet ? "Connected" : "Not connected"}
                 </div>
               </div>
 
-              <div className="panel">
-                <div className="panelHeader">
-                  <h2 className="panelTitle" style={{ marginTop: 8 }}>
-                    What you’ll do next
-                  </h2>
-                  <p className="panelSub">
-                    You’ll create a style using drag-and-drop and text paste. Then
-                    we’ll simulate a mint transaction and show a style ID.
-                  </p>
-                </div>
-                <div className="panelBody">
-                  <div className="chips">
-                    <span className="chip">Drag & drop files</span>
-                    <span className="chip">Live preview</span>
-                    <span className="chip">Mint simulation</span>
+              <div className="walletStatsGrid" aria-label="Wallet stats">
+                <div className="walletStat">
+                  <div className="walletStatLabel">Address</div>
+                  <div className="walletStatValue">
+                    {hasWallet ? shortAddress(address!) : "—"}
                   </div>
                 </div>
+                <div className="walletStat">
+                  <div className="walletStatLabel">Network</div>
+                  <div className="walletStatValue">Testnet</div>
+                </div>
+                <div className="walletStat">
+                  <div className="walletStatLabel">Credits</div>
+                  <div className="walletStatValue">{hasWallet ? "Ready" : "—"}</div>
+                </div>
+              </div>
+
+              <div className="walletActions">
+                <Button
+                  variant="primary"
+                  onClick={connectDummyWallet}
+                  ariaLabel="Connect dummy wallet"
+                  disabled={busy || hasWallet}
+                >
+                  {busy ? "Connecting…" : hasWallet ? "Wallet connected" : "Connect wallet"}
+                </Button>
+                <Button
+                  variant="secondary"
+                  ariaLabel="Continue to upload"
+                  href={hasWallet ? "/upload" : undefined}
+                  onClick={!hasWallet ? connectDummyWallet : undefined}
+                  disabled={busy}
+                >
+                  {hasWallet ? "Continue" : busy ? "Connecting…" : "Connect to upload"}
+                </Button>
+              </div>
+
+              <div className="walletFinePrint">
+                Your dummy wallet address is stored locally so you can continue to the
+                upload page.
               </div>
             </div>
           </div>

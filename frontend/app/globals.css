@@ -1312,6 +1312,11 @@ button{font-family:inherit}
   border-color: rgba(243,109,56,.30);
   background: rgba(243,109,56,.10);
 }
+
+.mintStepActive{
+  border-color: rgba(243,109,56,.42);
+  background: rgba(243,109,56,.12);
+}
 .mintBullet{
   width:26px;
   height:26px;
@@ -1339,6 +1344,213 @@ button{font-family:inherit}
 
 .uploadPreviewCard{
   width:100%;
+}
+
+/* Upload (compact) */
+.uploadGridTight{
+  align-items:start;
+  gap:14px;
+}
+
+.uploadPanelBody{
+  padding:14px 22px 18px;
+}
+
+.uploadTopRow{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+}
+
+.uploadTextArea{
+  min-height:160px;
+  max-height:240px;
+  overflow:auto;
+  resize:vertical;
+}
+
+.trustBox{
+  margin-top:14px;
+  padding:14px 14px;
+  border-radius:18px;
+  border:1px solid rgba(76,49,31,.10);
+  background: rgba(255,250,244,.58);
+}
+.trustTitle{
+  font-weight:900;
+  font-size:14px;
+  font-family:var(--font-heading) !important;
+}
+.trustText{
+  margin-top:8px;
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.6;
+}
+
+.styleSettingsCompact{
+  margin-top:14px;
+}
+
+.rangeRow{
+  display:flex;
+  align-items:center;
+  gap:14px;
+  margin-top:4px;
+  flex-wrap:wrap;
+}
+
+.rangeInput{
+  flex:1 1 220px;
+  accent-color: var(--accentA);
+}
+
+.rangeValue{
+  min-width:140px;
+  text-align:right;
+  font-weight:900;
+  color:#d85a29;
+}
+
+.voicePreviewCard{
+  border:1px solid var(--line);
+  border-radius:22px;
+  background: rgba(255,250,244,.62);
+  padding:14px;
+}
+.voicePreviewTop{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+}
+.voicePreviewTitle{
+  font-family:var(--font-heading) !important;
+  font-weight:500;
+  font-size:18px;
+}
+.voicePreviewMeta{
+  margin-top:4px;
+  color:var(--muted);
+  font-size:13px;
+  font-weight:650;
+}
+.voicePreviewRoyalty{
+  border-radius:999px;
+  border:1px solid rgba(243,109,56,.14);
+  background:rgba(243,109,56,.08);
+  color:#f36d38;
+  font-weight:800;
+  font-size:12px;
+  padding:7px 10px;
+  white-space:nowrap;
+}
+.voicePreviewText{
+  margin-top:12px;
+  max-height:180px;
+  overflow:auto;
+  white-space:pre-wrap;
+  line-height:1.65;
+  color: rgba(24,18,13,.82);
+  font-size:13px;
+}
+
+/* Wallet */
+.walletHero{
+  max-width:720px;
+}
+.walletGlassCard{
+  margin-top:18px;
+  border:1px solid rgba(76,49,31,.16);
+  background:rgba(255,255,255,.42);
+  border-radius:24px;
+  box-shadow:var(--shadow2);
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  padding:18px;
+}
+.walletCardTop{
+  display:flex;
+  justify-content:space-between;
+  gap:16px;
+  align-items:flex-start;
+  flex-wrap:wrap;
+}
+.walletCardTitle{
+  font-weight:800;
+  font-size:16px;
+  font-family:var(--font-heading) !important;
+}
+.walletCardSubtitle{
+  color:var(--muted);
+  font-size:13px;
+  margin-top:6px;
+  line-height:1.5;
+}
+.walletStatusPill{
+  border-radius:999px;
+  padding:8px 12px;
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.55);
+  color:var(--muted2);
+  font-weight:800;
+  font-size:12px;
+  white-space:nowrap;
+}
+.walletStatusOk{
+  border-color:rgba(243,109,56,.34);
+  background:rgba(243,109,56,.10);
+  color:#d85a29;
+}
+.walletStatsGrid{
+  display:grid;
+  grid-template-columns:repeat(3, minmax(0, 1fr));
+  gap:12px;
+  margin-top:14px;
+}
+.walletStat{
+  border:1px solid rgba(76,49,31,.10);
+  border-radius:18px;
+  background:rgba(255,250,244,.65);
+  padding:12px;
+}
+.walletStatLabel{
+  color:var(--muted2);
+  font-weight:800;
+  font-size:11px;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+}
+.walletStatValue{
+  margin-top:8px;
+  font-weight:800;
+  font-size:14px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.walletActions{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-top:16px;
+}
+.walletFinePrint{
+  color:var(--muted);
+  font-size:13px;
+  margin-top:10px;
+  line-height:1.6;
+}
+
+@media (max-width: 980px){
+  .walletStatsGrid{
+    grid-template-columns:1fr;
+  }
 }
 
 .mintChecks{
