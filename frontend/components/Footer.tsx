@@ -20,7 +20,7 @@ export function Footer() {
             <a href="#featured">Featured</a>
             <a href="#creators">Creators</a>
             <a href="#explorers">Explore</a>
-            <a href="#upload">Upload</a>
+            <a href="/wallet">Upload</a>
           </div>
         </div>
         <p className="fine">© {new Date().getFullYear()} Voices</p>

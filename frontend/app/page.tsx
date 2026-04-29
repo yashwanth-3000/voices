@@ -139,7 +139,7 @@ export default function Page() {
                 <Button href="/styles" variant="primary">
                   Explore writing styles
                 </Button>
-                <Button href="/upload" variant="secondary">
+                <Button href="/wallet" variant="secondary">
                   Upload your style <span aria-hidden="true">↑</span>
                 </Button>
               </div>
@@ -290,7 +290,7 @@ export default function Page() {
                       }
                     />
                     <div className="row">
-                      <Button variant="primary" href="#upload" ariaLabel="Upload your style (demo)">
+                      <Button variant="primary" href="/wallet" ariaLabel="Upload your style (demo)">
                         Upload Your Style
                       </Button>
                       <span className="muted" style={{ fontSize: 13 }}>

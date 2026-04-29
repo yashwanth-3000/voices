@@ -14,7 +14,7 @@ export type StyleModel = {
 
 export const styles: StyleModel[] = [
   {
-    id: "witty-conversational",
+    id: "style-01",
     title: "Witty & conversational",
     creatorName: "Romi Chen",
     creatorHandle: "romi",
@@ -44,7 +44,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "formal-analytical",
+    id: "style-02",
     title: "Formal & analytical",
     creatorName: "Jules Park",
     creatorHandle: "jules.memos",
@@ -74,7 +74,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "minimal-poetic",
+    id: "style-03",
     title: "Minimal & poetic",
     creatorName: "Noor S.",
     creatorHandle: "noor.poetry",
@@ -101,7 +101,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "viral-social",
+    id: "style-04",
     title: "Viral social voice",
     creatorName: "Saoirse Doyle",
     creatorHandle: "saoirse",
@@ -130,7 +130,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "contrarian-finance",
+    id: "style-05",
     title: "Contrarian finance",
     creatorName: "Devansh Patel",
     creatorHandle: "dev.p",
@@ -159,7 +159,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "observational-essay",
+    id: "style-06",
     title: "Observational essay",
     creatorName: "Lin Halverson",
     creatorHandle: "lin.h",
@@ -188,7 +188,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "lyrical-literary",
+    id: "style-07",
     title: "Lyrical literary",
     creatorName: "Maren Vasquez",
     creatorHandle: "maren.v",
@@ -216,7 +216,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    id: "crisp-product-copy",
+    id: "style-08",
     title: "Crisp product copy",
     creatorName: "Amina Rao",
     creatorHandle: "amina.ink",

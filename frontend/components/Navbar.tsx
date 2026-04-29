@@ -18,7 +18,7 @@ export function Navbar() {
 
         <div className="navLinks hideMobile" aria-label="Primary links">
           <a href="/styles">Styles</a>
-          <a href="/upload">Upload</a>
+          <a href="/wallet">Upload</a>
           <a href="/#creators">Creators</a>
           <a href="/#how">About</a>
         </div>
