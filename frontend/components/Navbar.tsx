@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
+import { useWallet } from "../context/WalletContext";
 
 function GitHubIcon() {
   return (
@@ -9,33 +10,6 @@ function GitHubIcon() {
       <path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.74.08-.74 1.21.09 1.85 1.25 1.85 1.25 1.07 1.83 2.82 1.3 3.5.99.11-.78.42-1.3.76-1.6-2.66-.3-5.46-1.33-5.46-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23A11.5 11.5 0 0 1 12 5.8c1.02.01 2.05.14 3.01.4 2.28-1.55 3.29-1.23 3.29-1.23.66 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.63-5.48 5.92.43.37.81 1.1.81 2.23v3.3c0 .32.22.7.83.58A12 12 0 0 0 12 .5Z" />
     </svg>
   );
-}
-
-const WALLET_KEY = "voices.wallet.v1";
-
-type WalletStore = {
-  address: string;
-  balance0g: string;
-  credits: number;
-};
-
-function readWalletState(): WalletStore | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = localStorage.getItem(WALLET_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as
-      | { address?: string; balance0g?: string; credits?: number }
-      | null;
-    if (!parsed?.address) return null;
-    return {
-      address: parsed.address,
-      balance0g: typeof parsed.balance0g === "string" ? parsed.balance0g : "0.42",
-      credits: typeof parsed.credits === "number" ? parsed.credits : 12,
-    };
-  } catch {
-    return null;
-  }
 }
 
 function shortAddress(address: string) {
@@ -52,18 +26,12 @@ function avatarFromAddress(address: string) {
 export function Navbar() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const [wallet, setWallet] = useState<WalletStore | null>(null);
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    setWallet(readWalletState());
-  }, []);
+  const { address, balance, credits, isOnCorrectNetwork, connectedWalletName, disconnect } = useWallet();
 
   useEffect(() => {
-    function onStorage(e: StorageEvent) {
-      if (e.key === WALLET_KEY) setWallet(readWalletState());
-    }
     function onClickOutside(e: MouseEvent) {
       if (!menuRef.current) return;
       if (!menuRef.current.contains(e.target as Node)) setOpen(false);
@@ -71,11 +39,9 @@ export function Navbar() {
     function onEsc(e: KeyboardEvent) {
       if (e.key === "Escape") setOpen(false);
     }
-    window.addEventListener("storage", onStorage);
     document.addEventListener("mousedown", onClickOutside);
     document.addEventListener("keydown", onEsc);
     return () => {
-      window.removeEventListener("storage", onStorage);
       document.removeEventListener("mousedown", onClickOutside);
       document.removeEventListener("keydown", onEsc);
     };
@@ -87,14 +53,8 @@ export function Navbar() {
   }, [pathname, searchParams]);
 
   function copyAddress() {
-    if (!wallet?.address) return;
-    navigator.clipboard.writeText(wallet.address).catch(() => {});
-  }
-
-  function disconnect() {
-    localStorage.removeItem(WALLET_KEY);
-    setWallet(null);
-    setOpen(false);
+    if (!address) return;
+    navigator.clipboard.writeText(address).catch(() => {});
   }
 
   return (
@@ -124,7 +84,7 @@ export function Navbar() {
         <span className="navDivider hideMobile" aria-hidden="true" />
 
         <div className="navWalletArea" ref={menuRef}>
-          {!wallet ? (
+          {!address ? (
             <a
               className="btn btnDark navWalletConnectBtn"
               href={`/wallet?returnTo=${encodeURIComponent(returnTo)}`}
@@ -142,44 +102,97 @@ export function Navbar() {
               >
                 <span
                   className="navWalletAvatar"
-                  style={{ background: avatarFromAddress(wallet.address) }}
+                  style={{ background: avatarFromAddress(address) }}
                   aria-hidden="true"
                 />
-                <span className="navWalletAddress">{shortAddress(wallet.address)}</span>
+                <span className="navWalletAddress">{shortAddress(address)}</span>
+                {!isOnCorrectNetwork && (
+                  <span
+                    style={{
+                      marginLeft: 4,
+                      fontSize: 10,
+                      color: "#c0392b",
+                      fontWeight: 700,
+                      background: "rgba(192,57,43,.1)",
+                      borderRadius: 6,
+                      padding: "1px 5px",
+                    }}
+                  >
+                    wrong network
+                  </span>
+                )}
               </button>
 
-              <div className={`navWalletMenu ${open ? "navWalletMenuOpen" : ""}`}>
-                <div className="navWalletMenuHead">
-                  <div className="navWalletMenuLabel">Wallet</div>
+              <div className={`navWalletMenu ${open ? "navWalletMenuOpen" : ""}`} role="dialog" aria-label="Wallet details">
+
+                {/* ── Header ── */}
+                <div className="navWalletMenuHeader">
+                  <span
+                    className="navWalletMenuAvatarLg"
+                    style={{ background: avatarFromAddress(address) }}
+                    aria-hidden="true"
+                  />
+                  <div className="navWalletMenuAddressBlock">
+                    <div className={`navWalletMenuNetwork ${!isOnCorrectNetwork ? "navWalletMenuNetworkBad" : ""}`}>
+                      {isOnCorrectNetwork ? "0G Galileo" : "⚠ Wrong Network"}
+                    </div>
+                    <div className="navWalletMenuShortAddr">{shortAddress(address)}</div>
+                    {connectedWalletName && (
+                      <div className="navWalletMenuWalletName">via {connectedWalletName}</div>
+                    )}
+                  </div>
                   <button type="button" className="navWalletCopyBtn" onClick={copyAddress}>
                     Copy
                   </button>
                 </div>
-                <div className="navWalletFullAddress">{wallet.address}</div>
 
-                <div className="navWalletBalances">
-                  <div className="navWalletBalanceRow">
-                    <span>0G balance</span>
-                    <strong>{wallet.balance0g} 0G</strong>
+                {/* ── Full address ── */}
+                <div className="navWalletFullAddress">{address}</div>
+
+                {/* ── Stats ── */}
+                <div className="navWalletStats">
+                  <div className="navWalletStatCell">
+                    <div className="navWalletStatLabel">Balance</div>
+                    <div className="navWalletStatValue">{balance ?? "—"}</div>
+                    <div className="navWalletStatUnit">OG</div>
                   </div>
-                  <div className="navWalletBalanceRow">
-                    <span>Credits</span>
-                    <strong>{wallet.credits} credits</strong>
+                  <div className="navWalletStatCell">
+                    <div className="navWalletStatLabel">Credits</div>
+                    <div className="navWalletStatValue">{credits ?? "—"}</div>
+                    <div className="navWalletStatUnit">credits</div>
                   </div>
                 </div>
 
-                <button type="button" className="navWalletBuyBtn">
-                  Buy credits
-                </button>
-
-                <div className="navWalletDivider" />
-
-                <button type="button" className="navWalletActionBtn">
-                  View dashboard
-                </button>
-                <button type="button" className="navWalletActionBtn" onClick={disconnect}>
-                  Disconnect
-                </button>
+                {/* ── Actions ── */}
+                <div className="navWalletActions">
+                  {!isOnCorrectNetwork && (
+                    <a
+                      href="/wallet"
+                      className="navWalletActionBtn"
+                      style={{ color: "#c0392b" }}
+                      onClick={() => setOpen(false)}
+                    >
+                      Switch to 0G Galileo
+                    </a>
+                  )}
+                  <button type="button" className="navWalletActionBtn">
+                    View dashboard
+                  </button>
+                  <a
+                    href={`/wallet?returnTo=${encodeURIComponent(returnTo)}&switch=1`}
+                    className="navWalletActionBtn"
+                    onClick={() => setOpen(false)}
+                  >
+                    Switch wallet
+                  </a>
+                  <button
+                    type="button"
+                    className={`navWalletActionBtn navWalletActionDanger`}
+                    onClick={() => { disconnect(); setOpen(false); }}
+                  >
+                    Disconnect
+                  </button>
+                </div>
               </div>
             </>
           )}

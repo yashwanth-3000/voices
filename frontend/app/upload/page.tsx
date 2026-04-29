@@ -7,8 +7,7 @@ import { Footer } from "../../components/Footer";
 import { Button } from "../../components/Button";
 import type { StyleModel } from "../../lib/styles";
 import { upsertMintedStyle } from "../../lib/mintedStyles";
-
-const WALLET_KEY = "voices.wallet.v1";
+import { useWallet } from "../../context/WalletContext";
 
 const MIN_CHARS = 200;
 const MAX_CHARS = 5000;
@@ -16,18 +15,6 @@ const MAX_CHARS = 5000;
 const ROYALTY_MIN = 0.0001;
 const ROYALTY_MAX = 0.002;
 const ROYALTY_STEP = 0.0001;
-
-function safeReadWallet(): string | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = localStorage.getItem(WALLET_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as { address?: string };
-    return typeof parsed?.address === "string" ? parsed.address : null;
-  } catch {
-    return null;
-  }
-}
 
 function shortAddress(addr: string) {
   return addr.length > 14 ? `${addr.slice(0, 6)}…${addr.slice(-6)}` : addr;
@@ -79,9 +66,7 @@ type MintStep = {
 export default function UploadPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-
-  const [checkingWallet, setCheckingWallet] = useState(true);
-  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const { address: walletAddress, isInitializing } = useWallet();
 
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [content, setContent] = useState("");
@@ -106,13 +91,8 @@ export default function UploadPage() {
   );
 
   useEffect(() => {
-    const addr = safeReadWallet();
-    setWalletAddress(addr);
-    setCheckingWallet(false);
-
-    if (!addr) router.replace("/wallet");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!isInitializing && !walletAddress) router.replace("/wallet?returnTo=/upload");
+  }, [isInitializing, walletAddress, router]);
 
   const charCount = content.length;
   const charHint = useMemo(() => {
@@ -257,7 +237,7 @@ export default function UploadPage() {
     setKeywordDraft("");
   }
 
-  if (checkingWallet) {
+  if (isInitializing || !walletAddress) {
     return (
       <div>
         <Navbar />

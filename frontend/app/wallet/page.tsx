@@ -1,59 +1,78 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
-
-const WALLET_KEY = "voices.wallet.v1";
-
-function safeReadWallet(): string | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = localStorage.getItem(WALLET_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as { address?: string };
-    return typeof parsed?.address === "string" ? parsed.address : null;
-  } catch {
-    return null;
-  }
-}
+import { useWallet } from "../../context/WalletContext";
+import type { DetectedWallet } from "../../context/WalletContext";
 
 function shortAddress(addr: string) {
-  return addr.length > 14 ? `${addr.slice(0, 6)}…${addr.slice(-6)}` : addr;
+  return `${addr.slice(0, 6)}…${addr.slice(-6)}`;
+}
+
+function WalletIcon({ wallet }: { wallet: DetectedWallet }) {
+  if (wallet.icon) {
+    return (
+      <img
+        src={wallet.icon}
+        alt={wallet.name}
+        width={32}
+        height={32}
+        style={{ borderRadius: 8, flexShrink: 0 }}
+      />
+    );
+  }
+  // Generic placeholder when icon isn't available
+  return (
+    <div
+      style={{
+        width: 32, height: 32, borderRadius: 8, flexShrink: 0,
+        background: "linear-gradient(135deg,#6ee7ff,#a78bfa)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 14, fontWeight: 800, color: "#fff",
+      }}
+    >
+      {wallet.name[0]}
+    </div>
+  );
 }
 
 export default function WalletPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [address, setAddress] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const {
+    address,
+    balance,
+    credits,
+    isOnCorrectNetwork,
+    isInitializing,
+    isConnecting,
+    error,
+    availableWallets,
+    connect,
+    switchNetwork,
+  } = useWallet();
 
-  const hasWallet = Boolean(address);
+  const returnTo  = searchParams.get("returnTo") ?? "/upload";
+  const isSwitchMode = searchParams.get("switch") === "1";
+
+  // Auto-skip when already connected (normal flow)
+  // In switch mode: only redirect after the user actively picks a new wallet (isConnecting just finished)
+  const [didConnect, setDidConnect] = useState(false);
+  useEffect(() => {
+    if (isConnecting) setDidConnect(true);
+  }, [isConnecting]);
 
   useEffect(() => {
-    const existing = safeReadWallet();
-    setAddress(existing);
-  }, []);
+    if (!isInitializing && address && isOnCorrectNetwork) {
+      if (!isSwitchMode || didConnect) router.replace(returnTo);
+    }
+  }, [isSwitchMode, didConnect, isInitializing, address, isOnCorrectNetwork, returnTo, router]);
 
-  const fakeAddress = useMemo(
-    () => "0x7B6a3cD9a2F4aA1B5c8E90bB1d0C2fF4aB9e12a3",
-    [],
-  );
-
-  function connectDummyWallet() {
-    setBusy(true);
-    setTimeout(() => {
-      localStorage.setItem(
-        WALLET_KEY,
-        JSON.stringify({ address: fakeAddress, balance0g: "0.42", credits: 12 }),
-      );
-      setAddress(fakeAddress);
-      setBusy(false);
-      const returnTo = searchParams.get("returnTo");
-      router.replace(returnTo || "/upload");
-    }, 650);
-  }
+  const statusLabel = address
+    ? isOnCorrectNetwork ? `Connected · ${shortAddress(address)}` : "Wrong network"
+    : "Not connected";
 
   return (
     <div>
@@ -66,40 +85,121 @@ export default function WalletPage() {
               <h1 className="sectionTitle" style={{ marginTop: 10 }}>
                 Connect your wallet
               </h1>
-              <p className="sectionSub">Connect to continue to style upload.</p>
+              <p className="sectionSub">
+                Choose a wallet to connect. We&apos;ll switch you to the 0G Galileo network automatically.
+              </p>
             </div>
 
             <div className="walletGlassCard" role="region" aria-label="Wallet connection">
               <div className="walletCardTop">
                 <div>
-                  <div className="walletCardTitle">Connect to your wallet</div>
+                  <div className="walletCardTitle">
+                    {isSwitchMode ? "Switch wallet" : address ? "Wallet connected" : "Choose your wallet"}
+                  </div>
                   <div className="walletCardSubtitle">
-                    Choose a wallet to connect.
+                    {isSwitchMode
+                      ? "Pick a different wallet to connect with."
+                      : address
+                        ? isOnCorrectNetwork
+                          ? "Connected to 0G Galileo — redirecting…"
+                          : "Connected but on the wrong network."
+                        : availableWallets.length === 0
+                          ? "Detecting wallets…"
+                          : `${availableWallets.length} wallet${availableWallets.length > 1 ? "s" : ""} detected`}
                   </div>
                 </div>
-                <div className={`walletStatusPill ${hasWallet ? "walletStatusOk" : ""}`}>
-                  {hasWallet ? `Connected · ${shortAddress(address!)}` : "Not connected"}
+                <div className={`walletStatusPill ${address ? "walletStatusOk" : ""}`}>
+                  {statusLabel}
                 </div>
               </div>
 
-              <button
-                type="button"
-                className="walletOption"
-                onClick={connectDummyWallet}
-                disabled={busy}
-                aria-label="Connect with MetaMask"
-              >
-                <div className="walletOptionLeft">
-                  <div className="walletOptionName">MetaMask</div>
-                  <div className="walletOptionSub">Connect using browser wallet</div>
+              {/* Connected info — hide in switch mode so the wallet list shows */}
+              {address && !isSwitchMode && (
+                <div className="walletStatsGrid" style={{ marginTop: 14 }}>
+                  <div className="walletStat">
+                    <div className="walletStatLabel">Address</div>
+                    <div className="walletStatValue" title={address}>{shortAddress(address)}</div>
+                  </div>
+                  <div className="walletStat">
+                    <div className="walletStatLabel">0G Balance</div>
+                    <div className="walletStatValue">{balance !== null ? `${balance} OG` : "…"}</div>
+                  </div>
+                  <div className="walletStat">
+                    <div className="walletStatLabel">Credits</div>
+                    <div className="walletStatValue">{credits !== null ? credits : "…"}</div>
+                  </div>
                 </div>
-                <div className="walletOptionRight">
-                  {busy ? "Connecting…" : hasWallet ? "Connected" : "Connect"}
+              )}
+
+              {/* Wrong network */}
+              {address && !isOnCorrectNetwork && (
+                <button type="button" className="walletOption" onClick={switchNetwork} style={{ marginTop: 14 }}>
+                  <div className="walletOptionLeft">
+                    <div className="walletOptionName">Switch to 0G Galileo</div>
+                    <div className="walletOptionSub">Required network for Voices</div>
+                  </div>
+                  <div className="walletOptionRight">Switch</div>
+                </button>
+              )}
+
+              {/* Wallet list — shown when not connected OR in switch mode */}
+              {(!address || isSwitchMode) && (
+                <>
+                  {availableWallets.length === 0 ? (
+                    <div className="walletFinePrint" style={{ marginTop: 16 }}>
+                      No wallets detected. Install{" "}
+                      <a href="https://metamask.io/download/" target="_blank" rel="noopener noreferrer">MetaMask</a>
+                      {" "}or another EVM-compatible wallet extension.
+                    </div>
+                  ) : (
+                    availableWallets.map((wallet) => (
+                      <button
+                        key={wallet.rdns}
+                        type="button"
+                        className="walletOption"
+                        onClick={() => connect(wallet)}
+                        disabled={isConnecting}
+                        aria-label={`Connect with ${wallet.name}`}
+                      >
+                        <div className="walletOptionLeft" style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                          <WalletIcon wallet={wallet} />
+                          <div>
+                            <div className="walletOptionName">{wallet.name}</div>
+                            <div className="walletOptionSub">Connect using {wallet.name}</div>
+                          </div>
+                        </div>
+                        <div className="walletOptionRight">
+                          {isConnecting ? "Connecting…" : "Connect"}
+                        </div>
+                      </button>
+                    ))
+                  )}
+                </>
+              )}
+
+              {/* In switch mode with a wallet already connected, offer a way back */}
+              {isSwitchMode && address && (
+                <div style={{ marginTop: 10 }}>
+                  <a
+                    href={returnTo}
+                    className="walletFinePrint"
+                    style={{ color: "var(--muted2)", textDecoration: "underline", cursor: "pointer" }}
+                  >
+                    Keep current wallet and go back
+                  </a>
                 </div>
-              </button>
+              )}
+
+              {error && (
+                <div className="walletFinePrint" style={{ color: "#c0392b", marginTop: 10 }}>
+                  {error}
+                </div>
+              )}
 
               <div className="walletFinePrint">
-                After connecting, you’ll be redirected to upload your style.
+                {!isSwitchMode && address && isOnCorrectNetwork
+                  ? "Redirecting…"
+                  : "Your wallet will ask for approval before connecting."}
               </div>
             </div>
           </div>
@@ -109,4 +209,3 @@ export default function WalletPage() {
     </div>
   );
 }
-

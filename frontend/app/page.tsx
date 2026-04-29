@@ -144,13 +144,6 @@ export default function Page() {
                 </Button>
               </div>
 
-              <div className="heroStats">
-                <span>2,841 styles</span>
-                <span className="sep">•</span>
-                <span>$0.04 avg / generation</span>
-                <span className="sep">•</span>
-                <span>Creator-first licensing</span>
-              </div>
             </div>
           </div>
         </section>

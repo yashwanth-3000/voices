@@ -654,12 +654,6 @@ const initialSteps: FlowStep[] = [
   { label: "Feedback refinement", state: "waiting" }
 ];
 
-declare global {
-  interface Window {
-    ethereum?: unknown;
-  }
-}
-
 async function getBrowserProvider(): Promise<BrowserProvider> {
   if (!window.ethereum) throw new Error("MetaMask is required for real on-chain testing");
   return new BrowserProvider(window.ethereum as ethers.Eip1193Provider);
