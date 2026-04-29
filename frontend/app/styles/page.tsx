@@ -1,11 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { StyleListingCard } from "../../components/StyleListingCard";
 import { styles } from "../../lib/styles";
-import { readMintedStyles } from "../../lib/mintedStyles";
+import {
+  ChainStyleDetails,
+  parseJsonResponse,
+  registryStyleToModel,
+  shortAddress,
+  StylesResponse
+} from "../../lib/registryStyles";
 
 const fillLines = [
   "Includes tone traits, cadence notes, and sample outputs for fast comparison.",
@@ -13,14 +19,67 @@ const fillLines = [
   "Preview hooks, structure, and phrasing patterns before you generate.",
 ];
 
-export default function StylesPage() {
-  const [minted, setMinted] = useState<typeof styles>([]);
+type GalleryStyle = {
+  id: string;
+  href: string;
+  title: string;
+  creator: string;
+  price: string;
+  tags: string[];
+  blurb: string;
+  fillText: string;
+};
 
-  useEffect(() => {
-    setMinted(readMintedStyles() as typeof styles);
+type LoadState = "idle" | "loading" | "ready" | "error";
+
+export default function StylesPage() {
+  const [state, setState] = useState<LoadState>("idle");
+  const [registryStyles, setRegistryStyles] = useState<ChainStyleDetails[]>([]);
+  const [registrySource, setRegistrySource] = useState("");
+  const [scannedCount, setScannedCount] = useState(0);
+  const [error, setError] = useState("");
+
+  const loadRegistryStyles = useCallback(async () => {
+    setState("loading");
+    setError("");
+    try {
+      const response = await fetch("/api/backend/styles?max=50", { cache: "no-store" });
+      const data = await parseJsonResponse<StylesResponse>(response);
+      setRegistryStyles(data.styles);
+      setRegistrySource(data.source);
+      setScannedCount(data.scannedTokenIds.length);
+      setState("ready");
+    } catch (flowError) {
+      setRegistryStyles([]);
+      setRegistrySource("");
+      setScannedCount(0);
+      setError(flowError instanceof Error ? flowError.message : String(flowError));
+      setState("error");
+    }
   }, []);
 
-  const allStyles = useMemo(() => [...styles, ...minted], [minted]);
+  useEffect(() => {
+    void loadRegistryStyles();
+  }, [loadRegistryStyles]);
+
+  const allStyles = useMemo<GalleryStyle[]>(() => {
+    if (registryStyles.length > 0) {
+      return [...registryStyles]
+        .sort((left, right) => (right.marketplace.updatedAt ?? 0) - (left.marketplace.updatedAt ?? 0))
+        .map((style) => mapRegistryStyle(style, registrySource));
+    }
+    if (state !== "error") return [];
+    return styles.map((style, index) => ({
+      id: style.id,
+      href: `/styles/${style.id}`,
+      title: style.title,
+      creator: `${style.creatorName} · @${style.creatorHandle}`,
+      price: style.price,
+      tags: style.tags,
+      blurb: style.blurb,
+      fillText: fillLines[index % fillLines.length]
+    }));
+  }, [registrySource, registryStyles, state]);
 
   return (
     <div>
@@ -28,26 +87,59 @@ export default function StylesPage() {
       <main className="siteShell">
         <section className="section sectionTightTop">
           <div className="container">
-            <div className="kicker">Styles</div>
-            <h1 className="sectionTitle" style={{ marginTop: 10 }}>
-              Explore writing styles
-            </h1>
-            <p className="sectionSub">
-              A gallery of creator-uploaded voices. Browse by vibe, preview the tone,
-              then pick a style for your next post, memo, landing page, or thread.
-            </p>
+            <div className="dashboardHero">
+              <div className="dashboardHeroCopy">
+                <div className="kicker">Styles</div>
+                <h1 className="sectionTitle" style={{ marginTop: 10 }}>
+                  Explore writing styles
+                </h1>
+                <p className="sectionSub">
+                  {registryStyles.length > 0
+                    ? `${registryStyles.length} styles from the live registry${scannedCount ? ` after scanning ${scannedCount} tokens` : ""}.`
+                    : "A gallery of creator-uploaded voices. Browse by vibe, preview the tone, then pick a style."}
+                </p>
+              </div>
+              <div className="dashboardHeroActions">
+                <button type="button" className="dashboardRefreshBtn" onClick={loadRegistryStyles} disabled={state === "loading"}>
+                  {state === "loading" ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+            </div>
+
+            {state === "loading" && registryStyles.length === 0 ? (
+              <div className="dashboardLoading">Loading all registry styles...</div>
+            ) : null}
+            {state === "error" ? (
+              <div className="dashboardError">
+                <strong>Live registry unavailable</strong>
+                <p>{error}</p>
+              </div>
+            ) : null}
+            {registryStyles.length > 0 ? (
+              <div className="stylesRegistryMeta">
+                <span>{registrySource || "0G style registry"}</span>
+                <span>{scannedCount} scanned</span>
+                <span>{registryStyles.filter((style) => style.chain.listed).length} listed</span>
+              </div>
+            ) : null}
+            {state === "ready" && registryStyles.length === 0 ? (
+              <div className="dashboardEmptyState">
+                <h2>No registry styles found</h2>
+                <p>The backend returned an empty style registry for the scanned token range.</p>
+              </div>
+            ) : null}
 
             <div className="styleGallery" style={{ marginTop: 18 }}>
-              {allStyles.map((s, i) => (
+              {allStyles.map((s) => (
                 <StyleListingCard
                   key={s.id}
-                  href={`/styles/${s.id}`}
+                  href={s.href}
                   title={s.title}
-                  creator={`${s.creatorName} · @${s.creatorHandle}`}
+                  creator={s.creator}
                   price={s.price}
                   tags={s.tags}
                   blurb={s.blurb}
-                  fillText={fillLines[i % fillLines.length]}
+                  fillText={s.fillText}
                 />
               ))}
             </div>
@@ -59,3 +151,18 @@ export default function StylesPage() {
   );
 }
 
+function mapRegistryStyle(style: ChainStyleDetails, source: string): GalleryStyle {
+  const mapped = registryStyleToModel(style);
+  const status = style.chain.listed ? style.marketplace.statusLabel : "Unlisted";
+  const outputText = style.marketplace.outputCount === 1 ? "1 output" : `${style.marketplace.outputCount} outputs`;
+  return {
+    id: `registry-${style.tokenId}`,
+    href: `/styles/${encodeURIComponent(style.tokenId)}`,
+    title: mapped.title,
+    creator: `${shortAddress(style.chain.creator)} · token ${style.tokenId}`,
+    price: mapped.price,
+    tags: mapped.tags,
+    blurb: mapped.blurb,
+    fillText: `${status} · ${outputText}${source ? ` · ${source}` : ""}`
+  };
+}

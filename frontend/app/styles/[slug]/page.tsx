@@ -1,12 +1,13 @@
- "use client";
+"use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../components/Navbar";
 import { Footer } from "../../../components/Footer";
 import { Button } from "../../../components/Button";
 import { PreviewBlock } from "../../../components/PreviewBlock";
-import { getStyle } from "../../../lib/styles";
+import { getStyle, StyleModel } from "../../../lib/styles";
 import { readMintedStyles } from "../../../lib/mintedStyles";
+import { ChainStyleDetails, parseJsonResponse, registryStyleToModel } from "../../../lib/registryStyles";
 
 type PageProps = {
   params: { slug: string };
@@ -15,19 +16,46 @@ type PageProps = {
 export default function StyleDetailPage({ params }: PageProps) {
   // Note: the route segment folder is `[slug]`, but we treat it as the style `id`.
   const staticStyle = useMemo(() => getStyle(params.slug), [params.slug]);
-  const [mintedStyle, setMintedStyle] = useState<ReturnType<typeof getStyle> | undefined>(undefined);
+  const [mintedStyle, setMintedStyle] = useState<StyleModel | undefined>(undefined);
+  const [registryStyle, setRegistryStyle] = useState<StyleModel | undefined>(undefined);
+  const [registryState, setRegistryState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [registryError, setRegistryError] = useState("");
   const [mounted, setMounted] = useState(false);
+
+  const loadRegistryStyle = useCallback(async () => {
+    setRegistryState("loading");
+    setRegistryError("");
+    try {
+      const response = await fetch(`/api/backend/styles/${encodeURIComponent(params.slug)}`, { cache: "no-store" });
+      const data = await parseJsonResponse<ChainStyleDetails>(response);
+      setRegistryStyle(registryStyleToModel(data));
+      setRegistryState("ready");
+    } catch (flowError) {
+      setRegistryStyle(undefined);
+      setRegistryError(flowError instanceof Error ? flowError.message : String(flowError));
+      setRegistryState("error");
+    }
+  }, [params.slug]);
 
   useEffect(() => {
     setMounted(true);
     const minted = readMintedStyles().find((s) => s.id === params.slug);
     setMintedStyle(minted);
-  }, [params.slug]);
+    setRegistryStyle(undefined);
+    setRegistryError("");
 
-  const style = staticStyle ?? mintedStyle;
+    if (!staticStyle && !minted) {
+      void loadRegistryStyle();
+    } else {
+      setRegistryState("idle");
+    }
+  }, [loadRegistryStyle, params.slug, staticStyle]);
+
+  const style = staticStyle ?? mintedStyle ?? registryStyle;
+  const isLoading = !style && (!mounted || registryState === "loading");
 
   if (!style) {
-    if (!mounted) {
+    if (isLoading) {
       return (
         <div>
           <Navbar />
@@ -56,7 +84,8 @@ export default function StyleDetailPage({ params }: PageProps) {
                 Style not found
               </h1>
               <p className="sectionSub">
-                This is a mock frontend prototype. Try going back to the gallery.
+                We could not find this style in the gallery or the live registry.
+                {registryError ? ` Backend said: ${registryError}` : ""}
               </p>
               <div className="row" style={{ marginTop: 18 }}>
                 <Button href="/styles" variant="primary">
@@ -156,7 +185,7 @@ export default function StyleDetailPage({ params }: PageProps) {
                   </div>
                   <div style={{ marginTop: 14 }}>
                     <PreviewBlock
-                      title="Marketplace preview (mock)"
+                      title="Marketplace preview"
                       toneLabel={style.title}
                       content={style.samples[0]?.text ?? "—"}
                     />
@@ -172,8 +201,7 @@ export default function StyleDetailPage({ params }: PageProps) {
                   Example outputs
                 </h2>
                 <p className="sectionSub">
-                  These are hardcoded previews to make the idea feel real. In a real
-                  app, they’d be generated from the style model.
+                  Profile excerpts and sample outputs that help you understand the voice before generating.
                 </p>
 
                 <div className="grid previewColumns" style={{ marginTop: 18 }}>
@@ -210,4 +238,3 @@ export default function StyleDetailPage({ params }: PageProps) {
     </div>
   );
 }
-

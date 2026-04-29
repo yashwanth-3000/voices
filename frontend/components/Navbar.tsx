@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { usePathname, useSearchParams } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { useWallet } from "../context/WalletContext";
 
 function GitHubIcon() {
@@ -25,7 +25,7 @@ function avatarFromAddress(address: string) {
 
 export function Navbar() {
   const pathname = usePathname();
-  const searchParams = useSearchParams();
+  const [queryString, setQueryString] = useState("");
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -47,10 +47,13 @@ export function Navbar() {
     };
   }, []);
 
+  useEffect(() => {
+    setQueryString(window.location.search.replace(/^\?/, ""));
+  }, [pathname]);
+
   const returnTo = useMemo(() => {
-    const qs = searchParams?.toString();
-    return qs ? `${pathname}?${qs}` : pathname;
-  }, [pathname, searchParams]);
+    return queryString ? `${pathname}?${queryString}` : pathname;
+  }, [pathname, queryString]);
 
   function copyAddress() {
     if (!address) return;
@@ -175,9 +178,13 @@ export function Navbar() {
                       Switch to 0G Galileo
                     </a>
                   )}
-                  <button type="button" className="navWalletActionBtn">
+                  <a
+                    href="/dashboard"
+                    className="navWalletActionBtn"
+                    onClick={() => setOpen(false)}
+                  >
                     View dashboard
-                  </button>
+                  </a>
                   <a
                     href={`/wallet?returnTo=${encodeURIComponent(returnTo)}&switch=1`}
                     className="navWalletActionBtn"

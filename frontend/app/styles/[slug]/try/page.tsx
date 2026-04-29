@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
 import { Footer } from "../../../../components/Footer";
 import { Button } from "../../../../components/Button";
-import { getStyle } from "../../../../lib/styles";
+import { getStyle, StyleModel } from "../../../../lib/styles";
 import { readMintedStyles } from "../../../../lib/mintedStyles";
+import { ChainStyleDetails, parseJsonResponse, registryStyleToModel } from "../../../../lib/registryStyles";
 
 type PageProps = {
   params: { slug: string };
@@ -103,8 +104,10 @@ function mockGenerate(styleTitle: string, prompt: string) {
 
 export default function TryStylePage({ params }: PageProps) {
   const staticStyle = useMemo(() => getStyle(params.slug), [params.slug]);
-  const [mintedStyle, setMintedStyle] = useState<typeof staticStyle | undefined>(undefined);
-  const style = staticStyle ?? mintedStyle;
+  const [mintedStyle, setMintedStyle] = useState<StyleModel | undefined>(undefined);
+  const [registryStyle, setRegistryStyle] = useState<StyleModel | undefined>(undefined);
+  const [registryState, setRegistryState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const style = staticStyle ?? mintedStyle ?? registryStyle;
 
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -113,10 +116,30 @@ export default function TryStylePage({ params }: PageProps) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
+  const loadRegistryStyle = useCallback(async () => {
+    setRegistryState("loading");
+    try {
+      const response = await fetch(`/api/backend/styles/${encodeURIComponent(params.slug)}`, { cache: "no-store" });
+      const data = await parseJsonResponse<ChainStyleDetails>(response);
+      setRegistryStyle(registryStyleToModel(data));
+      setRegistryState("ready");
+    } catch {
+      setRegistryStyle(undefined);
+      setRegistryState("error");
+    }
+  }, [params.slug]);
+
   useEffect(() => {
     const minted = readMintedStyles().find((s) => s.id === params.slug);
     setMintedStyle(minted);
-  }, [params.slug]);
+    setRegistryStyle(undefined);
+
+    if (!staticStyle && !minted) {
+      void loadRegistryStyle();
+    } else {
+      setRegistryState("idle");
+    }
+  }, [loadRegistryStyle, params.slug, staticStyle]);
 
   useEffect(() => {
     if (!style) return;
@@ -202,7 +225,7 @@ export default function TryStylePage({ params }: PageProps) {
             <div className="container">
               <div className="kicker">Try</div>
               <h1 className="sectionTitle" style={{ marginTop: 10 }}>
-                Style not found
+                {registryState === "loading" ? "Finding style..." : "Style not found"}
               </h1>
               <div className="row" style={{ marginTop: 18 }}>
                 <Button href="/styles" variant="primary">
@@ -468,4 +491,3 @@ function groupMessages(messages: Msg[]): MsgGroup[] {
     return acc;
   }, []);
 }
-

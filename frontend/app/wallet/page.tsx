@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { useWallet } from "../../context/WalletContext";
@@ -40,7 +40,6 @@ function WalletIcon({ wallet }: { wallet: DetectedWallet }) {
 
 export default function WalletPage() {
   const router = useRouter();
-  const searchParams = useSearchParams();
   const {
     address,
     balance,
@@ -54,8 +53,24 @@ export default function WalletPage() {
     switchNetwork,
   } = useWallet();
 
-  const returnTo  = searchParams.get("returnTo") ?? "/upload";
-  const isSwitchMode = searchParams.get("switch") === "1";
+  const [queryState, setQueryState] = useState({
+    returnTo: "/upload",
+    isDashboardMode: false,
+    isSwitchMode: false,
+    ready: false,
+  });
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setQueryState({
+      returnTo: params.get("returnTo") ?? "/upload",
+      isDashboardMode: params.get("dashboard") === "1",
+      isSwitchMode: params.get("switch") === "1",
+      ready: true,
+    });
+  }, []);
+
+  const { returnTo, isDashboardMode, isSwitchMode, ready: queryReady } = queryState;
 
   // Auto-skip when already connected (normal flow)
   // In switch mode: only redirect after the user actively picks a new wallet (isConnecting just finished)
@@ -65,14 +80,38 @@ export default function WalletPage() {
   }, [isConnecting]);
 
   useEffect(() => {
-    if (!isInitializing && address && isOnCorrectNetwork) {
+    if (queryReady && !isDashboardMode && !isInitializing && address && isOnCorrectNetwork) {
       if (!isSwitchMode || didConnect) router.replace(returnTo);
     }
-  }, [isSwitchMode, didConnect, isInitializing, address, isOnCorrectNetwork, returnTo, router]);
+  }, [queryReady, isDashboardMode, isSwitchMode, didConnect, isInitializing, address, isOnCorrectNetwork, returnTo, router]);
 
   const statusLabel = address
     ? isOnCorrectNetwork ? `Connected · ${shortAddress(address)}` : "Wrong network"
     : "Not connected";
+  const walletTitle = isDashboardMode
+    ? "Wallet dashboard"
+    : isSwitchMode
+      ? "Switch wallet"
+      : address
+        ? "Wallet connected"
+        : "Choose your wallet";
+  const walletSubtitle = isDashboardMode
+    ? address
+      ? isOnCorrectNetwork
+        ? "Review your 0G balance, credits, and connected wallet."
+        : "Switch networks to keep using Voices."
+      : availableWallets.length === 0
+        ? "Detecting wallets..."
+        : `${availableWallets.length} wallet${availableWallets.length > 1 ? "s" : ""} detected`
+    : isSwitchMode
+      ? "Pick a different wallet to connect with."
+      : address
+        ? isOnCorrectNetwork
+          ? "Connected to 0G Galileo - redirecting..."
+          : "Connected but on the wrong network."
+        : availableWallets.length === 0
+          ? "Detecting wallets..."
+          : `${availableWallets.length} wallet${availableWallets.length > 1 ? "s" : ""} detected`;
 
   return (
     <div>
@@ -83,30 +122,20 @@ export default function WalletPage() {
             <div className="walletHero">
               <div className="kicker">Wallet</div>
               <h1 className="sectionTitle" style={{ marginTop: 10 }}>
-                Connect your wallet
+                {isDashboardMode ? "Wallet dashboard" : "Connect your wallet"}
               </h1>
               <p className="sectionSub">
-                Choose a wallet to connect. We&apos;ll switch you to the 0G Galileo network automatically.
+                {isDashboardMode
+                  ? "Review your connected wallet, network, balance, and generation credits."
+                  : "Choose a wallet to connect. We'll switch you to the 0G Galileo network automatically."}
               </p>
             </div>
 
             <div className="walletGlassCard" role="region" aria-label="Wallet connection">
               <div className="walletCardTop">
                 <div>
-                  <div className="walletCardTitle">
-                    {isSwitchMode ? "Switch wallet" : address ? "Wallet connected" : "Choose your wallet"}
-                  </div>
-                  <div className="walletCardSubtitle">
-                    {isSwitchMode
-                      ? "Pick a different wallet to connect with."
-                      : address
-                        ? isOnCorrectNetwork
-                          ? "Connected to 0G Galileo — redirecting…"
-                          : "Connected but on the wrong network."
-                        : availableWallets.length === 0
-                          ? "Detecting wallets…"
-                          : `${availableWallets.length} wallet${availableWallets.length > 1 ? "s" : ""} detected`}
-                  </div>
+                  <div className="walletCardTitle">{walletTitle}</div>
+                  <div className="walletCardSubtitle">{walletSubtitle}</div>
                 </div>
                 <div className={`walletStatusPill ${address ? "walletStatusOk" : ""}`}>
                   {statusLabel}
@@ -140,6 +169,25 @@ export default function WalletPage() {
                   </div>
                   <div className="walletOptionRight">Switch</div>
                 </button>
+              )}
+
+              {isDashboardMode && address && (
+                <div className="walletDashboardActions">
+                  <a href={returnTo} className="walletOption">
+                    <div className="walletOptionLeft">
+                      <div className="walletOptionName">Back to app</div>
+                      <div className="walletOptionSub">Return to the page you opened this from</div>
+                    </div>
+                    <div className="walletOptionRight">Open</div>
+                  </a>
+                  <a href={`/wallet?returnTo=${encodeURIComponent(returnTo)}&switch=1`} className="walletOption">
+                    <div className="walletOptionLeft">
+                      <div className="walletOptionName">Switch wallet</div>
+                      <div className="walletOptionSub">Connect with a different wallet provider</div>
+                    </div>
+                    <div className="walletOptionRight">Switch</div>
+                  </a>
+                </div>
               )}
 
               {/* Wallet list — shown when not connected OR in switch mode */}
@@ -197,8 +245,10 @@ export default function WalletPage() {
               )}
 
               <div className="walletFinePrint">
-                {!isSwitchMode && address && isOnCorrectNetwork
-                  ? "Redirecting…"
+                {isDashboardMode && address
+                  ? "Wallet dashboard is open."
+                  : !isSwitchMode && address && isOnCorrectNetwork
+                    ? "Redirecting..."
                   : "Your wallet will ask for approval before connecting."}
               </div>
             </div>
