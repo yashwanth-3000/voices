@@ -87,6 +87,8 @@ export default function UploadPage() {
   const [content, setContent] = useState("");
   const [styleName, setStyleName] = useState("");
   const [royalty, setRoyalty] = useState<number>(0.0005);
+  const [keywords, setKeywords] = useState<string[]>([]);
+  const [keywordDraft, setKeywordDraft] = useState("");
 
   const [mintPhase, setMintPhase] = useState<MintPhase>("idle");
   const [mintStepIndex, setMintStepIndex] = useState(0);
@@ -133,6 +135,21 @@ export default function UploadPage() {
 
   const canMint =
     Boolean(walletAddress) && content.trim().length >= MIN_CHARS && styleName.trim().length > 0;
+
+  function addKeyword(raw: string) {
+    const trimmed = raw.trim().replace(/\s+/g, " ");
+    if (!trimmed) return;
+    if (trimmed.length > 22) return;
+    if (keywords.length >= 3) return;
+    const lower = trimmed.toLowerCase();
+    if (keywords.some((k) => k.toLowerCase() === lower)) return;
+    setKeywords((prev) => [...prev, trimmed]);
+    setKeywordDraft("");
+  }
+
+  function removeKeyword(value: string) {
+    setKeywords((prev) => prev.filter((k) => k !== value));
+  }
 
   async function handleFilesSelected(files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -236,6 +253,8 @@ export default function UploadPage() {
     setContent("");
     setStyleName("");
     setRoyalty(0.0005);
+    setKeywords([]);
+    setKeywordDraft("");
   }
 
   if (checkingWallet) {
@@ -268,8 +287,7 @@ export default function UploadPage() {
               Turn writing into a reusable voice
             </h1>
             <p className="sectionSub">
-              Upload a few samples and configure a royalty. We’ll simulate extraction + minting so you
-              can preview the flow end-to-end.
+              Upload a few samples and configure your style.
             </p>
 
             <div className="grid twoCol uploadGridTight" style={{ marginTop: 16 }}>
@@ -280,9 +298,7 @@ export default function UploadPage() {
                   <h2 className="panelTitle" style={{ marginTop: 10 }}>
                     Upload samples + paste text
                   </h2>
-                  <p className="panelSub">
-                    File text extraction is mocked for this UI demo.
-                  </p>
+                  <p className="panelSub">Upload files and/or paste text below.</p>
                 </div>
                 <div className="panelBody uploadPanelBody">
                   <div className="uploadTopRow">
@@ -338,14 +354,6 @@ export default function UploadPage() {
                     </div>
                   </div>
 
-                  <div className="trustBox">
-                    <div className="trustTitle">Your content stays private</div>
-                    <div className="trustText">
-                      In the real product we’d encrypt and store your samples securely and never expose
-                      them publicly. This demo is UI-only.
-                    </div>
-                  </div>
-
                   <div className="styleSettingsCompact">
                     <div className="field">
                       <div className="fieldLabel">Style name</div>
@@ -377,94 +385,53 @@ export default function UploadPage() {
                       </div>
                     </div>
 
-                    <div className="row" style={{ marginTop: 16, justifyContent: "space-between" }}>
-                      <span className="muted" style={{ fontSize: 13 }}>
-                        {content.trim().length < MIN_CHARS
-                          ? `Need at least ${MIN_CHARS} characters to mint.`
-                          : walletAddress
-                            ? "Ready when your style name is set."
-                            : "Connect wallet to mint."}
-                      </span>
-                      <Button
-                        variant="primary"
-                        onClick={startMintPipeline}
-                        ariaLabel="Mint this style"
-                        disabled={!canMint || mintPhase !== "idle"}
-                      >
-                        Mint this style
-                      </Button>
-                    </div>
-                  </div>
-
-                  {mintPhase !== "idle" ? (
-                    <div className="mintActivity">
-                      <div className="kicker">Mint simulation</div>
-                      <div className="mintSteps" aria-label="Mint activity steps">
-                        {mintSteps.map((s, idx) => {
-                          const done = idx < mintStepIndex;
-                          const active = idx === mintStepIndex;
-                          return (
-                            <div
-                              key={s.key}
-                              className={`mintStep ${done ? "mintStepDone" : "mintStepPending"} ${
-                                active ? "mintStepActive" : ""
-                              }`}
-                            >
-                              <span className="mintBullet" aria-hidden="true">
-                                {done ? "✓" : active ? "…" : " "}
-                              </span>
-                              <div className="mintStepLabel">{s.label}</div>
-                            </div>
-                          );
-                        })}
+                    <div className="field" style={{ marginTop: 16 }}>
+                      <div className="fieldLabel">Keywords (max 3)</div>
+                      <div className="keywordRow">
+                        <input
+                          className="textInput keywordInput"
+                          value={keywordDraft}
+                          onChange={(e) => setKeywordDraft(e.target.value)}
+                          placeholder="e.g., concise"
+                          aria-label="Keyword"
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              addKeyword(keywordDraft);
+                            }
+                          }}
+                          disabled={keywords.length >= 3}
+                        />
+                        <button
+                          type="button"
+                          className="keywordAddBtn"
+                          onClick={() => addKeyword(keywordDraft)}
+                          disabled={keywords.length >= 3}
+                        >
+                          Add
+                        </button>
                       </div>
 
-                      {mintPhase === "ready" ? (
-                        <div className="row" style={{ marginTop: 14, justifyContent: "flex-end" }}>
-                          <Button
-                            variant="primary"
-                            onClick={confirmMint}
-                            ariaLabel="Confirm mint"
-                          >
-                            Confirm mint
-                          </Button>
+                      {keywords.length > 0 ? (
+                        <div className="chips" style={{ marginTop: 10 }}>
+                          {keywords.map((k) => (
+                            <button
+                              key={k}
+                              type="button"
+                              className="chip keywordChip"
+                              onClick={() => removeKeyword(k)}
+                              aria-label={`Remove keyword ${k}`}
+                            >
+                              {k} <span aria-hidden="true">×</span>
+                            </button>
+                          ))}
                         </div>
                       ) : null}
-
-                      {mintPhase === "confirming" ? (
-                        <div className="muted" style={{ marginTop: 14 }}>
-                          Submitting transaction… (simulated)
-                        </div>
-                      ) : null}
-
-                      {mintPhase === "success" && txHash && mintedStyleId ? (
-                        <div className="mintSuccess">
-                          <div className="kicker">Success</div>
-                          <h2 className="panelTitle" style={{ marginTop: 10 }}>
-                            Your style is live (mock)
-                          </h2>
-                          <p className="panelSub">
-                            Transaction hash:{" "}
-                            <span className="mono" style={{ color: "var(--text)" }}>
-                              {txHash}
-                            </span>
-                          </p>
-                          <p className="panelSub">
-                            Style ID:{" "}
-                            <span className="mono" style={{ color: "var(--text)" }}>
-                              {mintedStyleId}
-                            </span>
-                          </p>
-
-                          <div className="row" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-                            <Button variant="primary" onClick={resetAll} ariaLabel="Create another style">
-                              Create another style
-                            </Button>
-                          </div>
-                        </div>
-                      ) : null}
+                      <div className="keywordHelp">
+                        Tip: press Enter to add. Click a keyword to remove.
+                      </div>
                     </div>
-                  ) : null}
+                  </div>
                 </div>
               </div>
 
@@ -475,7 +442,7 @@ export default function UploadPage() {
                   <h2 className="panelTitle" style={{ marginTop: 10 }}>
                     Voice preview
                   </h2>
-                  <p className="panelSub">A lightweight preview (not the marketplace card yet).</p>
+                  <p className="panelSub">Preview updates instantly as you edit.</p>
                 </div>
                 <div className="panelBody">
                   <div className="voicePreviewCard">
@@ -492,6 +459,106 @@ export default function UploadPage() {
                     </div>
 
                     <div className="voicePreviewText mono">{previewText}</div>
+
+                    {keywords.length > 0 ? (
+                      <div className="chips" style={{ marginTop: 12 }}>
+                        {keywords.map((k) => (
+                          <span className="chip" key={`kw-${k}`}>
+                            {k}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="mintRightBlock">
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <span className="muted" style={{ fontSize: 13 }}>
+                        {content.trim().length < MIN_CHARS
+                          ? `Need ${MIN_CHARS}+ characters`
+                          : styleName.trim()
+                            ? "Ready to mint"
+                            : "Add a style name to mint"}
+                      </span>
+                      <Button
+                        variant="primary"
+                        onClick={startMintPipeline}
+                        ariaLabel="Mint this style"
+                        disabled={!canMint || mintPhase !== "idle"}
+                      >
+                        Mint this style
+                      </Button>
+                    </div>
+
+                    {mintPhase !== "idle" ? (
+                      <div className="mintActivity">
+                        <div className="kicker">Mint activity</div>
+                        <div className="mintSteps" aria-label="Mint activity steps">
+                          {mintSteps.map((s, idx) => {
+                            const done = idx < mintStepIndex;
+                            const active = idx === mintStepIndex;
+                            return (
+                              <div
+                                key={s.key}
+                                className={`mintStep ${done ? "mintStepDone" : "mintStepPending"} ${
+                                  active ? "mintStepActive" : ""
+                                }`}
+                              >
+                                <span className="mintBullet" aria-hidden="true">
+                                  {done ? "✓" : active ? "…" : " "}
+                                </span>
+                                <div className="mintStepLabel">{s.label}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {mintPhase === "ready" ? (
+                          <div className="row" style={{ marginTop: 14, justifyContent: "flex-end" }}>
+                            <Button
+                              variant="primary"
+                              onClick={confirmMint}
+                              ariaLabel="Confirm mint"
+                            >
+                              Confirm mint
+                            </Button>
+                          </div>
+                        ) : null}
+
+                        {mintPhase === "confirming" ? (
+                          <div className="muted" style={{ marginTop: 14 }}>
+                            Submitting transaction…
+                          </div>
+                        ) : null}
+
+                        {mintPhase === "success" && txHash && mintedStyleId ? (
+                          <div className="mintSuccess">
+                            <div className="kicker">Success</div>
+                            <h2 className="panelTitle" style={{ marginTop: 10 }}>
+                              Style ready
+                            </h2>
+                            <p className="panelSub">
+                              Transaction hash:{" "}
+                              <span className="mono" style={{ color: "var(--text)" }}>
+                                {txHash}
+                              </span>
+                            </p>
+                            <p className="panelSub">
+                              Style ID:{" "}
+                              <span className="mono" style={{ color: "var(--text)" }}>
+                                {mintedStyleId}
+                              </span>
+                            </p>
+
+                            <div className="row" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+                              <Button variant="primary" onClick={resetAll} ariaLabel="Create another style">
+                                Create another style
+                              </Button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               </div>

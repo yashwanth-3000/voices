@@ -32,7 +32,8 @@ export default function WalletPage() {
   const hasWallet = Boolean(address);
 
   useEffect(() => {
-    setAddress(safeReadWallet());
+    const existing = safeReadWallet();
+    setAddress(existing);
   }, []);
 
   const fakeAddress = useMemo(
@@ -46,6 +47,7 @@ export default function WalletPage() {
       localStorage.setItem(WALLET_KEY, JSON.stringify({ address: fakeAddress }));
       setAddress(fakeAddress);
       setBusy(false);
+      router.replace("/upload");
     }, 650);
   }
 
@@ -58,65 +60,42 @@ export default function WalletPage() {
             <div className="walletHero">
               <div className="kicker">Wallet</div>
               <h1 className="sectionTitle" style={{ marginTop: 10 }}>
-                Connect to upload your style
+                Connect your wallet
               </h1>
-              <p className="sectionSub">
-                This demo uses a dummy wallet connection. No real authentication or
-                on-chain calls are made.
-              </p>
+              <p className="sectionSub">Connect to continue to style upload.</p>
             </div>
 
             <div className="walletGlassCard" role="region" aria-label="Wallet connection">
               <div className="walletCardTop">
                 <div>
-                  <div className="walletCardTitle">Connection</div>
-                  <div className="walletCardSubtitle">Secure, encrypted, and ready (mock)</div>
-                </div>
-                <div className={`walletStatusPill ${hasWallet ? "walletStatusOk" : ""}`}>
-                  {hasWallet ? "Connected" : "Not connected"}
-                </div>
-              </div>
-
-              <div className="walletStatsGrid" aria-label="Wallet stats">
-                <div className="walletStat">
-                  <div className="walletStatLabel">Address</div>
-                  <div className="walletStatValue">
-                    {hasWallet ? shortAddress(address!) : "—"}
+                  <div className="walletCardTitle">Connect to your wallet</div>
+                  <div className="walletCardSubtitle">
+                    Choose a wallet to connect.
                   </div>
                 </div>
-                <div className="walletStat">
-                  <div className="walletStatLabel">Network</div>
-                  <div className="walletStatValue">Testnet</div>
-                </div>
-                <div className="walletStat">
-                  <div className="walletStatLabel">Credits</div>
-                  <div className="walletStatValue">{hasWallet ? "Ready" : "—"}</div>
+                <div className={`walletStatusPill ${hasWallet ? "walletStatusOk" : ""}`}>
+                  {hasWallet ? `Connected · ${shortAddress(address!)}` : "Not connected"}
                 </div>
               </div>
 
-              <div className="walletActions">
-                <Button
-                  variant="primary"
-                  onClick={connectDummyWallet}
-                  ariaLabel="Connect dummy wallet"
-                  disabled={busy || hasWallet}
-                >
-                  {busy ? "Connecting…" : hasWallet ? "Wallet connected" : "Connect wallet"}
-                </Button>
-                <Button
-                  variant="secondary"
-                  ariaLabel="Continue to upload"
-                  href={hasWallet ? "/upload" : undefined}
-                  onClick={!hasWallet ? connectDummyWallet : undefined}
-                  disabled={busy}
-                >
-                  {hasWallet ? "Continue" : busy ? "Connecting…" : "Connect to upload"}
-                </Button>
-              </div>
+              <button
+                type="button"
+                className="walletOption"
+                onClick={connectDummyWallet}
+                disabled={busy}
+                aria-label="Connect with MetaMask"
+              >
+                <div className="walletOptionLeft">
+                  <div className="walletOptionName">MetaMask</div>
+                  <div className="walletOptionSub">Connect using browser wallet</div>
+                </div>
+                <div className="walletOptionRight">
+                  {busy ? "Connecting…" : hasWallet ? "Connected" : "Connect"}
+                </div>
+              </button>
 
               <div className="walletFinePrint">
-                Your dummy wallet address is stored locally so you can continue to the
-                upload page.
+                After connecting, you’ll be redirected to upload your style.
               </div>
             </div>
           </div>

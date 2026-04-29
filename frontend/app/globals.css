@@ -1458,6 +1458,58 @@ button{font-family:inherit}
   font-size:13px;
 }
 
+.mintRightBlock{
+  margin-top:14px;
+  padding-top:14px;
+  border-top:1px solid rgba(76,49,31,.08);
+}
+
+/* Keywords */
+.keywordRow{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin-top:6px;
+}
+.keywordInput{
+  flex:1 1 220px;
+}
+.keywordAddBtn{
+  border-radius:999px;
+  padding:10px 14px;
+  border:1px solid var(--line);
+  background: rgba(255,255,255,.55);
+  color: var(--muted);
+  font-weight:800;
+  font-size:13px;
+  cursor:pointer;
+  transition: transform .18s ease, border-color .18s ease, background .18s ease, color .18s ease;
+}
+.keywordAddBtn:hover{
+  transform: translateY(-1px);
+  border-color: var(--line2);
+  background: rgba(255,255,255,.76);
+  color: var(--text);
+}
+.keywordAddBtn:disabled{
+  opacity:.6;
+  cursor:not-allowed;
+  transform:none;
+}
+.keywordHelp{
+  margin-top:8px;
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.5;
+}
+.keywordChip{
+  cursor:pointer;
+}
+.keywordChip:hover{
+  border-color: rgba(243,109,56,.22);
+}
+
 /* Wallet */
 .walletHero{
   max-width:720px;
@@ -1545,6 +1597,57 @@ button{font-family:inherit}
   font-size:13px;
   margin-top:10px;
   line-height:1.6;
+}
+
+.walletOption{
+  width:100%;
+  margin-top:14px;
+  border-radius:22px;
+  border:1px solid rgba(76,49,31,.12);
+  background: rgba(255,250,244,.62);
+  padding:14px 14px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  cursor:pointer;
+  transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+.walletOption:hover{
+  transform: translateY(-2px);
+  border-color: rgba(243,109,56,.28);
+  background: rgba(255,252,247,.92);
+  box-shadow: var(--shadow2);
+}
+.walletOption:disabled{
+  opacity:.7;
+  cursor:not-allowed;
+  transform:none;
+  box-shadow:none;
+}
+.walletOptionLeft{
+  text-align:left;
+}
+.walletOptionName{
+  font-family:var(--font-heading) !important;
+  font-weight:500;
+  font-size:18px;
+}
+.walletOptionSub{
+  margin-top:4px;
+  color:var(--muted);
+  font-size:13px;
+  font-weight:650;
+}
+.walletOptionRight{
+  border-radius:999px;
+  padding:8px 12px;
+  border:1px solid rgba(243,109,56,.14);
+  background:rgba(243,109,56,.08);
+  color:#f36d38;
+  font-weight:900;
+  font-size:12px;
+  white-space:nowrap;
 }
 
 @media (max-width: 980px){
