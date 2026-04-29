@@ -1,5 +1,5 @@
 export type StyleModel = {
-  slug: string;
+  id: string;
   title: string;
   creatorName: string;
   creatorHandle: string;
@@ -14,7 +14,7 @@ export type StyleModel = {
 
 export const styles: StyleModel[] = [
   {
-    slug: "witty-conversational",
+    id: "witty-conversational",
     title: "Witty & conversational",
     creatorName: "Romi Chen",
     creatorHandle: "romi",
@@ -44,7 +44,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "formal-analytical",
+    id: "formal-analytical",
     title: "Formal & analytical",
     creatorName: "Jules Park",
     creatorHandle: "jules.memos",
@@ -74,7 +74,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "minimal-poetic",
+    id: "minimal-poetic",
     title: "Minimal & poetic",
     creatorName: "Noor S.",
     creatorHandle: "noor.poetry",
@@ -101,7 +101,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "viral-social",
+    id: "viral-social",
     title: "Viral social voice",
     creatorName: "Saoirse Doyle",
     creatorHandle: "saoirse",
@@ -130,7 +130,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "contrarian-finance",
+    id: "contrarian-finance",
     title: "Contrarian finance",
     creatorName: "Devansh Patel",
     creatorHandle: "dev.p",
@@ -159,7 +159,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "observational-essay",
+    id: "observational-essay",
     title: "Observational essay",
     creatorName: "Lin Halverson",
     creatorHandle: "lin.h",
@@ -188,7 +188,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "lyrical-literary",
+    id: "lyrical-literary",
     title: "Lyrical literary",
     creatorName: "Maren Vasquez",
     creatorHandle: "maren.v",
@@ -216,7 +216,7 @@ export const styles: StyleModel[] = [
     ],
   },
   {
-    slug: "crisp-product-copy",
+    id: "crisp-product-copy",
     title: "Crisp product copy",
     creatorName: "Amina Rao",
     creatorHandle: "amina.ink",
@@ -246,7 +246,7 @@ export const styles: StyleModel[] = [
   },
 ];
 
-export function getStyle(slug: string): StyleModel | undefined {
-  return styles.find((s) => s.slug === slug);
+export function getStyle(id: string): StyleModel | undefined {
+  return styles.find((s) => s.id === id);
 }
 

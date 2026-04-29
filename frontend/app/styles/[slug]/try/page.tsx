@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
+import { Footer } from "../../../../components/Footer";
 import { Button } from "../../../../components/Button";
 import { getStyle } from "../../../../lib/styles";
 
@@ -90,7 +91,7 @@ export default function TryStylePage({ params }: PageProps) {
     const assistantMsg: Msg = {
       id: `a-${now}`,
       role: "assistant",
-      text: mockGenerate(style.title, trimmed),
+      text: mockGenerate(style!.title, trimmed),
     };
     setMessages((m) => [...m, userMsg, assistantMsg]);
     setInput("");

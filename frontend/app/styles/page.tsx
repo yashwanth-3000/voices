@@ -28,8 +28,8 @@ export default function StylesPage() {
             <div className="styleGallery" style={{ marginTop: 18 }}>
               {styles.map((s, i) => (
                 <StyleListingCard
-                  key={s.slug}
-                  href={`/styles/${s.slug}`}
+                  key={s.id}
+                  href={`/styles/${s.id}`}
                   title={s.title}
                   creator={`${s.creatorName} · @${s.creatorHandle}`}
                   price={s.price}

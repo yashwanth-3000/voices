@@ -9,6 +9,7 @@ type PageProps = {
 };
 
 export default function StyleDetailPage({ params }: PageProps) {
+  // Note: the route segment folder is `[slug]`, but we treat it as the style `id`.
   const style = getStyle(params.slug);
 
   if (!style) {
@@ -80,15 +81,25 @@ export default function StyleDetailPage({ params }: PageProps) {
                       </div>
                     ))}
                   </div>
+
                   <div className="aboutBottomActions" style={{ marginTop: 14 }}>
                     <span className="stylePriceTag">{style.price}</span>
-                    <Button
-                      href={`/styles/${style.slug}/try`}
-                      variant="primary"
-                      className="tryStyleCta"
-                    >
-                      Try style
-                    </Button>
+                    <div className="aboutActionButtons">
+                      <Button
+                        href={`/styles/${style.id}/try`}
+                        variant="primary"
+                        className="tryStyleCta"
+                      >
+                        Try style
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        className="buyCreditsCta"
+                        ariaLabel={`Buy credits for style ${style.title}`}
+                      >
+                        Buy credits
+                      </Button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -144,17 +155,22 @@ export default function StyleDetailPage({ params }: PageProps) {
                   ))}
                 </div>
 
-                <div className="row" style={{ marginTop: 18, justifyContent: "space-between" }}>
+                <div
+                  className="row"
+                  style={{ marginTop: 18, justifyContent: "space-between" }}
+                >
                   <Button href="/styles" variant="secondary">
                     Back to styles
                   </Button>
-                  <Button href={`/styles/${style.slug}/try`} variant="primary">
+                  <Button
+                    href={`/styles/${style.id}/try`}
+                    variant="primary"
+                  >
                     Try style
                   </Button>
                 </div>
               </div>
             </div>
-
           </div>
         </section>
       </main>

@@ -1092,6 +1092,15 @@ button{font-family:inherit}
   display:flex;
   align-items:center;
   gap:12px;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  width:100%;
+}
+
+.aboutActionButtons{
+  display:flex;
+  align-items:center;
+  gap:12px;
 }
 
 .stylePriceTag{
@@ -1109,6 +1118,13 @@ button{font-family:inherit}
   padding:14px 24px;
   font-size:14px;
   font-weight:700;
+}
+
+.buyCreditsCta{
+  padding:14px 18px;
+  font-size:13px;
+  font-weight:700;
+  white-space:nowrap;
 }
 
 .textArea{
