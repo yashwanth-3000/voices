@@ -32,7 +32,14 @@ export class MockComputeClient implements AgentCompute {
 }
 
 function mockResult(content: string): ChatResult {
-  return { content, verified: null, model: "mock-derived-from-input" };
+  return {
+    content,
+    verified: null,
+    teeVerified: null,
+    model: "mock-derived-from-input",
+    computePath: "mock",
+    durationMs: 0
+  };
 }
 
 export class ZeroGComputeClient implements AgentCompute {
@@ -60,21 +67,30 @@ export class ZeroGComputeClient implements AgentCompute {
   }
 
   private async directChat(messages: ChatMessage[], options?: { model?: string; maxTokens?: number }): Promise<ChatResult> {
+    const started = Date.now();
     const client = new OpenAI({
       apiKey: requiredEnv("OG_COMPUTE_API_KEY"),
       baseURL: normalizeDirectBaseUrl(requiredEnv("OG_COMPUTE_SERVICE_URL"))
     });
     const model = options?.model ?? requiredEnv("OG_COMPUTE_MODEL");
     const completion = await client.chat.completions.create({ model, messages, max_tokens: options?.maxTokens });
+    const usage = tokenUsage(completion.usage);
     return {
       content: completion.choices[0]?.message?.content ?? "",
       chatId: completion.id,
       verified: null,
-      model
+      teeVerified: null,
+      model,
+      serviceUrl: normalizeDirectBaseUrl(requiredEnv("OG_COMPUTE_SERVICE_URL")),
+      computePath: "direct",
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      durationMs: Date.now() - started
     };
   }
 
   private async brokerChat(messages: ChatMessage[], options?: { maxRetries?: number; maxTokens?: number }): Promise<ChatResult> {
+    const started = Date.now();
     const broker = await this.createBroker();
     const providerAddress = requiredEnv("OG_COMPUTE_PROVIDER_ADDRESS");
     try {
@@ -92,11 +108,19 @@ export class ZeroGComputeClient implements AgentCompute {
       const data = await response.json();
       const chatId = response.headers.get("ZG-Res-Key") || response.headers.get("zg-res-key") || data.id || data.chatID;
       const verified = await broker.inference.processResponse(providerAddress, chatId, JSON.stringify(data.usage || {}));
+      const usage = tokenUsage(data.usage);
       return {
         content: data.choices?.[0]?.message?.content ?? "",
         chatId,
         verified,
-        model
+        teeVerified: verified,
+        providerAddress,
+        serviceUrl: endpoint,
+        model,
+        computePath: "broker",
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        durationMs: Date.now() - started
       };
     } finally {
       broker.inference.stopAutoFunding();
@@ -272,6 +296,18 @@ export function createComputeClient(): AgentCompute {
 function normalizeDirectBaseUrl(serviceUrl: string): string {
   const trimmed = serviceUrl.replace(/\/$/, "");
   return trimmed.endsWith("/v1/proxy") ? trimmed : `${trimmed}/v1/proxy`;
+}
+
+function tokenUsage(usage: unknown): { inputTokens?: number; outputTokens?: number } {
+  const record = usage && typeof usage === "object" ? (usage as Record<string, unknown>) : {};
+  return {
+    inputTokens: numberValue(record.prompt_tokens) ?? numberValue(record.input_tokens),
+    outputTokens: numberValue(record.completion_tokens) ?? numberValue(record.output_tokens)
+  };
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function extractTaggedBlocks(input: string, tag: string): string[] {

@@ -61,11 +61,33 @@ pnpm --filter backend compute:hello
 
 The 0G Compute broker currently requires more test funds than basic chain/storage work. If the wallet has no Compute ledger yet, the SDK asks for `broker.ledger.addLedger(3)`, so keep at least `3 0G` plus gas available before running the broker-backed compute smoke test.
 
+## Verifiable trail
+
+Every backend workflow can now be inspected through a proof endpoint:
+
+```bash
+GET /proof/:requestId
+GET /proof/:requestId    # with Accept: text/html for a browser-readable page
+GET /storage/blob?rootHash=<AGENT_BRAIN_ROOT>
+GET /admin/health
+```
+
+After running `/styles/upload`, `/generate`, or the smoke script, paste the returned `requestId` into `/proof/:requestId`. The response includes the agent trail, AgentBrain manifest root, encrypted sample/profile roots, compute call metadata, checkpoint keys, receipt verifications, contract addresses, and explorer links.
+
+For a full local proof pass:
+
+```bash
+pnpm --filter backend smoke:agents
+pnpm --filter backend start:mock
+```
+
+Then open `/proof/<requestId>` from the smoke output or live UI event stream.
+
 ## Agent architecture
 
 The backend now runs the three Voices specialists as a LangGraph swarm:
 
-- `style_curator` uses explicit ReAct tools: `verify_attestation`, `encrypt_and_store_samples`, `extract_style_profile`, `mint_inft`, `refine_profile_from_feedback`, and `handoff_to_content_creator`.
+- `style_curator` uses explicit ReAct tools: `verify_attestation`, `encrypt_and_store_samples`, `extract_style_profile`, `build_and_upload_agent_brain`, `mint_inft`, `refine_profile_from_feedback`, and `handoff_to_content_creator`.
 - `content_creator` uses explicit ReAct tools: `check_credit_balance`, `read_style_profile`, `pull_relevant_samples`, `generate_with_voice`, `log_draft`, and `handoff_to_distribution`.
 - `distribution_mgr` uses explicit ReAct tools: `tune_for_platform`, `check_credit_balance`, `deduct_credit_via_keeper`, `deposit_royalty_via_keeper`, `topup_credits_via_keeper`, and `handoff_to_curator`.
 
@@ -80,6 +102,47 @@ Local tests use a deterministic low-cost planner with mock compute. In live 0G c
 ```bash
 AGENT_LANGGRAPH_PLANNER_MODE=deterministic
 ```
+
+## AgentBrain iNFT model
+
+Each minted Voices style gets a fresh 256-bit content key. That key encrypts the creator samples, structured style profile, and future memory stream. The public iNFT reference points to an AgentBrain manifest on 0G Storage, while `StyleRegistry.sealedKeyOf(tokenId, owner)` stores the owner-wrapped content key.
+
+The AgentBrain manifest is intentionally not secret. It is the audit bundle that points to encrypted material:
+
+- encrypted sample root and 0G storage transaction
+- encrypted profile root, KV profile key, and refinement count
+- memory log stream for feedback/refinement history
+- compute provider/model/chat id evidence when available
+- content key hash and wrapping mode
+
+When the creator signs the ownership attestation, Voices recovers the EVM public key and uses a simplified ECIES-style secp256k1 wrapper for the content key. If a public key is unavailable, the backend falls back to an explicitly marked `address-derived-demo` wrapper so the demo remains runnable; production transfer re-wrapping should use a TEE/ZKP oracle.
+
+## 0G integration depth
+
+- 0G Storage: encrypted samples, encrypted style profiles, AgentBrain manifests, KV state, Log history, and LangGraph checkpoints.
+- 0G Compute: style extraction, generation, platform tuning, profile refinement, and optional ReAct planning. Broker mode surfaces provider address, chat id, token usage, duration, and TEE verification result when the provider returns one.
+- 0G Chain: StyleRegistry, CreditSystem, and RoyaltyVault transaction intents; confirmation endpoints now verify receipts and decoded events before emitting confirmed backend events.
+- 0G iNFT: ERC-7857-inspired encrypted metadata, per-token sealed keys, owner-scoped access, dynamic memory/refinement, and AgentBrain manifests stored on 0G.
+
+Use `/admin/health` to confirm the demo is in live mode. For the prize demo, the expected modes are:
+
+```json
+{
+  "storage": "0g",
+  "compute": "0g",
+  "compute_path": "broker",
+  "chain": "0g",
+  "checkpoint_flush": "0g",
+  "planner": "0g"
+}
+```
+
+## Honest limitations
+
+- Voices implements an ERC-7857-inspired data model and lifecycle, not full production ERC-7857 proof verification.
+- Transfer/clone proof semantics are not verified by a TEE or ZKP oracle in this hackathon build. The contract requires proof bytes, but the proof semantics are a documented next step.
+- Per-token key wrapping is real per-style key material, but the fallback `address-derived-demo` mode is only for hackathon/demo continuity. For production, require wallet public-key attestation or oracle-assisted re-wrapping.
+- Receipt verification depends on live 0G RPC access and deployed contract addresses. Mock mode returns deterministic mock receipts for local tests.
 
 Useful local checks:
 

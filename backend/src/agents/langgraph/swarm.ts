@@ -9,8 +9,16 @@ import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { createSwarm } from "@langchain/langgraph-swarm";
 import { z } from "zod";
 import { AgentEvent, AgentStatus, EventType, createUlid, requestIdFromEvent } from "../../events/types.js";
+import {
+  buildAgentBrain,
+  generateContentKey,
+  protectContentKeyForRuntime,
+  recoverRuntimeContentKey,
+  uploadAgentBrain,
+  wrapKeyForOwner
+} from "../../inft/agent-brain.js";
 import { contentGenerationPrompt, platformTuningPrompt, styleExtractionPrompt, styleRefinementPrompt } from "../prompts.js";
-import { MintStyleInput, AgentChain, AgentCompute, AgentStorage, KeeperHubClient } from "../../infra/types.js";
+import { MintStyleInput, AgentChain, AgentCompute, AgentStorage, ChatResult as AgentChatResult, KeeperHubClient } from "../../infra/types.js";
 import {
   VoicesAgentName,
   VoicesSwarmState,
@@ -79,6 +87,7 @@ export class VoicesLangGraphSwarm {
         this.verifyAttestationTool(),
         this.encryptAndStoreSamplesTool(),
         this.extractStyleProfileTool(),
+        this.buildAndUploadAgentBrainTool(),
         this.mintInftTool(),
         this.refineProfileFromFeedbackTool(),
         this.handoffToContentCreatorTool()
@@ -177,12 +186,19 @@ export class VoicesLangGraphSwarm {
           }
           const samples = stringArray(event.payload.samples);
           validateSamples(samples);
-          const encryptionKey = stringValue(event.payload.attestationSignature, "") || process.env.OG_STORAGE_ENCRYPTION_KEY;
+          const contentKey = generateContentKey();
+          const keyWrap = wrapKeyForOwner(contentKey, event.actor, {
+            attestationMessage: stringValue(event.payload.attestationMessage, undefined),
+            attestationSignature: stringValue(event.payload.attestationSignature, undefined),
+            ownerPublicKey: stringValue(event.payload.ownerPublicKey, undefined)
+          });
           const rawSamples = Buffer.from(samples.join("\n\n--- sample break ---\n\n"), "utf8");
-          const upload = await this.deps.storage.uploadEncrypted(rawSamples, encryptionKey);
+          const upload = await this.deps.storage.uploadEncrypted(rawSamples, ethers.hexlify(contentKey));
           await this.publishToolActivity(state, "style_curator", "encrypt_and_store_samples", "completed", "Encrypted samples were written through 0G Storage.", {
             rootHash: upload.rootHash,
-            txHash: upload.txHash
+            txHash: upload.txHash,
+            keyHash: keyWrap.keyHash,
+            keyWrapMode: keyWrap.wrapMode
           });
           return new Command({
             update: {
@@ -190,6 +206,11 @@ export class VoicesLangGraphSwarm {
               requestId,
               samplesRootHash: upload.rootHash,
               storageTxHash: upload.txHash,
+              runtimeContentKey: protectContentKeyForRuntime(contentKey),
+              keyHash: keyWrap.keyHash,
+              wrappedKey: keyWrap.wrappedKey,
+              ownerPublicKey: keyWrap.ownerPublicKey,
+              keyWrapMode: keyWrap.wrapMode,
               selectedSamples: budgetSamplesForExtraction(samples),
               lastError: undefined
             }
@@ -243,14 +264,18 @@ export class VoicesLangGraphSwarm {
             ...profile,
             sampleExcerpts: normalizeSampleExcerpts(profile, stringArray(event.payload.samples)),
             samplesRootHash: state.samplesRootHash,
-            teeVerified: compute.verified,
+            teeVerified: compute.teeVerified ?? compute.verified,
+            computeProvider: compute.providerAddress,
+            computeModel: compute.model,
+            computeChatId: compute.chatId,
             langGraphThread: `voices:${requestId}`,
             updatedAt: Date.now()
           };
           await this.deps.storage.kvSet(profileKey, enrichedProfile);
           await this.publishToolActivity(state, "style_curator", "extract_style_profile", "completed", "Profile JSON was extracted and stored in 0G KV.", {
             profileKey,
-            teeVerified: compute.verified
+            teeVerified: compute.teeVerified ?? compute.verified,
+            compute: computeEvidence(compute, "style_profile_extraction")
           });
           return new Command({
             update: {
@@ -261,7 +286,8 @@ export class VoicesLangGraphSwarm {
               creatorAddress: event.actor,
               styleProfile: enrichedProfile,
               profileKey,
-              teeVerified: compute.verified,
+              teeVerified: compute.teeVerified ?? compute.verified,
+              lastCompute: computeEvidence(compute, "style_profile_extraction"),
               lastError: undefined
             }
           });
@@ -287,6 +313,101 @@ export class VoicesLangGraphSwarm {
     );
   }
 
+  private buildAndUploadAgentBrainTool() {
+    return tool(
+      async () => {
+        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
+        const event = requireIncomingEvent(state);
+        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+        await this.publishToolActivity(state, "style_curator", "build_and_upload_agent_brain", "started", "Encrypting profile material and publishing the AgentBrain manifest.");
+        try {
+          if (!state.runtimeContentKey || !state.samplesRootHash || !state.profileKey || !state.styleProfile) {
+            throw new Error("Content key, encrypted samples, and profile are required before AgentBrain upload");
+          }
+          if (!state.wrappedKey || !state.keyHash) {
+            throw new Error("Wrapped key material is required before AgentBrain upload");
+          }
+
+          const contentKey = recoverRuntimeContentKey(state.runtimeContentKey);
+          const styleId = state.currentStyleId ?? state.pendingStyleId ?? `pending:${event.id}`;
+          const profileBytes = Buffer.from(JSON.stringify(state.styleProfile), "utf8");
+          const profileUpload = await this.deps.storage.uploadEncrypted(profileBytes, ethers.hexlify(contentKey));
+          const samples = stringArray(event.payload.samples);
+          const { manifest } = buildAgentBrain({
+            styleId,
+            creator: state.creatorAddress ?? event.actor,
+            contentKey,
+            samplesUpload: { rootHash: state.samplesRootHash, txHash: state.storageTxHash },
+            profileUpload,
+            profileKey: state.profileKey,
+            profile: state.styleProfile,
+            sampleCount: samples.length,
+            sampleSizeBytes: Buffer.byteLength(samples.join("\n"), "utf8"),
+            memoryLogStream: `style:${styleId}:memory`,
+            feedbackCount: 0,
+            compute: {
+              content: "",
+              verified: state.teeVerified ?? null,
+              teeVerified: state.teeVerified ?? null,
+              model: stringValue(state.styleProfile.computeModel, undefined),
+              providerAddress: stringValue(state.styleProfile.computeProvider, undefined),
+              chatId: stringValue(state.styleProfile.computeChatId, undefined)
+            },
+            wrapMode: state.keyWrapMode === "ecies-secp256k1-attestation" ? "ecies-secp256k1-attestation" : "address-derived-demo"
+          });
+          const brainUpload = await uploadAgentBrain(this.deps.storage, manifest);
+          const agentBrainKey = `style:${styleId}:agentBrain`;
+          await this.deps.storage.kvSet(agentBrainKey, {
+            ...manifest,
+            manifest_root_hash: brainUpload.rootHash,
+            manifest_storage_tx_hash: brainUpload.txHash,
+            manifest_hash: brainUpload.manifestHash
+          });
+
+          await this.publishToolActivity(state, "style_curator", "build_and_upload_agent_brain", "completed", "AgentBrain manifest uploaded to 0G Storage.", {
+            agentBrainRootHash: brainUpload.rootHash,
+            agentBrainTxHash: brainUpload.txHash,
+            agentBrainManifestHash: brainUpload.manifestHash,
+            profileRootHash: profileUpload.rootHash,
+            keyHash: state.keyHash
+          });
+
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `AgentBrain manifest uploaded at ${brainUpload.rootHash}.`),
+              requestId,
+              pendingStyleId: styleId,
+              currentStyleId: styleId,
+              profileRootHash: profileUpload.rootHash,
+              profileStorageTxHash: profileUpload.txHash,
+              agentBrainRootHash: brainUpload.rootHash,
+              agentBrainTxHash: brainUpload.txHash,
+              agentBrainManifestHash: brainUpload.manifestHash,
+              lastError: undefined
+            }
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publishToolActivity(state, "style_curator", "build_and_upload_agent_brain", "failed", reason);
+          await this.publishStyleFailure(event, requestId, reason);
+          return new Command({
+            update: {
+              ...appendAgentMessage("style_curator", `AgentBrain upload failed: ${reason}`),
+              requestId,
+              lastEventType: "style.failed",
+              lastError: reason
+            }
+          });
+        }
+      },
+      {
+        name: "build_and_upload_agent_brain",
+        description: "Encrypt the profile with the per-style content key, upload the AgentBrain manifest, and persist its 0G root hash.",
+        schema: z.object({})
+      }
+    );
+  }
+
   private mintInftTool() {
     return tool(
       async () => {
@@ -295,16 +416,19 @@ export class VoicesLangGraphSwarm {
         const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
         await this.publishToolActivity(state, "style_curator", "mint_inft", "started", "Preparing the StyleRegistry mint transaction intent for the creator wallet.");
         try {
-          if (!state.profileKey || !state.samplesRootHash || !state.styleProfile) {
-            throw new Error("Profile and encrypted samples are required before minting");
+          if (!state.profileKey || !state.samplesRootHash || !state.styleProfile || !state.agentBrainRootHash) {
+            throw new Error("Profile, encrypted samples, and AgentBrain manifest are required before minting");
+          }
+          if (!state.wrappedKey || !state.keyHash) {
+            throw new Error("Wrapped key material is required before minting");
           }
           const styleId = state.currentStyleId ?? state.pendingStyleId ?? `pending:${event.id}`;
           const mintInput: MintStyleInput = {
             tokenMetadataURI: stringValue(event.payload.tokenMetadataURI, ""),
-            encryptedSamplesURI: `0g://storage/${state.samplesRootHash}`,
+            encryptedSamplesURI: `0g://agent-brain/${state.agentBrainRootHash}`,
             profileURI: `0g://kv/${state.profileKey}`,
-            metadataHash: ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(state.styleProfile))),
-            sealedKey: ethers.hexlify(ethers.toUtf8Bytes("server-side-demo-sealed-key")),
+            metadataHash: state.agentBrainManifestHash ?? ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(state.styleProfile))),
+            sealedKey: state.wrappedKey,
             royaltyWei: stringValue(event.payload.royaltyWei, "1000000000000000"),
             sampleCount: stringArray(event.payload.samples).length,
             language: stringValue(event.payload.language, "en"),
@@ -324,6 +448,11 @@ export class VoicesLangGraphSwarm {
               profileKey: state.profileKey,
               samplesRootHash: state.samplesRootHash,
               storageTxHash: state.storageTxHash,
+              agentBrainRootHash: state.agentBrainRootHash,
+              agentBrainTxHash: state.agentBrainTxHash,
+              agentBrainManifestHash: state.agentBrainManifestHash,
+              keyHash: state.keyHash,
+              keyWrapMode: state.keyWrapMode,
               teeVerified: state.teeVerified,
               transactionIntent,
               langGraphThread: `voices:${requestId}`
@@ -569,8 +698,9 @@ export class VoicesLangGraphSwarm {
           const draft = guardGeneratedDraft(rawDraft, prompt, state.styleProfile ?? {});
           await this.publishToolActivity(state, "content_creator", "generate_with_voice", "completed", "Draft generated and checked for sample-content leakage.", {
             styleId,
-            teeVerified: compute.verified,
-            qualityGuard: draft === rawDraft.trim() ? "passed" : "fallback_rewrite"
+            teeVerified: compute.teeVerified ?? compute.verified,
+            qualityGuard: draft === rawDraft.trim() ? "passed" : "fallback_rewrite",
+            compute: computeEvidence(compute, "voice_generation")
           });
           return new Command({
             update: {
@@ -579,7 +709,8 @@ export class VoicesLangGraphSwarm {
               currentStyleId: styleId,
               prompt,
               draftText: draft,
-              teeVerified: compute.verified,
+              teeVerified: compute.teeVerified ?? compute.verified,
+              lastCompute: computeEvidence(compute, "voice_generation"),
               lastError: undefined
             }
           });
@@ -622,6 +753,7 @@ export class VoicesLangGraphSwarm {
           draft,
           prompt: state.prompt ?? stringValue(event.payload.prompt, ""),
           teeVerified: state.teeVerified,
+          compute: state.lastCompute,
           langGraphThread: `voices:${requestId}`,
           timestamp: Date.now()
         });
@@ -638,6 +770,7 @@ export class VoicesLangGraphSwarm {
             prompt: state.prompt ?? stringValue(event.payload.prompt, ""),
             platforms: state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
             teeVerified: state.teeVerified,
+            compute: state.lastCompute,
             langGraphThread: `voices:${requestId}`
           }
         });
@@ -720,7 +853,8 @@ export class VoicesLangGraphSwarm {
         await this.deps.storage.logAppend(`consumer:${consumerAddress}:history`, `published:${event.id}`, {
           styleId,
           variants,
-          teeVerified: compute.verified,
+          teeVerified: compute.teeVerified ?? compute.verified,
+          compute: computeEvidence(compute, "platform_tuning"),
           langGraphThread: `voices:${requestId}`,
           timestamp: Date.now()
         });
@@ -734,7 +868,8 @@ export class VoicesLangGraphSwarm {
           payload: {
             requestId,
             variants,
-            teeVerified: compute.verified,
+            teeVerified: compute.teeVerified ?? compute.verified,
+            compute: computeEvidence(compute, "platform_tuning"),
             settlementStatus: "awaiting_wallet_signature",
             spendIntent,
             langGraphThread: `voices:${requestId}`
@@ -743,14 +878,15 @@ export class VoicesLangGraphSwarm {
         await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "completed", "Variants written to the consumer log and spend-credit intent prepared.", {
           styleId,
           platforms,
-          teeVerified: compute.verified
+          teeVerified: compute.teeVerified ?? compute.verified,
+          compute: computeEvidence(compute, "platform_tuning")
         });
         return new Command({
           update: {
             ...appendAgentMessage("distribution_mgr", "Platform variants created in one 0G Compute call."),
             platformVariants: variants,
             spendIntent,
-            teeVerified: compute.verified,
+            teeVerified: compute.teeVerified ?? compute.verified,
             lastEventType: "generation.published",
             lastError: undefined
           }
@@ -1117,7 +1253,8 @@ export class VoicesLangGraphSwarm {
     if (delta.meaningful_change === false) {
       await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "completed", "0G Compute judged the feedback too weak for a profile update.", {
         styleId,
-        teeVerified: compute.verified
+        teeVerified: compute.teeVerified ?? compute.verified,
+        compute: computeEvidence(compute, "style_profile_refinement")
       });
       return appendAgentMessage("style_curator", "Feedback did not justify a profile update.");
     }
@@ -1128,7 +1265,8 @@ export class VoicesLangGraphSwarm {
       recentFeedback: feedback,
       lastRefinementReason: stringValue(delta.reason, "feedback.received"),
       lastRefinementQualitySignal: stringValue(delta.quality_signal, "mixed"),
-      lastRefinementTeeVerified: compute.verified,
+      lastRefinementTeeVerified: compute.teeVerified ?? compute.verified,
+      lastRefinementCompute: computeEvidence(compute, "style_profile_refinement"),
       refinementCount: Number(existing.refinementCount ?? 0) + 1,
       langGraphThread: `voices:${requestId}`,
       updatedAt: Date.now()
@@ -1145,7 +1283,8 @@ export class VoicesLangGraphSwarm {
     await this.publishToolActivity(state, "style_curator", "refine_profile_from_feedback", "completed", "Profile patch stored and style.refined emitted.", {
       styleId,
       profileKey,
-      teeVerified: compute.verified
+      teeVerified: compute.teeVerified ?? compute.verified,
+      compute: computeEvidence(compute, "style_profile_refinement")
     });
 
     return {
@@ -1447,7 +1586,7 @@ function preferredToolOrder(agentName: VoicesAgentName, transcript: string): str
     if (transcript.includes("feedback.received")) {
       return ["refine_profile_from_feedback"];
     }
-    return ["verify_attestation", "encrypt_and_store_samples", "extract_style_profile", "mint_inft"];
+    return ["verify_attestation", "encrypt_and_store_samples", "extract_style_profile", "build_and_upload_agent_brain", "mint_inft"];
   }
 
   if (agentName === "content_creator") {
@@ -1477,6 +1616,7 @@ function toolHasRun(toolName: string, messages: BaseMessage[], transcript: strin
     verify_attestation: ["Creator attestation verified", "Attestation rejected"],
     encrypt_and_store_samples: ["Encrypted samples stored", "Sample storage failed"],
     extract_style_profile: ["Structured style profile extracted", "Style extraction failed"],
+    build_and_upload_agent_brain: ["AgentBrain manifest uploaded", "AgentBrain upload failed"],
     mint_inft: ["Mint intent prepared", "Mint intent failed"],
     refine_profile_from_feedback: ["refined from feedback", "refinement skipped", "Feedback was not specific"],
     check_credit_balance: ["generation credit", "No credits available", "Settlement check sees"],
@@ -1504,6 +1644,21 @@ function toChatResult(message: AIMessage): ChatResult {
         message
       }
     ]
+  };
+}
+
+function computeEvidence(compute: AgentChatResult, purpose: string): Record<string, unknown> {
+  return {
+    purpose,
+    provider: compute.providerAddress,
+    serviceUrl: compute.serviceUrl,
+    model: compute.model,
+    chatId: compute.chatId,
+    teeVerified: compute.teeVerified ?? compute.verified ?? null,
+    inputTokens: compute.inputTokens,
+    outputTokens: compute.outputTokens,
+    durationMs: compute.durationMs,
+    path: compute.computePath
   };
 }
 

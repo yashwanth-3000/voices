@@ -72,7 +72,47 @@ export const VoicesSwarmState = Annotation.Root({
     reducer: (_left, right) => right,
     default: () => undefined
   }),
+  runtimeContentKey: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  keyHash: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  wrappedKey: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  ownerPublicKey: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  keyWrapMode: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
   profileKey: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  profileRootHash: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  profileStorageTxHash: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  agentBrainRootHash: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  agentBrainTxHash: Annotation<string | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  agentBrainManifestHash: Annotation<string | undefined>({
     reducer: (_left, right) => right,
     default: () => undefined
   }),
@@ -89,6 +129,10 @@ export const VoicesSwarmState = Annotation.Root({
     default: () => undefined
   }),
   teeVerified: Annotation<boolean | null | undefined>({
+    reducer: (_left, right) => right,
+    default: () => undefined
+  }),
+  lastCompute: Annotation<Record<string, unknown> | undefined>({
     reducer: (_left, right) => right,
     default: () => undefined
   }),

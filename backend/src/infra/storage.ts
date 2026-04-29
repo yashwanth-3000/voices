@@ -59,6 +59,20 @@ export class MemoryStorageClient implements AgentStorage {
     return { rootHash };
   }
 
+  async uploadRaw(bytes: Uint8Array): Promise<{ rootHash: string; txHash?: string }> {
+    const rootHash = `memory://${createHash("sha256").update(bytes).digest("hex")}`;
+    this.blobs.set(rootHash, new Uint8Array(bytes));
+    return { rootHash };
+  }
+
+  async downloadRaw(rootHash: string): Promise<Uint8Array> {
+    const bytes = this.blobs.get(rootHash);
+    if (!bytes) {
+      throw new Error(`Missing raw blob: ${rootHash}`);
+    }
+    return bytes;
+  }
+
   async downloadEncrypted(rootHash: string, encryptionKey?: string): Promise<Uint8Array> {
     const encrypted = this.blobs.get(rootHash);
     if (!encrypted) {
@@ -120,21 +134,20 @@ export class ZeroGStorageClient extends MemoryStorageClient {
   override async uploadEncrypted(bytes: Uint8Array, encryptionKey?: string): Promise<{ rootHash: string; txHash?: string }> {
     return this.runStorageTransaction("encrypted upload", async () => {
       const encrypted = encryptBytes(bytes, resolveAesKey(encryptionKey));
-      const file = new MemData(encrypted);
-      const [tx, err] = await this.indexer.upload(
-        file,
-        this.rpcUrl,
-        this.signer as unknown as Parameters<Indexer["upload"]>[2]
-      );
-      if (err || !tx) {
-        throw err ?? new Error("0G encrypted upload failed");
-      }
-
-      if ("rootHash" in tx) {
-        return { rootHash: tx.rootHash, txHash: tx.txHash };
-      }
-      return { rootHash: tx.rootHashes[0], txHash: tx.txHashes[0] };
+      return this.uploadMemData(encrypted, "0G encrypted upload failed");
     });
+  }
+
+  override async uploadRaw(bytes: Uint8Array): Promise<{ rootHash: string; txHash?: string }> {
+    return this.runStorageTransaction("raw upload", async () => this.uploadMemData(bytes, "0G raw upload failed"));
+  }
+
+  override async downloadRaw(rootHash: string): Promise<Uint8Array> {
+    const [blob, err] = await this.indexer.downloadToBlob(rootHash, { proof: true });
+    if (err) {
+      throw err;
+    }
+    return new Uint8Array(await blob.arrayBuffer());
   }
 
   override async downloadEncrypted(rootHash: string, encryptionKey?: string): Promise<Uint8Array> {
@@ -144,6 +157,23 @@ export class ZeroGStorageClient extends MemoryStorageClient {
     }
     const encrypted = new Uint8Array(await blob.arrayBuffer());
     return decryptBytes(encrypted, resolveAesKey(encryptionKey));
+  }
+
+  private async uploadMemData(bytes: Uint8Array, failureMessage: string): Promise<{ rootHash: string; txHash?: string }> {
+    const file = new MemData(bytes);
+    const [tx, err] = await this.indexer.upload(
+      file,
+      this.rpcUrl,
+      this.signer as unknown as Parameters<Indexer["upload"]>[2]
+    );
+    if (err || !tx) {
+      throw err ?? new Error(failureMessage);
+    }
+
+    if ("rootHash" in tx) {
+      return { rootHash: tx.rootHash, txHash: tx.txHash };
+    }
+    return { rootHash: tx.rootHashes[0], txHash: tx.txHashes[0] };
   }
 
   async kvReadThrough<T>(key: string): Promise<T | null> {

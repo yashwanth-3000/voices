@@ -12,7 +12,14 @@ export type ChatResult = {
   chatId?: string;
   providerSig?: string;
   verified?: boolean | null;
+  teeVerified?: boolean | null;
+  providerAddress?: string;
+  serviceUrl?: string;
   model?: string;
+  computePath?: "mock" | "direct" | "broker";
+  inputTokens?: number;
+  outputTokens?: number;
+  durationMs?: number;
 };
 
 export type TransactionIntent = {
@@ -27,6 +34,16 @@ export type KeeperHubResult = {
   workflowId?: string;
   txHash?: string;
   reason?: string;
+};
+
+export type ReceiptVerification = {
+  txHash: string;
+  blockNumber?: number;
+  events: Array<{
+    contract: string;
+    name: string;
+    args: Record<string, string>;
+  }>;
 };
 
 export type StyleInfo = {
@@ -62,6 +79,8 @@ export interface AgentStorage {
   kvDelete(key: string): Promise<void>;
   logAppend<T>(streamId: string, key: string, value: T): Promise<void>;
   logScan<T>(streamId: string, prefix?: string, after?: string): Promise<Array<{ key: string; value: T }>>;
+  uploadRaw(bytes: Uint8Array): Promise<{ rootHash: string; txHash?: string }>;
+  downloadRaw(rootHash: string): Promise<Uint8Array>;
   uploadEncrypted(bytes: Uint8Array, encryptionKey?: string): Promise<{ rootHash: string; txHash?: string }>;
   downloadEncrypted(rootHash: string, encryptionKey?: string): Promise<Uint8Array>;
 }
@@ -76,6 +95,9 @@ export interface AgentChain {
   mintStyleIntent(input: MintStyleInput): TransactionIntent;
   buyCreditsIntent(amount: bigint): Promise<TransactionIntent>;
   spendCreditIntent(tokenId: string): TransactionIntent;
+  verifyMintReceipt(txHash: string, expected: { tokenId: string; creator: string }): Promise<ReceiptVerification>;
+  verifyCreditPurchaseReceipt(txHash: string, expected: { buyer: string; amount: string }): Promise<ReceiptVerification>;
+  verifySettlementReceipt(txHash: string, expected: { consumer: string; tokenId: string }): Promise<ReceiptVerification>;
   creditPrice(): Promise<bigint>;
   credits(address: string): Promise<bigint>;
   styleOf(tokenId: string): Promise<StyleInfo>;
