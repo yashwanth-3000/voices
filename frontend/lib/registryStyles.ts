@@ -9,8 +9,12 @@ export type ChainStyleDetails = {
     totalEarnings?: string;
     sampleCount?: number;
     listed: boolean;
+    encryptedSamplesURI?: string;
+    profileURI?: string;
     language?: string;
     genres?: string;
+    attestationURI?: string;
+    metadataHash?: string;
   };
   marketplace: {
     title: string;
@@ -24,6 +28,18 @@ export type ChainStyleDetails = {
     hasAgentBrain?: boolean;
     hasProfile?: boolean;
   };
+  profileKey?: string;
+  profile?: Record<string, unknown> | null;
+  agentBrain?: Record<string, unknown> | null;
+  recentOutputs?: Array<{
+    requestId?: string;
+    prompt?: string;
+    draft?: string;
+    variants?: Record<string, string>;
+    teeVerified?: boolean | null;
+    timestamp?: number;
+  }>;
+  evidenceLinks?: Array<{ label: string; url: string }>;
 };
 
 export type StylesResponse = {

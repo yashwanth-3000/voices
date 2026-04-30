@@ -46,8 +46,8 @@ export function styleExtractionPrompt(samples: string[], metadata: Record<string
     },
     recurring_themes: ["string"],
     rhetorical_moves: ["named moves such as contrast, caveat, concrete example, escalation, warning, reframing"],
-    do_rules: ["style rules a downstream generation model should follow"],
-    dont_rules: ["style mistakes a downstream generation model should avoid"],
+    do_rules: ["6 to 10 compact style rules a downstream generation model should follow"],
+    dont_rules: ["4 to 8 compact style mistakes a downstream generation model should avoid"],
     sample_excerpts: ["3 to 5 short representative excerpts copied exactly from the supplied samples, each under 240 chars"],
     voice_fingerprint: {
       fingerprint_text: "one compact paragraph describing the voice",
@@ -55,6 +55,24 @@ export function styleExtractionPrompt(samples: string[], metadata: Record<string
     },
     voice_essence: "one sentence that captures what makes this writer distinctive",
     safety_notes: ["privacy, attribution, known-author, or over-copying concerns"],
+    source_profile: {
+      primary_source_type: "twitter | github_readme | blog_article | file_upload | mixed",
+      source_inventory: [
+        {
+          type: "source type",
+          label: "creator-facing source label",
+          unit_count: "number of posts/articles/readmes/files represented",
+          character_count: "number of submitted characters for this source"
+        }
+      ],
+      analysis_focus: "which source-specific style lens was used and why",
+      generation_guidelines_by_format: {
+        tweet: ["2 to 4 compact rules for writing a new tweet in this voice"],
+        thread: ["2 to 4 compact rules for writing a thread"],
+        readme: ["2 to 4 compact rules for writing README/docs"],
+        article: ["2 to 4 compact rules for writing a blog/article"]
+      }
+    },
     confidence: "number between 0 and 1"
   };
   return [
@@ -70,13 +88,24 @@ export function styleExtractionPrompt(samples: string[], metadata: Record<string
         "3. Rhythm: estimate sentence length, variance, punctuation habits, compression level, and how short and long sentences are sequenced.",
         "4. Structure: describe openings, closings, paragraph length, transitions, and how arguments are built.",
         "5. Voice fingerprint: summarize what makes this writer recognizable in a way a generation model can follow without copying exact prose.",
+        "6. Source mechanics: adapt the profile to the submitted source type.",
+        "",
+        "Source-specific requirements:",
+        "- If the material is only Twitter/X posts, focus the profile on tweet behavior: hooks, post length, line breaks, emoji usage, hashtags, CTAs, thread shapes, quote/reply habits, punctuation, casing, and how a new tweet should be written.",
+        "- If the material is only GitHub READMEs, focus the profile on README/docs behavior: heading hierarchy, setup flow, code blocks, command examples, badges, tables, feature framing, contribution/license sections, and maintainer tone.",
+        "- If the material is only blogs/articles, focus the profile on long-form behavior: headline/opening style, thesis shape, sectioning, paragraph cadence, evidence style, examples, transitions, conclusion, and CTA.",
+        "- If the material is uploaded files, infer the document genre from the content and describe its formatting and transfer rules.",
+        "- If multiple source types are present, create one cross-source voice fingerprint plus a source_profile section for each source type that appears.",
         "",
         "Be specific. Prefer observable signals such as 'uses contrast before making the point' over vague labels such as 'professional'.",
         "Separate style from subject matter. Do not treat product names, wallet mechanics, or 0G-specific nouns as mandatory unless they are genuinely part of the writer's voice.",
-        "For sample_excerpts, include 3 to 5 short excerpts under 240 characters each. Copy them exactly, but choose excerpts that are representative and not private-sensitive.",
-        "Add do_rules and dont_rules that can be used directly by a generation prompt.",
+        "Keep this base profile compact and parse-safe. The next 0G Compute call creates the long detailed style guide, so do not put the full report here.",
+        "Prefer concise JSON arrays for do_rules, dont_rules, rhetorical_moves, and generation_guidelines_by_format. These fields should be directly usable by a future generation prompt.",
+        "For sample_excerpts, include 3 to 5 short excerpts under 180 characters each. Copy them exactly, but choose excerpts that are representative and not private-sensitive.",
+        "Output must be under 1800 tokens.",
         "Do not imitate or attribute the samples to any known author. Do not include commentary outside the tags.",
-        "Return only valid JSON wrapped in <style_profile>...</style_profile> tags. No markdown. No code fences.",
+        "Return one complete JSON object wrapped in <style_profile>...</style_profile> tags. The first character inside the opening tag must be { and the last character before the closing tag must be }.",
+        "No markdown. No code fences. No trailing text.",
         `Use this schema and keep the same top-level keys: ${JSON.stringify(schema)}`
       ].join("\n")
     },
@@ -87,6 +116,120 @@ export function styleExtractionPrompt(samples: string[], metadata: Record<string
         `Metadata: ${JSON.stringify(metadata)}`,
         "Treat each sample as private source material. Extract style signals, not reusable paragraphs.",
         ...samples.map((sample, index) => [`<sample index="${index + 1}">`, sample, "</sample>"].join("\n"))
+      ].join("\n\n")
+    }
+  ];
+}
+
+export function detailedStyleGuidePrompt(input: {
+  profile: Record<string, unknown>;
+  samples: string[];
+  metadata: Record<string, unknown>;
+}): ChatMessage[] {
+  const schema = {
+    guide_version: 1,
+    generated_by: "0g-compute",
+    source_type: "twitter | github_readme | blog_article | file_upload | mixed",
+    source_summary: "what material was analyzed",
+    source_preservation: {
+      full_input_stored_encrypted: true,
+      public_report_contains_selected_examples_only: true,
+      analyzed_unit_count: "number",
+      analyzed_character_count: "number"
+    },
+    prompt_ready_style_brief: "dense paragraph that a generation model can follow directly",
+    voice_summary: "plain-language summary of what makes the voice recognizable",
+    actual_examples: [
+      {
+        label: "short label",
+        source_label: "where this example came from",
+        text: "exact short example from the supplied material",
+        observed_patterns: ["specific style mechanics visible in this example"]
+      }
+    ],
+    writing_patterns: {
+      length_and_density: "measurable post, paragraph, or section length patterns",
+      hooks_or_openings: ["specific observed opening patterns"],
+      structure: "how the writer organizes the material",
+      line_breaks_or_sectioning: "spacing, section, heading, or paragraph habits",
+      vocabulary_signals: ["recurring words, domain nouns, and phrase shapes"],
+      punctuation_and_casing: "questions, exclamations, colon use, caps, quote style",
+      emoji_hashtag_link_cta_usage: "for Twitter/X; say none if absent",
+      argument_shape: "how points are built, caveated, escalated, or closed"
+    },
+    voice_rules: ["10 to 16 concrete generation rules"],
+    avoid_rules: ["8 to 12 concrete mistakes to avoid"],
+    generation_recipe: {
+      tweet: ["source-specific steps for writing one tweet"],
+      thread: ["source-specific steps for writing a thread"],
+      readme: ["source-specific steps for writing README/docs"],
+      article: ["source-specific steps for writing a long-form piece"],
+      generic: ["safe adaptation steps for other formats"]
+    },
+    confidence: "number between 0 and 1"
+  };
+
+  return [
+    {
+      role: "system",
+      content: [
+        "You are the 0G Compute Style Guide Generator for Voices.",
+        "Your task is to create a detailed, public, prompt-ready style guide from creator-owned private samples and an existing style profile.",
+        "",
+        "This is not a summary. It must be operational: another generation model should be able to follow it to write in the same structural voice without seeing the full encrypted source material.",
+        "",
+        "Hard requirements:",
+        "- Derive every claim from the supplied samples and existing profile. Do not invent mechanics.",
+        "- Preserve all important source-specific behavior: tweet hooks, emoji/hashtag/link/CTA habits, line breaks, post length, thread shape; README headings, setup flow, code blocks, tables; article thesis, sectioning, evidence style, paragraph cadence.",
+        "- Include 4 to 8 actual examples copied exactly from the supplied material. For Twitter/X, use whole short posts when possible. For README/article/file material, use representative headings, paragraphs, or concise sections.",
+        "- For each example, explain observed_patterns: why this example teaches the style.",
+        "- Create concrete voice_rules and avoid_rules. Avoid generic instructions like 'be professional' unless the samples actually show that behavior and you explain how.",
+        "- Do not expose secrets, credentials, private keys, or sensitive personal identifiers if present. If an example contains sensitive data, choose another example.",
+        "- Do not attribute the style to a known author. Do not say the creator is a public figure.",
+        "- Do not include markdown, commentary, or code fences.",
+        "",
+        "Return only valid JSON wrapped in <style_guide>...</style_guide> tags.",
+        `Use this schema and keep the same top-level keys: ${JSON.stringify(schema)}`
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: [
+        "Existing style profile:",
+        JSON.stringify(input.profile),
+        "Metadata:",
+        JSON.stringify(input.metadata),
+        "Creator-owned samples to analyze:",
+        ...input.samples.map((sample, index) => `<sample index="${index + 1}">\n${sample}\n</sample>`)
+      ].join("\n\n")
+    }
+  ];
+}
+
+export function jsonRepairPrompt(input: {
+  tag: string;
+  content: string;
+  parseError: string;
+}): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: [
+        "You repair malformed JSON emitted by an LLM.",
+        "Keep the original meaning and fields. Do not invent new analysis. Do not summarize.",
+        "Fix only syntax problems: missing outer braces, missing commas, trailing commas, unescaped newlines inside strings, accidental tag text, and unfinished trailing fields.",
+        "If the input is an object fragment such as \"tone\": {...}, wrap it with { and }.",
+        "If the response was cut off, close the current object/array safely and omit only the unfinished trailing field.",
+        `Return exactly one complete JSON object wrapped in <${input.tag}>...</${input.tag}> tags. The first character inside the opening tag must be { and the last character before the closing tag must be }. No markdown. No code fences.`
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: [
+        `Tag: ${input.tag}`,
+        `Parse error: ${input.parseError}`,
+        "Malformed response:",
+        input.content
       ].join("\n\n")
     }
   ];
@@ -182,6 +325,9 @@ export function contentGenerationPrompt(input: {
         "",
         "Style transfer rules:",
         "- Use the profile's do_rules and dont_rules if present.",
+        "- Use detailed_style_guide first when present, especially prompt_ready_style_brief, writing_patterns, voice_rules, avoid_rules, actual_examples, and generation_recipe.",
+        "- Use source_profile when present. For X/tweets, follow twitter_profile and generation_guidelines_by_format.tweet/thread. For README/docs requests, follow readme_profile and generation_guidelines_by_format.readme. For blog/article requests, follow article_profile and generation_guidelines_by_format.article.",
+        "- Match the source-specific format mechanics: post length, line breaks, emoji/hashtag/CTA habits for tweets; heading hierarchy and code/example flow for READMEs; thesis, sections, evidence, and conclusion shape for articles.",
         "- Keep the draft compact unless the user asks for long-form.",
         "- Prefer concrete nouns and clear causality over hype.",
         "- Do not explain your reasoning. Do not add preamble. Do not wrap the draft in quotation marks.",

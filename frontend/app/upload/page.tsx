@@ -2,11 +2,10 @@
 
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { BrowserProvider, Interface, type TransactionRequest, ethers } from "ethers";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { Button } from "../../components/Button";
-import type { StyleModel } from "../../lib/styles";
-import { upsertMintedStyle } from "../../lib/mintedStyles";
 import { useWallet } from "../../context/WalletContext";
 
 const MIN_CHARS = 200;
@@ -15,22 +14,14 @@ const ROYALTY_MAX = 0.002;
 const ROYALTY_STEP = 0.0001;
 const MAX_BLOG_IMPORTS = 3;
 const MAX_GITHUB_READMES = 3;
+const STYLE_UPLOAD_TIMEOUT_MS = 15 * 60_000;
+const POLL_INTERVAL_MS = 1_000;
+const STYLE_REGISTRY_IFACE = new Interface([
+  "event StyleMinted(uint256 indexed tokenId,address indexed creator,uint256 royaltyWei,string encryptedSamplesURI,bytes32 metadataHash)",
+]);
 
 function shortAddress(addr: string) {
   return addr.length > 14 ? `${addr.slice(0, 6)}…${addr.slice(-6)}` : addr;
-}
-
-function makeFakeTxHash() {
-  const hex = Array.from({ length: 64 }, () =>
-    Math.floor(Math.random() * 16).toString(16),
-  ).join("");
-  return `0x${hex}`;
-}
-
-function makeFakeStyleId() {
-  const a = Math.random().toString(16).slice(2, 8);
-  const b = Date.now().toString(16).slice(-6);
-  return `uploaded-${a}-${b}`;
 }
 
 function formatImportDate(value?: string) {
@@ -227,23 +218,25 @@ function MarkdownView({ text }: { text: string }) {
   return <div className="vcMarkdown">{blocks}</div>;
 }
 
-async function extractMockText(file: File): Promise<string> {
+async function extractFileText(file: File): Promise<string> {
   const name = file.name || "file";
   const lower = name.toLowerCase();
   const isPdf = lower.endsWith(".pdf") || file.type.includes("pdf");
   const isTxt = lower.endsWith(".txt");
   const isMd = lower.endsWith(".md") || lower.endsWith(".markdown");
-  if (isPdf) return `\n[Mock PDF extract: ${name}]\nThis is mocked extracted content from a PDF upload.\n\n`;
+  if (isPdf) {
+    throw new Error("PDF text extraction is not wired yet. Upload TXT or Markdown so the full source text can be preserved exactly.");
+  }
   if (isTxt || isMd) {
     const txt = await file.text();
-    return `\n[${isMd ? "Mock Markdown" : "Text"}: ${name}]\n${txt}\n\n`;
+    return txt;
   }
-  return `\n[Unsupported file type (mocked): ${name}]\n`;
+  throw new Error(`Unsupported file type: ${name}`);
 }
 
 type MintPhase = "idle" | "processing" | "ready" | "confirming" | "success";
-type MintStep = { key: string; label: string };
 type ImportStatus = "idle" | "loading" | "ready" | "error";
+type StreamStatus = "closed" | "connecting" | "open" | "error";
 
 type TwitterImportTweet = {
   id: string;
@@ -303,6 +296,35 @@ type GitHubReadmeImport = {
   importedAt: string;
 };
 
+type SourceKind = "file_upload" | "twitter" | "blog_article" | "github_readme";
+
+type SourceMaterial = {
+  id: string;
+  kind: SourceKind;
+  label: string;
+  text: string;
+  characterCount: number;
+  unitCount: number;
+  importedAt: string;
+  metadata: Record<string, unknown>;
+};
+
+type AgentEvent = {
+  id: string;
+  type: string;
+  timestamp: number;
+  actor: string;
+  styleId?: string;
+  payload?: Record<string, unknown>;
+};
+
+type TransactionIntent = {
+  to: string;
+  data: string;
+  value: string;
+  description: string;
+};
+
 export default function UploadPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -311,6 +333,7 @@ export default function UploadPage() {
   const [activeTab, setActiveTab] = useState<"upload" | "twitter" | "blog" | "github">("upload");
   const [isDragging, setIsDragging] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
+  const [sourceMaterials, setSourceMaterials] = useState<SourceMaterial[]>([]);
   const [content, setContent] = useState("");
   const [styleName, setStyleName] = useState("");
   const [description, setDescription] = useState("");
@@ -336,20 +359,27 @@ export default function UploadPage() {
   const [blogImports, setBlogImports] = useState<BlogImportResult[]>([]);
   const [blogLoadingIndex, setBlogLoadingIndex] = useState<number | null>(null);
   const [mintPhase, setMintPhase] = useState<MintPhase>("idle");
-  const [mintStepIndex, setMintStepIndex] = useState(0);
   const [txHash, setTxHash] = useState<string | null>(null);
   const [mintedStyleId, setMintedStyleId] = useState<string | null>(null);
-
-  const mintSteps: MintStep[] = useMemo(() => [
-    { key: "verify", label: "Verifying input" },
-    { key: "process", label: "Processing samples" },
-    { key: "profile", label: "Generating style profile" },
-    { key: "prepare", label: "Preparing mint transaction" },
-  ], []);
+  const [requestId, setRequestId] = useState<string | null>(null);
+  const [pendingStyleId, setPendingStyleId] = useState<string | null>(null);
+  const [mintIntent, setMintIntent] = useState<TransactionIntent | null>(null);
+  const [mintError, setMintError] = useState("");
+  const [workflowEvents, setWorkflowEvents] = useState<AgentEvent[]>([]);
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>("closed");
+  const [selectedEventId, setSelectedEventId] = useState("");
+  const streamRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     if (!isInitializing && !walletAddress) router.replace("/wallet?returnTo=/upload");
   }, [isInitializing, walletAddress, router]);
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.close();
+      streamRef.current = null;
+    };
+  }, []);
 
   const charCount = content.length;
 
@@ -357,7 +387,7 @@ export default function UploadPage() {
     () => githubRepos.find((r) => r.fullName === githubRepoFullName) ?? null,
     [githubRepoFullName, githubRepos],
   );
-  const sourceCount = uploadedFiles.length;
+  const sourceCount = sourceMaterials.length;
 
   const canMint =
     Boolean(walletAddress) && content.trim().length >= MIN_CHARS && styleName.trim().length > 0;
@@ -386,6 +416,35 @@ export default function UploadPage() {
   ], [charCount, sourceCount, styleName, walletAddress]);
   const readinessCompleteCount = readiness.filter((item) => item.ready).length;
   const readinessPercent = Math.round((readinessCompleteCount / readiness.length) * 100);
+  const visibleWorkflowEvents = useMemo(
+    () => [...workflowEvents].sort((left, right) => right.timestamp - left.timestamp),
+    [workflowEvents],
+  );
+  const selectedEvent = useMemo(
+    () => workflowEvents.find((event) => event.id === selectedEventId) ?? null,
+    [selectedEventId, workflowEvents],
+  );
+
+  useEffect(() => {
+    const mintReadyEvent = workflowEvents.find((event) => event.type === "style.mint.intent.created");
+    if (mintReadyEvent && !mintIntent && mintPhase !== "confirming" && mintPhase !== "success") {
+      const intent = payloadIntent(mintReadyEvent, "transactionIntent");
+      if (intent && mintReadyEvent.styleId) {
+        setPendingStyleId(mintReadyEvent.styleId);
+        setMintIntent(intent);
+        setMintError("");
+        setMintPhase("ready");
+        return;
+      }
+    }
+
+    const failedEvent = workflowEvents.find((event) => event.type === "style.failed");
+    if (failedEvent && mintPhase === "processing") {
+      const payload = eventPayload(failedEvent);
+      setMintError(String(payload.reason ?? payload.error ?? "Style profiling failed"));
+      setMintPhase("idle");
+    }
+  }, [mintIntent, mintPhase, workflowEvents]);
 
   function addKeyword(raw: string) {
     const trimmed = raw.trim().replace(/\s+/g, " ");
@@ -424,15 +483,26 @@ export default function UploadPage() {
     if (!files || files.length === 0) return;
     const accepted = Array.from(files).filter((f) => {
       const n = f.name.toLowerCase();
-      return n.endsWith(".txt") || n.endsWith(".md") || n.endsWith(".pdf");
+      return n.endsWith(".txt") || n.endsWith(".md") || n.endsWith(".markdown");
     });
     if (!accepted.length) return;
-    setUploadedFiles((prev) => [...prev, ...accepted.map((f) => f.name)]);
-    let combined = content;
-    for (const f of accepted) {
-      combined = combined + (await extractMockText(f));
+    for (const file of accepted) {
+      try {
+        const text = await extractFileText(file);
+        appendImportedText(file.name, text, {
+          kind: "file_upload",
+          label: file.name,
+          unitCount: 1,
+          metadata: {
+            fileName: file.name,
+            fileType: file.type || "text/plain",
+            size: file.size,
+          },
+        });
+      } catch (error) {
+        setMintError(error instanceof Error ? error.message : String(error));
+      }
     }
-    setContent(combined);
   }
 
   function triggerFilePicker() { fileInputRef.current?.click(); }
@@ -443,12 +513,35 @@ export default function UploadPage() {
     handleFilesSelected(e.dataTransfer.files);
   }
 
-  function appendImportedText(label: string, text: string) {
-    if (!text.trim()) return;
+  function appendImportedText(
+    label: string,
+    text: string,
+    source: {
+      kind: SourceKind;
+      label?: string;
+      unitCount?: number;
+      metadata?: Record<string, unknown>;
+    },
+  ) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
     setContent((prev) => {
       const divider = prev.trim().length > 0 ? "\n\n" : "";
-      return `${prev}${divider}[Import: ${label}]\n${text}`;
+      return `${prev}${divider}[Import: ${label}]\n${trimmed}`;
     });
+    setSourceMaterials((prev) => [
+      ...prev,
+      {
+        id: `${source.kind}:${Date.now()}:${prev.length}`,
+        kind: source.kind,
+        label: source.label ?? label,
+        text: trimmed,
+        characterCount: trimmed.length,
+        unitCount: source.unitCount ?? 1,
+        importedAt: new Date().toISOString(),
+        metadata: source.metadata ?? {},
+      },
+    ]);
     setUploadedFiles((prev) => [...prev, label]);
   }
 
@@ -521,7 +614,18 @@ export default function UploadPage() {
       setBlogPreview(importedBlog);
       setBlogImports((prev) => [...prev, importedBlog]);
       setBlogDrafts((prev) => prev.map((draft, idx) => idx === index ? importedBlog.url : draft));
-      appendImportedText(`Blog ${title}`, text);
+      appendImportedText(`Blog ${title}`, text, {
+        kind: "blog_article",
+        label: title,
+        unitCount: 1,
+        metadata: {
+          url: importedBlog.url,
+          title: importedBlog.title,
+          siteName: importedBlog.siteName,
+          source: importedBlog.source,
+          summary: importedBlog.summary,
+        },
+      });
       setBlogStatus("ready");
     } catch (err) {
       setBlogStatus("error");
@@ -574,7 +678,19 @@ export default function UploadPage() {
         verified: Boolean(data?.verified),
         metrics: data?.metrics || {},
       });
-      appendImportedText(`X @${resolved} (${tweets.length} posts)`, buildTweetsImportText(tweets, resolved));
+      appendImportedText(`X @${resolved} (${tweets.length} posts)`, buildTweetsImportText(tweets, resolved), {
+        kind: "twitter",
+        label: `@${resolved}`,
+        unitCount: tweets.length,
+        metadata: {
+          username: resolved,
+          displayName: data?.displayName || resolved,
+          verified: Boolean(data?.verified),
+          followers: data?.metrics?.followers_count,
+          tweetCount: data?.metrics?.tweet_count,
+          importedTweetIds: tweets.map((tweet) => tweet.id).filter(Boolean),
+        },
+      });
       if (!styleName.trim()) setStyleName(`@${resolved}`);
       setTwitterStatus("ready");
     } catch (err) {
@@ -622,7 +738,20 @@ export default function UploadPage() {
       if (!res.ok) throw new Error(data?.message || `README import failed (${res.status})`);
       const readme = typeof data?.text === "string" ? data.text : "";
       if (!readme.trim()) throw new Error("No readable README found.");
-      appendImportedText(`GitHub README ${selectedGitHubRepo.fullName}`, readme);
+      appendImportedText(`GitHub README ${selectedGitHubRepo.fullName}`, readme, {
+        kind: "github_readme",
+        label: selectedGitHubRepo.fullName,
+        unitCount: 1,
+        metadata: {
+          repo: selectedGitHubRepo.fullName,
+          repoUrl: selectedGitHubRepo.url,
+          readmeUrl: data?.url || selectedGitHubRepo.url,
+          path: data?.path || "README",
+          stars: selectedGitHubRepo.stars,
+          defaultBranch: selectedGitHubRepo.defaultBranch,
+          description: selectedGitHubRepo.description,
+        },
+      });
       setGithubReadmes((prev) => [
         ...prev,
         {
@@ -646,56 +775,161 @@ export default function UploadPage() {
 
   async function startMintPipeline() {
     if (!canMint || mintPhase !== "idle") return;
-    setMintPhase("processing"); setMintStepIndex(0); setTxHash(null); setMintedStyleId(null);
-    for (let i = 0; i < mintSteps.length; i++) {
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, 520 + i * 160));
-      setMintStepIndex(i + 1);
+    let activeRequestId: string | null = null;
+    setMintPhase("processing");
+    setTxHash(null);
+    setMintedStyleId(null);
+    setRequestId(null);
+    setPendingStyleId(null);
+    setMintIntent(null);
+    setMintError("");
+    setWorkflowEvents([]);
+    setSelectedEventId("");
+    setStreamStatus("closed");
+    closeEventStream();
+
+    try {
+      const samples = buildBackendSamples(sourceMaterials, content);
+      const provider = await getBrowserProvider();
+      const signer = await provider.getSigner();
+      const creator = await signer.getAddress();
+      const sampleHash = ethers.id(samples.join("\n\n--- sample break ---\n\n"));
+      const summary = sourceSummary(sourceMaterials);
+      const message = [
+        "I confirm these writing samples are mine and may be used to mint a Voices style iNFT.",
+        `Creator: ${creator}`,
+        `Style name: ${styleName.trim()}`,
+        `Source summary: ${summary}`,
+        `Sample hash: ${sampleHash}`,
+        `Timestamp: ${new Date().toISOString()}`,
+      ].join("\n");
+      const signature = await signer.signMessage(message);
+
+      const upload = await apiPost<{ requestId: string }>("/styles/upload", {
+        walletAddress: creator,
+        samples,
+        attestationMessage: message,
+        attestationSignature: signature,
+        styleName: styleName.trim(),
+        description: description.trim(),
+        keywords,
+        sourceKind: sourceKind(sourceMaterials),
+        sourceSummary: summary,
+        sourceMaterials: sourceMaterials.map(publicSourceMaterial),
+        language: "en",
+        genres: [...new Set(["creator-style", sourceKind(sourceMaterials), ...keywords])],
+        royaltyWei: ethers.parseEther(String(royalty)).toString(),
+        tokenMetadataURI: `voices://style/${encodeURIComponent(styleName.trim())}`,
+      });
+
+      activeRequestId = upload.requestId;
+      setRequestId(upload.requestId);
+      openEventStream(upload.requestId);
+      const intentEvent = await waitForAny(upload.requestId, ["style.mint.intent.created", "style.failed"], (events) => {
+        appendWorkflowEvents(events);
+      });
+      if (intentEvent.type === "style.failed") {
+        throw new Error(String(intentEvent.payload?.reason ?? intentEvent.payload?.error ?? "Style profiling failed"));
+      }
+      const intent = payloadIntent(intentEvent, "transactionIntent");
+      if (!intent || !intentEvent.styleId) {
+        throw new Error("The backend did not return a mint transaction intent.");
+      }
+      setPendingStyleId(intentEvent.styleId);
+      setMintIntent(intent);
+      setMintPhase("ready");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("Timed out waiting")) {
+        setMintError(
+          `${message}. Live 0G jobs can occasionally take longer; the log stream is still listening${activeRequestId ? ` for ${activeRequestId}` : ""}.`,
+        );
+        setMintPhase("processing");
+      } else {
+        setMintError(message);
+        setMintPhase("idle");
+      }
     }
-    setMintPhase("ready");
   }
 
   async function confirmMint() {
-    if (mintPhase !== "ready") return;
+    if (mintPhase !== "ready" || !mintIntent || !requestId) return;
     setMintPhase("confirming");
-    await new Promise((r) => setTimeout(r, 900));
-    const newTx = makeFakeTxHash();
-    const newStyleId = makeFakeStyleId();
-    const trimmed = content.trim();
-
-    const newStyle: StyleModel = {
-      id: newStyleId,
-      title: styleName.trim() || "Untitled style",
-      creatorName: "Creator",
-      creatorHandle: (walletAddress ?? "creator").replace(/^0x/i, "").slice(0, 10),
-      price: `$${royalty.toFixed(4)} / use`,
-      tags: ["uploaded"],
-      blurb: trimmed ? `Based on your samples: "${trimmed.slice(0, 90)}${trimmed.length > 90 ? "…" : ""}"` : "Based on your samples.",
-      about: description.trim() || "A reusable writing voice built from your uploaded samples. This is a UI prototype.",
-      bestFor: ["Posts", "Memos", "Landing page copy", "Thread replies"],
-      traits: [
-        { label: "Tone", value: content.includes("?") ? "Curious, conversational" : "Clear, polished" },
-        { label: "Cadence", value: content.length > 2000 ? "Structured, confident pacing" : "Tight, punchy flow" },
-        { label: "Signature", value: "Creator-first phrasing with consistent rhythm" },
-      ],
-      samples: [
-        { label: "Style sample", text: trimmed.slice(0, 220) || "—" },
-        { label: "Alt angle", text: trimmed.slice(220, 440) || trimmed.slice(0, 220) || "—" },
-      ],
-    };
-
-    upsertMintedStyle(newStyle);
-    setTxHash(newTx); setMintedStyleId(newStyleId); setMintPhase("success");
+    setMintError("");
+    openEventStream(requestId);
+    try {
+      const receipt = await sendIntent(mintIntent);
+      const tokenId = tokenIdFromMintReceipt(receipt, mintIntent.to);
+      await apiPost("/styles/confirm-mint", {
+        requestId,
+        walletAddress,
+        pendingStyleId,
+        tokenId,
+        txHash: receipt.hash,
+      });
+      setTxHash(receipt.hash);
+      setMintedStyleId(tokenId);
+      setMintPhase("success");
+      void refreshWorkflowEvents(requestId);
+    } catch (error) {
+      setMintError(error instanceof Error ? error.message : String(error));
+      setMintPhase("ready");
+    }
   }
 
   function resetAll() {
-    setMintPhase("idle"); setMintStepIndex(0); setTxHash(null); setMintedStyleId(null);
-    setUploadedFiles([]); setContent(""); setStyleName(""); setDescription(""); setRoyalty(0.0005);
+    setMintPhase("idle"); setTxHash(null); setMintedStyleId(null);
+    setRequestId(null); setPendingStyleId(null); setMintIntent(null); setMintError("");
+    setWorkflowEvents([]); setSelectedEventId(""); setStreamStatus("closed"); closeEventStream();
+    setUploadedFiles([]); setSourceMaterials([]); setContent(""); setStyleName(""); setDescription(""); setRoyalty(0.0005);
     setKeywords([]); setKeywordDraft(""); setIsDragging(false);
     setTwitterHandle(""); setTwitterStatus("idle"); setTwitterError(""); setTwitterTweets([]); setTwitterProfile(null);
     setGithubUsername(""); setGithubRepos([]); setGithubRepoFullName("");
     setGithubStatus("idle"); setGithubError(""); setGithubReadmes([]); setShowGithubImporter(true);
     setBlogDrafts([""]); setBlogStatus("idle"); setBlogError(""); setBlogPreview(null); setBlogImports([]); setBlogLoadingIndex(null);
+  }
+
+  function appendWorkflowEvents(events: AgentEvent[]) {
+    if (!events.length) return;
+    setWorkflowEvents((current) => mergeEvents(current, events));
+  }
+
+  async function refreshWorkflowEvents(id: string) {
+    try {
+      const data = await apiGet<{ events: AgentEvent[] }>(`/events/${id}`);
+      appendWorkflowEvents(Array.isArray(data.events) ? data.events : []);
+    } catch {
+      // The live log is an observability surface; minting should not fail because a refresh did.
+    }
+  }
+
+  function closeEventStream() {
+    streamRef.current?.close();
+    streamRef.current = null;
+  }
+
+  function openEventStream(id: string) {
+    if (streamRef.current) return;
+    setStreamStatus("connecting");
+    const source = new EventSource(`/api/backend/events/stream/${encodeURIComponent(id)}`);
+    source.onopen = () => setStreamStatus("open");
+    source.onmessage = (message) => {
+      try {
+        const event = JSON.parse(message.data) as AgentEvent;
+        appendWorkflowEvents([event]);
+        setStreamStatus("open");
+      } catch {
+        setStreamStatus("error");
+      }
+    };
+    source.onerror = () => {
+      setStreamStatus("error");
+      source.close();
+      if (streamRef.current === source) {
+        streamRef.current = null;
+      }
+    };
+    streamRef.current = source;
   }
 
   if (isInitializing || !walletAddress) {
@@ -781,10 +1015,10 @@ export default function UploadPage() {
                       </svg>
                       <div>
                         <p className="vcDropTitle">Drop files or click to upload</p>
-                        <p className="vcDropSub">TXT, MD, PDF supported</p>
+                        <p className="vcDropSub">TXT and Markdown supported. Full text is preserved encrypted.</p>
                       </div>
                     </div>
-                    <input ref={fileInputRef} type="file" multiple accept=".txt,.md,.pdf" style={{ display: "none" }} onChange={(e) => handleFilesSelected(e.target.files)} />
+                    <input ref={fileInputRef} type="file" multiple accept=".txt,.md,.markdown" style={{ display: "none" }} onChange={(e) => handleFilesSelected(e.target.files)} />
                     {uploadedFiles.length > 0 && (
                       <div className="vcChips" style={{ marginTop: 12 }} aria-label="Uploaded files">
                         {uploadedFiles.slice(-8).map((name, idx) => (
@@ -1182,6 +1416,7 @@ export default function UploadPage() {
                     Complete all checklist items to mint your voice
                   </div>
                 )}
+                {mintError && <div className="vcAlertError" role="alert">{mintError}</div>}
 
                 <div className="vcMintArea">
                   <button
@@ -1194,29 +1429,20 @@ export default function UploadPage() {
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <path d="M12 2L2 7l10 5 10-5-10-5Z" /><path d="M2 17l10 5 10-5" /><path d="M2 12l10 5 10-5" />
                     </svg>
-                    {mintPhase === "idle" ? "Mint Voice NFT" : mintPhase === "processing" ? "Processing…" : mintPhase === "success" ? "Style minted" : "Minting…"}
+                    {mintPhase === "idle" ? "Mint Voice NFT" : mintPhase === "processing" ? "Profiling…" : mintPhase === "success" ? "Style minted" : "Minting…"}
                   </button>
 
                   {mintPhase !== "idle" && (
                     <div className="vcMintFlow">
-                      {mintSteps.map((s, idx) => {
-                        const done = idx < mintStepIndex;
-                        const active = idx === mintStepIndex && mintPhase === "processing";
-                        return (
-                          <div key={s.key} className={`vcMintStep${done ? " vcMintStepDone" : ""}${active ? " vcMintStepActive" : ""}`}>
-                            <span className="vcMintBullet" aria-hidden="true">{done ? "✓" : active ? "◎" : "○"}</span>
-                            <span>{s.label}</span>
-                          </div>
-                        );
-                      })}
                       {mintPhase === "ready" && (
-                        <button type="button" className="vcMintBtn" onClick={confirmMint}>Confirm &amp; sign</button>
+                        <button type="button" className="vcMintBtn" onClick={confirmMint}>Sign on-chain mint</button>
                       )}
                       {mintPhase === "confirming" && <p className="vcMintStatus">Submitting transaction…</p>}
                       {mintPhase === "success" && txHash && mintedStyleId && (
                         <div className="vcMintSuccess" aria-live="polite">
                           <div className="vcMintSuccessTitle">Style minted</div>
                           <div className="vcMintHash">{txHash.slice(0, 20)}…</div>
+                          {requestId && <a className="vcMintHash" href={`/api/backend/proof/${encodeURIComponent(requestId)}`} target="_blank" rel="noreferrer">Open proof trail</a>}
                           <div className="vcMintSuccessActions">
                             <Button variant="secondary" href="/styles" ariaLabel="Browse styles">Browse styles</Button>
                             <Button variant="primary" onClick={resetAll} ariaLabel="Create another">Create another</Button>
@@ -1225,20 +1451,77 @@ export default function UploadPage() {
                       )}
                     </div>
                   )}
-
-                  <p className="vcMintNote">Minting creates a reusable style profile for this voice.</p>
                 </div>
               </section>
 
-              {/* Tips */}
-              <section className="vcCard vcTipsCard" aria-label="Pro tips">
-                <h3 className="vcTipsTitle">💡 Pro Tips</h3>
-                <ul className="vcTipsList">
-                  <li>Upload diverse writing samples for better voice quality</li>
-                  <li>Use descriptive keywords to help others discover your voice</li>
-                  <li>Import public writing when you want a faster first draft</li>
-                  <li>Set competitive royalties (3–10% recommended)</li>
-                </ul>
+              {/* Live backend logs */}
+              <section className="vcCard vcWorkflowLogCard" aria-label="Live backend workflow logs">
+                <div className="vcWorkflowLogHead">
+                  <div>
+                    <h3>Live Backend Logs</h3>
+                    <p>{requestId ? "Streaming real agent events from the backend." : "Logs appear here after minting starts."}</p>
+                  </div>
+                  <span data-state={streamStatus}>{streamStatus}</span>
+                </div>
+
+                {requestId ? (
+                  <div className="vcWorkflowRequest">
+                    <code>{requestId}</code>
+                    <a href={`/api/backend/proof/${encodeURIComponent(requestId)}`} target="_blank" rel="noreferrer">Proof</a>
+                  </div>
+                ) : null}
+
+                <div className="vcWorkflowTimeline" role="log" aria-live="polite" aria-label="Realtime mint workflow events">
+                  {visibleWorkflowEvents.length === 0 ? (
+                    <p className="vcWorkflowEmpty">
+                      Press Mint Voice NFT to watch attestation, encryption, 0G Compute profiling, AgentBrain upload, and mint intent creation.
+                    </p>
+                  ) : null}
+                  {visibleWorkflowEvents.map((event) => {
+                    const payload = eventPayload(event);
+                    const status = String(payload.status ?? (event.type.endsWith(".failed") ? "failed" : "completed"));
+                    return (
+                      <button
+                        type="button"
+                        key={event.id}
+                        className="vcWorkflowEvent"
+                        data-state={status}
+                        data-type={event.type === "agent.activity" ? "activity" : "event"}
+                        data-selected={selectedEventId === event.id}
+                        aria-pressed={selectedEventId === event.id}
+                        onClick={() => setSelectedEventId(event.id)}
+                      >
+                        <span className="vcWorkflowDot" aria-hidden="true" />
+                        <div className="vcWorkflowEventMain">
+                          <div className="vcWorkflowEventTop">
+                            <strong>{event.type === "agent.activity" ? String(payload.agentLabel ?? payload.agent ?? "Agent") : event.type}</strong>
+                            <time>{formatLogTime(event.timestamp)}</time>
+                          </div>
+                          <p>{eventExplanation(event)}</p>
+                          <small>{event.type === "agent.activity" ? String(payload.tool ?? "agent.activity") : event.actor}</small>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="vcWorkflowRaw">
+                  <div className="vcWorkflowRawHead">
+                    <strong>Raw selected log</strong>
+                    {selectedEvent ? <button type="button" onClick={() => setSelectedEventId("")}>Clear</button> : null}
+                  </div>
+                  {selectedEvent ? (
+                    <>
+                      <div className="vcWorkflowRawMeta">
+                        <span>{selectedEvent.type}</span>
+                        <code>{selectedEvent.id}</code>
+                      </div>
+                      <pre>{JSON.stringify(selectedEvent, null, 2)}</pre>
+                    </>
+                  ) : (
+                    <p>Click a log row to inspect the exact backend event payload.</p>
+                  )}
+                </div>
               </section>
 
             </aside>
@@ -1248,4 +1531,200 @@ export default function UploadPage() {
       <Footer />
     </div>
   );
+}
+
+function buildBackendSamples(sourceMaterials: SourceMaterial[], fallbackContent: string): string[] {
+  const materials = sourceMaterials.length
+    ? sourceMaterials
+    : fallbackContent.trim()
+      ? [{
+          id: "manual:0",
+          kind: "file_upload" as const,
+          label: "Manual writing sample",
+          text: fallbackContent.trim(),
+          characterCount: fallbackContent.trim().length,
+          unitCount: 1,
+          importedAt: new Date().toISOString(),
+          metadata: {},
+        }]
+      : [];
+  return materials.map((material, index) => {
+    const metadata = Object.entries(material.metadata)
+      .filter(([, value]) => value !== undefined && value !== "")
+      .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(", ") : String(value)}`)
+      .join("\n");
+    return [
+      `<source kind="${material.kind}" index="${index + 1}" label="${escapeSourceLabel(material.label)}">`,
+      `Label: ${material.label}`,
+      `Imported at: ${material.importedAt}`,
+      `Units represented: ${material.unitCount}`,
+      `Character count: ${material.characterCount}`,
+      metadata ? `Metadata:\n${metadata}` : "",
+      "Full source text:",
+      material.text,
+      "</source>",
+    ].filter(Boolean).join("\n");
+  });
+}
+
+function publicSourceMaterial(material: SourceMaterial): Record<string, unknown> {
+  return {
+    id: material.id,
+    kind: material.kind,
+    label: material.label,
+    characterCount: material.characterCount,
+    unitCount: material.unitCount,
+    importedAt: material.importedAt,
+    metadata: material.metadata,
+  };
+}
+
+function sourceKind(materials: SourceMaterial[]): SourceKind | "mixed" | "unknown" {
+  const kinds = [...new Set(materials.map((material) => material.kind))];
+  if (kinds.length === 0) return "unknown";
+  return kinds.length === 1 ? kinds[0] : "mixed";
+}
+
+function sourceSummary(materials: SourceMaterial[]): string {
+  if (materials.length === 0) return "manual writing sample";
+  const counts = materials.reduce<Record<string, number>>((acc, material) => {
+    acc[material.kind] = (acc[material.kind] ?? 0) + material.unitCount;
+    return acc;
+  }, {});
+  return Object.entries(counts)
+    .map(([kind, count]) => `${count} ${sourceKindLabel(kind, count)}`)
+    .join(", ");
+}
+
+function sourceKindLabel(kind: string, count: number): string {
+  const plural = count === 1 ? "" : "s";
+  if (kind === "twitter") return `tweet${plural}`;
+  if (kind === "github_readme") return `GitHub README${plural}`;
+  if (kind === "blog_article") return `blog/article${plural}`;
+  if (kind === "file_upload") return `uploaded file${plural}`;
+  return `source${plural}`;
+}
+
+function escapeSourceLabel(value: string): string {
+  return value.replace(/"/g, "&quot;");
+}
+
+async function getBrowserProvider(): Promise<BrowserProvider> {
+  if (!window.ethereum) throw new Error("A browser wallet is required to sign and mint on 0G.");
+  return new BrowserProvider(window.ethereum as ethers.Eip1193Provider);
+}
+
+async function sendIntent(intent: TransactionIntent) {
+  const provider = await getBrowserProvider();
+  const signer = await provider.getSigner();
+  const tx: TransactionRequest = {
+    to: intent.to,
+    data: intent.data,
+    value: BigInt(intent.value || "0"),
+  };
+  const response = await signer.sendTransaction(tx);
+  const receipt = await response.wait();
+  if (!receipt) throw new Error(`Transaction ${response.hash} was not confirmed`);
+  return receipt;
+}
+
+async function apiPost<T = Record<string, unknown>>(path: string, body: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`/api/backend${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseResponse<T>(response);
+}
+
+async function apiGet<T = Record<string, unknown>>(path: string): Promise<T> {
+  const response = await fetch(`/api/backend${path}`, { cache: "no-store" });
+  return parseResponse<T>(response);
+}
+
+async function parseResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok) {
+    throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+  }
+  return data as T;
+}
+
+async function waitForAny(
+  requestId: string,
+  types: string[],
+  onEvents?: (events: AgentEvent[]) => void,
+): Promise<AgentEvent> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < STYLE_UPLOAD_TIMEOUT_MS) {
+    const data = await apiGet<{ events: AgentEvent[] }>(`/events/${requestId}`);
+    const events = Array.isArray(data.events) ? data.events : [];
+    onEvents?.(events);
+    const found = events.find((event) => types.includes(event.type));
+    if (found) return found;
+    await sleep(POLL_INTERVAL_MS);
+  }
+  throw new Error(`Timed out waiting for ${types.join(" or ")}`);
+}
+
+function mergeEvents(current: AgentEvent[], incoming: AgentEvent[]): AgentEvent[] {
+  const byId = new Map(current.map((event) => [event.id, event]));
+  for (const event of incoming) {
+    byId.set(event.id, event);
+  }
+  return [...byId.values()].sort((left, right) => left.timestamp - right.timestamp);
+}
+
+function eventPayload(event: AgentEvent | undefined): Record<string, unknown> {
+  const payload = event?.payload;
+  return payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+}
+
+function eventExplanation(event: AgentEvent): string {
+  const payload = eventPayload(event);
+  if (event.type === "agent.activity") {
+    const label = String(payload.agentLabel ?? payload.agent ?? "Agent");
+    const status = String(payload.status ?? "updated");
+    const message = String(payload.message ?? payload.tool ?? "activity");
+    return `${label} ${status}: ${message}`;
+  }
+  if (event.type === "style.uploaded") return "Backend received the creator samples and wallet attestation.";
+  if (event.type === "style.mint.intent.created") {
+    const root = typeof payload.agentBrainRootHash === "string" ? payload.agentBrainRootHash.slice(0, 18) : "AgentBrain";
+    const key = typeof payload.keyHash === "string" ? payload.keyHash.slice(0, 18) : "key";
+    return `Mint intent ready with ${root}… and ${key}….`;
+  }
+  if (event.type === "style.minted") return `On-chain mint confirmed${event.styleId ? ` for token ${event.styleId}` : ""}.`;
+  if (event.type.endsWith(".failed")) return String(payload.reason ?? payload.error ?? "Backend reported a failure.");
+  return event.styleId ?? event.actor;
+}
+
+function formatLogTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function payloadIntent(event: AgentEvent | undefined, key: string): TransactionIntent | null {
+  const value = event?.payload?.[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const intent = value as Partial<TransactionIntent>;
+  return intent.to && intent.data && typeof intent.value === "string" ? (intent as TransactionIntent) : null;
+}
+
+function tokenIdFromMintReceipt(receipt: ethers.TransactionReceipt | null, styleRegistryAddress: string): string {
+  if (!receipt) throw new Error("Mint transaction did not return a receipt");
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== styleRegistryAddress.toLowerCase()) continue;
+    try {
+      const parsed = STYLE_REGISTRY_IFACE.parseLog(log);
+      if (parsed?.name === "StyleMinted") return parsed.args.tokenId.toString();
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("Could not find StyleMinted event in mint receipt");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

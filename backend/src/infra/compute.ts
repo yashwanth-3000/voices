@@ -149,6 +149,10 @@ export class ZeroGComputeClient implements AgentCompute {
 function buildStyleProfile(prompt: string): Record<string, unknown> {
   const samples = extractTaggedBlocks(prompt, "sample");
   const sampleText = samples.join("\n\n") || prompt;
+  const metadata = parsePromptMetadata(prompt);
+  const sourceContext = recordValue(metadata.sourceContext);
+  const sourceKind = stringValue(metadata.sourceKind) || stringValue(sourceContext.sourceKind) || "unknown";
+  const sourceMaterials = Array.isArray(metadata.sourceMaterials) ? metadata.sourceMaterials : [];
   const words = distinctiveWords(sampleText, 12);
   const sentences = splitSentences(sampleText);
   const avgSentenceLength = average(sentences.map((sentence) => wordsIn(sentence).length));
@@ -192,6 +196,50 @@ function buildStyleProfile(prompt: string): Record<string, unknown> {
       embedding_hint: words.slice(0, 10)
     },
     voice_essence: `A ${inferToneLabels(sampleText)[0] ?? "direct"} voice that frames ${words[0] ?? "the topic"} through concrete explanation.`,
+    source_profile: {
+      primary_source_type: sourceKind,
+      source_inventory: sourceMaterials,
+      analysis_focus: mockAnalysisFocus(sourceKind),
+      twitter_profile: sourceKind === "twitter" || sourceKind === "mixed"
+        ? {
+            tweet_shapes: ["Mock mode: derived from imported post boundaries and sentence cadence."],
+            hook_patterns: excerpts.slice(0, 2),
+            line_breaking: sampleText.includes("\n\n") ? "uses separated post blocks" : "compact single-block posts",
+            emoji_usage: /[\u{1F300}-\u{1FAFF}]/u.test(sampleText) ? "emoji present in source text" : "no emoji pattern detected",
+            hashtag_usage: /#[\p{L}\p{N}_]+/u.test(sampleText) ? "hashtags present in source text" : "no hashtag pattern detected",
+            cta_patterns: /follow|subscribe|join|read|try|check/i.test(sampleText) ? ["direct CTA appears in source"] : ["no strong CTA detected"]
+          }
+        : undefined,
+      readme_profile: sourceKind === "github_readme" || sourceKind === "mixed"
+        ? {
+            heading_hierarchy: "Mock mode: inferred from markdown headings and section order.",
+            setup_flow: /install|usage|quickstart|setup/i.test(sampleText) ? "includes setup or usage language" : "setup flow not strongly visible",
+            code_block_usage: sampleText.includes("```") ? "uses fenced code blocks" : "no fenced code blocks detected",
+            feature_framing: "features are framed through recurring project nouns and direct explanations"
+          }
+        : undefined,
+      article_profile: sourceKind === "blog_article" || sourceKind === "mixed"
+        ? {
+            headline_and_opening: excerpts[0] ?? "Mock mode opening unavailable",
+            thesis_shape: sampleText.includes("because") ? "explains causality explicitly" : "states observations directly",
+            sectioning: sampleText.includes("#") ? "uses markdown headings" : "paragraph-led structure",
+            conclusion_or_cta: excerpts.at(-1) ?? "Mock mode closing unavailable"
+          }
+        : undefined,
+      file_profile: sourceKind === "file_upload" || sourceKind === "unknown"
+        ? {
+            document_structure: "Mock mode: inferred from uploaded text blocks.",
+            formatting_habits: sampleText.includes("- ") ? "uses lists" : "mostly prose paragraphs",
+            reuse_guidance: "preserve cadence and rhetorical shape without copying source sentences"
+          }
+        : undefined,
+      generation_guidelines_by_format: {
+        tweet: ["Open with the strongest concrete point.", "Keep one clear idea per post."],
+        thread: ["Use one move per post and keep transitions explicit."],
+        readme: ["Mirror heading hierarchy and setup flow before examples."],
+        article: ["Start with a clear thesis, then develop with concrete examples."]
+      }
+    },
     safety_notes: ["Mock profile generated from the submitted sample, not a fixed response."],
     confidence: 0.7
   };
@@ -312,6 +360,35 @@ function numberValue(value: unknown): number | undefined {
 
 function extractTaggedBlocks(input: string, tag: string): string[] {
   return [...input.matchAll(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "g"))].map((match) => match[1].trim());
+}
+
+function parsePromptMetadata(prompt: string): Record<string, unknown> {
+  const line = prompt.match(/Metadata:\s*(\{[^\n]+})/);
+  if (!line?.[1]) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(line[1]) as unknown;
+    return recordValue(parsed);
+  } catch {
+    return {};
+  }
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function mockAnalysisFocus(sourceKind: string): string {
+  if (sourceKind === "twitter") return "tweet structure, hooks, emoji/hashtag/CTA habits, and short-form rhythm";
+  if (sourceKind === "github_readme") return "README hierarchy, setup flow, examples, code blocks, and maintainer docs tone";
+  if (sourceKind === "blog_article") return "long-form thesis, sectioning, evidence style, transitions, and conclusion habits";
+  if (sourceKind === "mixed") return "cross-source voice fingerprint plus per-source generation rules";
+  return "general writing structure, cadence, vocabulary, and reusable generation rules";
 }
 
 function afterLabel(input: string, label: string): string {

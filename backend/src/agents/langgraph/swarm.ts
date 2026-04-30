@@ -17,7 +17,14 @@ import {
   uploadAgentBrain,
   wrapKeyForOwner
 } from "../../inft/agent-brain.js";
-import { contentGenerationPrompt, platformTuningPrompt, styleExtractionPrompt, styleRefinementPrompt } from "../prompts.js";
+import {
+  contentGenerationPrompt,
+  detailedStyleGuidePrompt,
+  jsonRepairPrompt,
+  platformTuningPrompt,
+  styleExtractionPrompt,
+  styleRefinementPrompt
+} from "../prompts.js";
 import { MintStyleInput, AgentChain, AgentCompute, AgentStorage, ChatResult as AgentChatResult, KeeperHubClient } from "../../infra/types.js";
 import {
   VoicesAgentName,
@@ -47,9 +54,19 @@ type AgentMeta = {
 
 type AgentActivityStatus = "started" | "completed" | "failed" | "handoff";
 
+type StyleExtractionMetadata = Record<string, unknown> & {
+  sourceContext: Record<string, unknown>;
+  sourceMaterials: Array<Record<string, unknown>>;
+  sourceKind: string;
+  sourceSummary?: string;
+  styleName?: string;
+  description?: string;
+  keywords: string[];
+};
+
 const MIN_SAMPLE_BYTES = 1024;
 const MAX_SAMPLE_BYTES = 1024 * 1024;
-const DEFAULT_STYLE_SAMPLE_CHAR_BUDGET = 12_000;
+const DEFAULT_STYLE_SAMPLE_CHAR_BUDGET = 60_000;
 const DENYLIST = ["paul graham", "j.k. rowling", "jk rowling", "stephen king"];
 
 export class VoicesLangGraphSwarm {
@@ -248,34 +265,53 @@ export class VoicesLangGraphSwarm {
           if (!state.samplesRootHash) {
             throw new Error("Samples must be encrypted and stored before profile extraction");
           }
-          const samples = state.selectedSamples.length > 0 ? state.selectedSamples : budgetSamplesForExtraction(stringArray(event.payload.samples));
-          const compute = await this.extractProfile(samples, {
-            wallet: event.actor,
-            language: stringValue(event.payload.language, "en"),
-            genres: stringArray(event.payload.genres),
-            sourceSampleCount: stringArray(event.payload.samples).length,
-            promptSampleCount: samples.length,
-            sampleBudget: "low-cost-demo"
-          });
-          const profile = parseTaggedJson(compute.content, "style_profile");
+          const allSamples = stringArray(event.payload.samples);
+          const samples = state.selectedSamples.length > 0 ? state.selectedSamples : budgetSamplesForExtraction(allSamples);
+          const extractionMetadata = buildStyleExtractionMetadata(event.payload, event.actor, allSamples, samples);
+          const { compute, profile: baseProfile } = await this.extractProfile(samples, extractionMetadata);
+          const guideResult = hasDetailedStyleGuide(baseProfile)
+            ? undefined
+            : await this.generateDetailedStyleGuide(samples, baseProfile, extractionMetadata);
+          const profile = guideResult
+            ? { ...baseProfile, detailed_style_guide: guideResult.guide, styleGuideCompute: computeEvidence(guideResult.compute, "detailed_style_guide") }
+            : baseProfile;
           const styleId = state.currentStyleId ?? state.pendingStyleId ?? `pending:${event.id}`;
           const profileKey = `style:${styleId}:profile`;
           const enrichedProfile = {
             ...profile,
-            sampleExcerpts: normalizeSampleExcerpts(profile, stringArray(event.payload.samples)),
+            sampleExcerpts: normalizeSampleExcerpts(profile, allSamples),
+            sourceContext: extractionMetadata.sourceContext,
+            sourceMaterials: extractionMetadata.sourceMaterials,
+            sourceKind: extractionMetadata.sourceKind,
+            sourceSummary: extractionMetadata.sourceSummary,
+            styleName: extractionMetadata.styleName,
+            description: extractionMetadata.description,
+            keywords: extractionMetadata.keywords,
+            fullSampleCount: allSamples.length,
+            fullSampleBytes: Buffer.byteLength(allSamples.join("\n"), "utf8"),
+            extractionSampleCount: samples.length,
+            extractionSampleBytes: Buffer.byteLength(samples.join("\n"), "utf8"),
             samplesRootHash: state.samplesRootHash,
             teeVerified: compute.teeVerified ?? compute.verified,
             computeProvider: compute.providerAddress,
             computeModel: compute.model,
             computeChatId: compute.chatId,
+            styleGuideCompute: guideResult
+              ? computeEvidence(guideResult.compute, "detailed_style_guide")
+              : baseProfile.styleGuideCompute,
             langGraphThread: `voices:${requestId}`,
             updatedAt: Date.now()
           };
           await this.deps.storage.kvSet(profileKey, enrichedProfile);
           await this.publishToolActivity(state, "style_curator", "extract_style_profile", "completed", "Profile JSON was extracted and stored in 0G KV.", {
             profileKey,
+            sourceKind: extractionMetadata.sourceKind,
+            sourceCount: extractionMetadata.sourceMaterials.length,
+            fullSampleBytes: Buffer.byteLength(allSamples.join("\n"), "utf8"),
             teeVerified: compute.teeVerified ?? compute.verified,
-            compute: computeEvidence(compute, "style_profile_extraction")
+            compute: computeEvidence(compute, "style_profile_extraction"),
+            styleGuideCompute: guideResult ? computeEvidence(guideResult.compute, "detailed_style_guide") : undefined,
+            hasDetailedStyleGuide: hasDetailedStyleGuide(enrichedProfile)
           });
           return new Command({
             update: {
@@ -1336,18 +1372,63 @@ export class VoicesLangGraphSwarm {
     };
   }
 
-  private async extractProfile(samples: string[], metadata: Record<string, unknown>) {
-    try {
-      return await this.deps.compute.chat(styleExtractionPrompt(samples, metadata), { maxRetries: 1, maxTokens: 900 });
-    } catch (error) {
-      const smallerWindow = samples.slice(0, Math.max(1, Math.min(samples.length, 3)));
-      if (smallerWindow.length === samples.length) {
-        throw error;
+  private async extractProfile(
+    samples: string[],
+    metadata: Record<string, unknown>
+  ): Promise<{ compute: AgentChatResult; profile: Record<string, unknown> }> {
+    const attempts = [
+      { samples, metadata, maxTokens: 2200 },
+      {
+        samples: compactSamplesForParseRetry(samples),
+        metadata: { ...metadata, retry: "json_parse_safe_compact_profile" },
+        maxTokens: 1800
       }
-      return this.deps.compute.chat(styleExtractionPrompt(smallerWindow, { ...metadata, retry: "short_sample_window" }), {
-        maxRetries: 1,
-        maxTokens: 700
-      });
+    ];
+    let lastError: unknown;
+
+    for (const attempt of attempts) {
+      try {
+        const compute = await this.deps.compute.chat(styleExtractionPrompt(attempt.samples, attempt.metadata), {
+          maxRetries: 1,
+          maxTokens: attempt.maxTokens
+        });
+        return {
+          compute,
+          profile: await this.parseTaggedJsonWithRepair(compute.content, "style_profile")
+        };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private async generateDetailedStyleGuide(
+    samples: string[],
+    profile: Record<string, unknown>,
+    metadata: Record<string, unknown>
+  ): Promise<{ guide: Record<string, unknown>; compute: AgentChatResult }> {
+    const compute = await this.deps.compute.chat(
+      detailedStyleGuidePrompt({ samples, profile, metadata }),
+      { maxRetries: 1, maxTokens: 4200 }
+    );
+    return {
+      guide: await this.parseTaggedJsonWithRepair(compute.content, "style_guide"),
+      compute
+    };
+  }
+
+  private async parseTaggedJsonWithRepair(content: string, tag: string): Promise<Record<string, unknown>> {
+    try {
+      return parseTaggedJson(content, tag);
+    } catch (error) {
+      const parseError = error instanceof Error ? error.message : String(error);
+      const repair = await this.deps.compute.chat(
+        jsonRepairPrompt({ tag, content: content.slice(0, 60_000), parseError }),
+        { maxRetries: 1, maxTokens: tag === "style_guide" ? 4200 : 2800 }
+      );
+      return parseTaggedJson(repair.content, tag);
     }
   }
 
@@ -1811,7 +1892,8 @@ function validateSamples(samples: string[]): void {
 function parseTaggedJson(content: string, tag: string): Record<string, unknown> {
   const cleaned = stripCodeFence(content);
   const tagged = matchTaggedContent(cleaned, tag);
-  const candidate = extractFirstJsonObject(stripCodeFence(tagged ?? cleaned));
+  const source = stripCodeFence(tagged ?? stripLooseTag(cleaned, tag));
+  const candidate = normalizeJsonObjectSource(source);
 
   try {
     const parsed = JSON.parse(candidate) as unknown;
@@ -1824,6 +1906,26 @@ function parseTaggedJson(content: string, tag: string): Record<string, unknown> 
     const reason = error instanceof Error ? error.message : "unknown parse error";
     throw new Error(`Could not parse ${tag} JSON from 0G Compute response: ${reason}. Response starts: ${snippet}`);
   }
+}
+
+function normalizeJsonObjectSource(source: string): string {
+  const trimmed = source.trim();
+  if (trimmed.startsWith("{")) {
+    return extractFirstJsonObject(trimmed);
+  }
+  const lastBrace = trimmed.lastIndexOf("}");
+  const body = lastBrace >= 0 ? trimmed.slice(0, lastBrace + 1) : trimmed;
+  if (body.trim().endsWith("}")) {
+    return `{${body.trim()}`;
+  }
+  return `{${body.trim().replace(/,\s*$/, "")}}`;
+}
+
+function stripLooseTag(content: string, tag: string): string {
+  return content
+    .replace(new RegExp(`<${tag}[^>]*>`, "gi"), "")
+    .replace(new RegExp(`<\\/${tag}>`, "gi"), "")
+    .trim();
 }
 
 function parseVariants(content: string, draft: string, platforms: string[]): Record<string, string> {
@@ -2012,30 +2114,138 @@ function extractFirstJsonObject(content: string): string {
 function normalizeSampleExcerpts(profile: Record<string, unknown>, samples: string[]): string[] {
   const fromProfile = stringArray(profile.sample_excerpts).concat(stringArray(profile.sampleExcerpts));
   if (fromProfile.length > 0) {
-    return fromProfile.slice(0, 5);
+    return fromProfile.map(cleanSampleExcerpt).filter(Boolean).slice(0, 5);
   }
   return samples
-    .map((sample) => sample.replace(/\s+/g, " ").trim())
+    .map((sample) => cleanSampleExcerpt(sample))
     .filter(Boolean)
     .slice(0, 5)
     .map((sample) => sample.slice(0, 240));
+}
+
+function hasDetailedStyleGuide(profile: Record<string, unknown>): boolean {
+  const guide = recordValue(profile.detailed_style_guide);
+  return Boolean(stringValue(guide.prompt_ready_style_brief, undefined)) && Array.isArray(guide.actual_examples) && guide.actual_examples.length > 0;
+}
+
+function cleanSampleExcerpt(value: string): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!text.startsWith("<source")) {
+    return text;
+  }
+  const fullTextIndex = text.toLowerCase().indexOf("full source text:");
+  if (fullTextIndex !== -1) {
+    return text.slice(fullTextIndex + "full source text:".length).replace(/<\/source>\s*$/i, "").trim();
+  }
+  return "";
+}
+
+function buildStyleExtractionMetadata(
+  payload: Record<string, unknown>,
+  wallet: string,
+  allSamples: string[],
+  promptSamples: string[]
+): StyleExtractionMetadata {
+  const sourceMaterials = sourceMaterialsFromPayload(payload);
+  const sourceKind = stringValue(payload.sourceKind, undefined) ?? inferSourceKind(sourceMaterials);
+  const fullSampleBytes = Buffer.byteLength(allSamples.join("\n"), "utf8");
+  const promptSampleBytes = Buffer.byteLength(promptSamples.join("\n"), "utf8");
+  const keywords = stringArray(payload.keywords).slice(0, 8);
+  const sourceContext = {
+    sourceKind,
+    sourceSummary: stringValue(payload.sourceSummary, undefined),
+    sourceMaterials,
+    sourceTypeCounts: countSourceTypes(sourceMaterials),
+    fullSampleCount: allSamples.length,
+    fullSampleBytes,
+    promptSampleCount: promptSamples.length,
+    promptSampleBytes,
+    fullMaterialPreservedInEncryptedStorage: true,
+    extractionWindow:
+      promptSampleBytes >= fullSampleBytes
+        ? "all submitted text was passed to 0G Compute"
+        : "full submitted text was encrypted and stored; a source-balanced analysis window was passed to 0G Compute"
+  };
+
+  return {
+    wallet,
+    language: stringValue(payload.language, "en"),
+    genres: stringArray(payload.genres),
+    styleName: stringValue(payload.styleName, undefined),
+    description: stringValue(payload.description, undefined),
+    keywords,
+    sourceKind,
+    sourceSummary: stringValue(payload.sourceSummary, undefined),
+    sourceMaterials,
+    sourceContext,
+    sourceSampleCount: allSamples.length,
+    promptSampleCount: promptSamples.length,
+    sampleBudget: "source-aware-profile"
+  };
+}
+
+function sourceMaterialsFromPayload(payload: Record<string, unknown>): Array<Record<string, unknown>> {
+  const value = payload.sourceMaterials;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      id: stringValue(item.id, undefined),
+      kind: stringValue(item.kind, "unknown"),
+      label: stringValue(item.label, "Untitled source"),
+      characterCount: typeof item.characterCount === "number" ? item.characterCount : undefined,
+      unitCount: typeof item.unitCount === "number" ? item.unitCount : undefined,
+      importedAt: stringValue(item.importedAt, undefined),
+      metadata: recordValue(item.metadata)
+    }));
+}
+
+function inferSourceKind(sourceMaterials: Array<Record<string, unknown>>): string {
+  const kinds = [...new Set(sourceMaterials.map((source) => stringValue(source.kind, "unknown")))].filter((kind) => kind !== "unknown");
+  if (kinds.length === 0) return "unknown";
+  return kinds.length === 1 ? kinds[0] : "mixed";
+}
+
+function countSourceTypes(sourceMaterials: Array<Record<string, unknown>>): Record<string, number> {
+  return sourceMaterials.reduce<Record<string, number>>((counts, source) => {
+    const kind = stringValue(source.kind, "unknown");
+    counts[kind] = (counts[kind] ?? 0) + 1;
+    return counts;
+  }, {});
 }
 
 function budgetSamplesForExtraction(samples: string[]): string[] {
   const budget = Number(process.env.OG_AGENT_STYLE_SAMPLE_CHAR_BUDGET ?? DEFAULT_STYLE_SAMPLE_CHAR_BUDGET);
   const safeBudget = Number.isFinite(budget) && budget > 1_000 ? budget : DEFAULT_STYLE_SAMPLE_CHAR_BUDGET;
   const normalized = samples.map((sample) => sample.replace(/\s+/g, " ").trim()).filter(Boolean);
-  const chunkBudget = Math.max(800, Math.floor(safeBudget / Math.min(normalized.length || 1, 8)));
+  if (normalized.join("").length <= safeBudget) {
+    return normalized;
+  }
+  const sampleWindow = normalized.slice(0, 12);
+  const chunkBudget = Math.max(1_200, Math.floor(safeBudget / Math.min(sampleWindow.length || 1, 12)));
   const chunks: string[] = [];
 
-  for (const sample of normalized) {
-    if (chunks.join("").length >= safeBudget || chunks.length >= 8) {
+  for (const sample of sampleWindow) {
+    if (chunks.join("").length >= safeBudget || chunks.length >= 12) {
       break;
     }
     chunks.push(sample.slice(0, chunkBudget));
   }
 
   return chunks.length > 0 ? chunks : samples.slice(0, 1);
+}
+
+function compactSamplesForParseRetry(samples: string[]): string[] {
+  const budget = 18_000;
+  const normalized = samples.map((sample) => sample.replace(/\s+/g, " ").trim()).filter(Boolean);
+  if (normalized.join("").length <= budget) {
+    return normalized;
+  }
+  const sampleWindow = normalized.slice(0, 8);
+  const chunkBudget = Math.max(1_200, Math.floor(budget / Math.min(sampleWindow.length || 1, 8)));
+  return sampleWindow.map((sample) => sample.slice(0, chunkBudget)).filter(Boolean);
 }
 
 function isMeaningfulFeedback(feedback: string, payload: Record<string, unknown>): boolean {

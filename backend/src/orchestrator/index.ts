@@ -20,6 +20,7 @@ export class Orchestrator {
   readonly events: EventLog;
   readonly swarm: VoicesLangGraphSwarm;
   readonly storage: AgentStorage;
+  readonly compute: AgentCompute;
   readonly chain: AgentChain;
   private started = false;
 
@@ -29,6 +30,7 @@ export class Orchestrator {
     const chain = deps.chain ?? createChainClient();
     const keeperhub = deps.keeperhub ?? createKeeperHubClient();
     this.storage = storage;
+    this.compute = compute;
     this.chain = chain;
     this.events = deps.eventLog ?? new EventLog({ storage });
     this.swarm =

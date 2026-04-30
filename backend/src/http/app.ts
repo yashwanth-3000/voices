@@ -1,7 +1,9 @@
 import { Buffer } from "node:buffer";
 import Fastify, { FastifyInstance, FastifyReply } from "fastify";
+import { detailedStyleGuidePrompt } from "../agents/prompts.js";
 import { AgentEvent, createUlid } from "../events/types.js";
 import { Orchestrator, createOrchestrator } from "../orchestrator/index.js";
+import { ChatResult } from "../infra/types.js";
 
 type StyleOutputPreview = {
   requestId?: string;
@@ -106,6 +108,16 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     return styleDetails(orchestrator, params.tokenId);
   });
 
+  app.post("/styles/:tokenId/regenerate-guide", async (request, reply) => {
+    const params = request.params as { tokenId: string };
+    try {
+      return await regenerateDetailedStyleGuide(orchestrator, params.tokenId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return reply.code(400).send({ ok: false, error: "style_guide_generation_failed", message });
+    }
+  });
+
   app.post("/styles/upload", async (request, reply) => {
     const body = asRecord(request.body);
     const requestId = createUlid();
@@ -118,6 +130,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         samples: requireStringArray(body.samples, "samples"),
         attestationMessage: body.attestationMessage,
         attestationSignature: body.attestationSignature,
+        styleName: optionalString(body.styleName),
+        description: optionalString(body.description),
+        keywords: stringArrayOrEmpty(body.keywords).slice(0, 8),
+        sourceKind: optionalString(body.sourceKind) ?? "unknown",
+        sourceSummary: optionalString(body.sourceSummary),
+        sourceMaterials: sanitizeSourceMaterials(body.sourceMaterials),
         language: body.language ?? "en",
         genres: Array.isArray(body.genres) ? body.genres : [],
         royaltyWei: body.royaltyWei ?? "1000000000000000",
@@ -378,11 +396,12 @@ async function styleDetails(orchestrator: Orchestrator, tokenId: string) {
   const style = await orchestrator.chain.styleOf(tokenId);
   const profileKey = `style:${tokenId}:profile`;
   const agentBrainKey = `style:${tokenId}:agentBrain`;
-  const [profile, agentBrain, recentOutputs] = await Promise.all([
+  const [storedProfile, agentBrain, recentOutputs] = await Promise.all([
     orchestrator.storage.kvGet<Record<string, unknown>>(profileKey),
     orchestrator.storage.kvGet<Record<string, unknown>>(agentBrainKey),
     recentOutputsForStyle(orchestrator, tokenId, style.creator)
   ]);
+  const profile = enrichProfileForResponse(storedProfile);
   const manifestRootHash =
     stringField(agentBrain, "manifest_root_hash") ??
     (style.encryptedSamplesURI.startsWith("0g://agent-brain/")
@@ -432,6 +451,82 @@ async function styleDetails(orchestrator: Orchestrator, tokenId: string) {
   };
 }
 
+async function regenerateDetailedStyleGuide(orchestrator: Orchestrator, tokenId: string) {
+  const style = await orchestrator.chain.styleOf(tokenId);
+  const profileKey = `style:${tokenId}:profile`;
+  const storedProfile = await orchestrator.storage.kvGet<Record<string, unknown>>(profileKey);
+  if (!storedProfile) {
+    throw new Error(`No stored profile found for token ${tokenId}`);
+  }
+  const uploadedSamples = uploadedSamplesForProfile(orchestrator, storedProfile);
+  if (!uploadedSamples.length) {
+    throw new Error("Original uploaded samples were not found in the request event log");
+  }
+
+  const metadata = styleGuideMetadata(tokenId, style, storedProfile, uploadedSamples);
+  const compute = await orchestrator.compute.chat(
+    detailedStyleGuidePrompt({
+      profile: storedProfile,
+      samples: uploadedSamples,
+      metadata
+    }),
+    { maxRetries: 1, maxTokens: 4200 }
+  );
+  const guide = parseTaggedJson(compute.content, "style_guide");
+  if (!hasDetailedStyleGuide(guide)) {
+    throw new Error("0G Compute returned a style guide without a prompt-ready brief and examples");
+  }
+
+  const styleGuideCompute = computeEvidence(compute, "detailed_style_guide");
+  const updatedProfile = {
+    ...storedProfile,
+    detailed_style_guide: guide,
+    styleGuideCompute,
+    updatedAt: Date.now()
+  };
+  await orchestrator.storage.kvSet(profileKey, updatedProfile);
+
+  const agentBrainKey = `style:${tokenId}:agentBrain`;
+  const agentBrain = await orchestrator.storage.kvGet<Record<string, unknown>>(agentBrainKey);
+  if (agentBrain) {
+    await orchestrator.storage.kvSet(agentBrainKey, {
+      ...agentBrain,
+      updated_at: Date.now(),
+      profile: {
+        ...(agentBrain.profile && typeof agentBrain.profile === "object" && !Array.isArray(agentBrain.profile)
+          ? agentBrain.profile
+          : {}),
+        kv_key: profileKey,
+        detailed_style_guide_kv_key: profileKey,
+        detailed_style_guide_generated_at: new Date().toISOString()
+      }
+    });
+  }
+
+  const requestId = requestIdForProfile(storedProfile) ?? `style-${tokenId}-guide`;
+  await orchestrator.publish({
+    id: `${requestId}:style.guide.regenerated:${Date.now()}`,
+    type: "agent.activity",
+    actor: "style_curator",
+    styleId: tokenId,
+    payload: {
+      requestId,
+      agent: "style_curator",
+      agentLabel: "Style Curator",
+      tool: "generate_detailed_style_guide",
+      status: "completed",
+      message: "0G Compute generated a detailed style guide from the original uploaded samples.",
+      profileKey,
+      sampleCount: uploadedSamples.length,
+      hasDetailedStyleGuide: true,
+      compute: styleGuideCompute,
+      langGraphThread: `voices:${requestId}`
+    }
+  });
+
+  return styleDetails(orchestrator, tokenId);
+}
+
 function marketplaceSummary(input: {
   tokenId: string;
   profile: Record<string, unknown> | null;
@@ -440,7 +535,11 @@ function marketplaceSummary(input: {
   listed: boolean;
 }) {
   const labels = profileLabels(input.profile);
-  const sampleExcerpts = stringArrayField(input.profile, "sampleExcerpts").slice(0, 3);
+  const sampleExcerpts = stringArrayField(input.profile, "sampleExcerpts")
+    .map(cleanProfileExcerpt)
+    .filter((excerpt) => excerpt.length > 0)
+    .slice(0, 3);
+  const styleName = stringField(input.profile, "styleName");
   const primary = stringField(input.profile, "primary") ?? labels[0];
   const essence =
     stringField(input.profile, "voice_essence") ??
@@ -448,7 +547,7 @@ function marketplaceSummary(input: {
     (labels.length > 0 ? `${labels.join(", ")} voice profile` : undefined);
   const latestOutput = input.recentOutputs[0];
   return {
-    title: primary ? `${titleCase(primary)} style` : `Style token ${input.tokenId}`,
+    title: styleName || (primary ? `${titleCase(primary)} style` : `Style token ${input.tokenId}`),
     status: input.profile ? "ready_to_generate" : "onchain_only",
     statusLabel: input.profile ? "Ready to generate" : "On-chain only",
     listed: input.listed,
@@ -462,6 +561,175 @@ function marketplaceSummary(input: {
     hasProfile: Boolean(input.profile),
     updatedAt: numberField(input.profile, "updatedAt")
   };
+}
+
+function enrichProfileForResponse(profile: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (!profile) {
+    return null;
+  }
+  return {
+    ...profile,
+    sampleExcerpts: stringArrayField(profile, "sampleExcerpts")
+      .concat(stringArrayField(profile, "sample_excerpts"))
+      .map(cleanProfileExcerpt)
+      .filter(Boolean)
+      .slice(0, 8)
+  };
+}
+
+function uploadedSamplesForProfile(orchestrator: Orchestrator, profile: Record<string, unknown> | null): string[] {
+  const requestId = requestIdForProfile(profile);
+  if (!requestId) {
+    return [];
+  }
+  return orchestrator
+    .eventsForRequest(requestId)
+    .filter((event) => event.type === "style.uploaded")
+    .flatMap((event) => stringArrayField(event.payload, "samples"));
+}
+
+function requestIdForProfile(profile: Record<string, unknown> | null): string | undefined {
+  const requestId = stringField(profile, "requestId");
+  if (requestId) {
+    return requestId;
+  }
+  const thread = stringField(profile, "langGraphThread");
+  return thread?.startsWith("voices:") ? thread.slice("voices:".length) : undefined;
+}
+
+function styleGuideMetadata(
+  tokenId: string,
+  style: Awaited<ReturnType<Orchestrator["chain"]["styleOf"]>>,
+  profile: Record<string, unknown>,
+  samples: string[]
+): Record<string, unknown> {
+  const sourceContext =
+    profile.sourceContext && typeof profile.sourceContext === "object" && !Array.isArray(profile.sourceContext)
+      ? profile.sourceContext as Record<string, unknown>
+      : {};
+  return {
+    tokenId,
+    creator: style.creator,
+    sourceKind: stringField(profile, "sourceKind") ?? stringField(sourceContext, "sourceKind") ?? "unknown",
+    sourceSummary: stringField(profile, "sourceSummary") ?? stringField(sourceContext, "sourceSummary"),
+    sourceMaterials: Array.isArray(profile.sourceMaterials) ? profile.sourceMaterials : sourceContext.sourceMaterials,
+    fullSampleCount: samples.length,
+    fullSampleBytes: Buffer.byteLength(samples.join("\n"), "utf8"),
+    existingProfileKeys: Object.keys(profile),
+    styleName: stringField(profile, "styleName"),
+    keywords: stringArrayField(profile, "keywords"),
+    computeMode: runtimeModes().compute,
+    storageMode: runtimeModes().storage
+  };
+}
+
+function hasDetailedStyleGuide(guide: Record<string, unknown>): boolean {
+  return Boolean(stringField(guide, "prompt_ready_style_brief")) && Array.isArray(guide.actual_examples) && guide.actual_examples.length > 0;
+}
+
+function computeEvidence(compute: ChatResult, purpose: string): Record<string, unknown> {
+  return {
+    purpose,
+    provider: compute.providerAddress,
+    model: compute.model,
+    chatId: compute.chatId,
+    teeVerified: compute.teeVerified ?? compute.verified ?? null,
+    inputTokens: compute.inputTokens,
+    outputTokens: compute.outputTokens,
+    durationMs: compute.durationMs,
+    computePath: compute.computePath
+  };
+}
+
+function parseTaggedJson(content: string, tag: string): Record<string, unknown> {
+  const cleaned = stripCodeFence(content);
+  const tagged = matchTaggedContent(cleaned, tag);
+  const source = stripCodeFence(tagged ?? stripLooseTag(cleaned, tag));
+  const candidate = normalizeJsonObjectSource(source);
+
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Tagged response was not a JSON object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    const snippet = cleaned.replace(/\s+/g, " ").slice(0, 240);
+    const reason = error instanceof Error ? error.message : "unknown parse error";
+    throw new Error(`Could not parse ${tag} JSON from 0G Compute response: ${reason}. Response starts: ${snippet}`);
+  }
+}
+
+function normalizeJsonObjectSource(source: string): string {
+  const trimmed = source.trim();
+  if (trimmed.startsWith("{")) {
+    return extractFirstJsonObject(trimmed);
+  }
+  const lastBrace = trimmed.lastIndexOf("}");
+  const body = lastBrace >= 0 ? trimmed.slice(0, lastBrace + 1) : trimmed;
+  if (body.trim().endsWith("}")) {
+    return `{${body.trim()}`;
+  }
+  return `{${body.trim().replace(/,\s*$/, "")}}`;
+}
+
+function stripLooseTag(content: string, tag: string): string {
+  return content
+    .replace(new RegExp(`<${tag}[^>]*>`, "gi"), "")
+    .replace(new RegExp(`<\\/${tag}>`, "gi"), "")
+    .trim();
+}
+
+function matchTaggedContent(content: string, tag: string): string | undefined {
+  const pattern = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  return content.match(pattern)?.[1]?.trim();
+}
+
+function stripCodeFence(content: string): string {
+  return content
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
+}
+
+function extractFirstJsonObject(content: string): string {
+  const start = content.indexOf("{");
+  if (start === -1) {
+    throw new Error("No JSON object found");
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+    }
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return content.slice(start, index + 1).trim();
+      }
+    }
+  }
+
+  return content.slice(start).trim();
 }
 
 async function recentOutputsForStyle(orchestrator: Orchestrator, tokenId: string, creator: string): Promise<StyleOutputPreview[]> {
@@ -683,21 +951,23 @@ function collectComputeCalls(events: AgentEvent[]) {
   const seen = new Set<string>();
   const calls: unknown[] = [];
   for (const event of events) {
-    const compute = event.payload.compute;
-    if (!compute || typeof compute !== "object") {
-      continue;
-    }
-    const record = compute as Record<string, unknown>;
-    const key = [
-      record.purpose,
-      record.chatId,
-      record.provider,
-      record.model,
-      event.id
-    ].join(":");
-    if (!seen.has(key)) {
-      seen.add(key);
-      calls.push(compute);
+    for (const field of ["compute", "styleGuideCompute"]) {
+      const compute = event.payload[field];
+      if (!compute || typeof compute !== "object") {
+        continue;
+      }
+      const record = compute as Record<string, unknown>;
+      const key = [
+        record.purpose,
+        record.chatId,
+        record.provider,
+        record.model,
+        event.id
+      ].join(":");
+      if (!seen.has(key)) {
+        seen.add(key);
+        calls.push(compute);
+      }
     }
   }
   return calls;
@@ -790,6 +1060,65 @@ function requireStringArray(value: unknown, field: string): string[] {
   return value as string[];
 }
 
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function stringArrayOrEmpty(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+    : [];
+}
+
+function sanitizeSourceMaterials(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const materials: Array<Record<string, unknown>> = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const label = optionalString(record.label);
+    const kind = optionalString(record.kind);
+    if (!label || !kind) {
+      continue;
+    }
+    materials.push({
+      id: optionalString(record.id),
+      kind,
+      label,
+      characterCount: typeof record.characterCount === "number" ? record.characterCount : undefined,
+      unitCount: typeof record.unitCount === "number" ? record.unitCount : undefined,
+      importedAt: optionalString(record.importedAt),
+      metadata: sanitizeJsonObject(record.metadata)
+    });
+    if (materials.length >= 24) {
+      break;
+    }
+  }
+  return materials;
+}
+
+function sanitizeJsonObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter((entry) => {
+      const item = entry[1];
+      return item === null || ["string", "number", "boolean"].includes(typeof item) || Array.isArray(item);
+    })
+    .map(([key, item]) => [
+      key,
+      Array.isArray(item)
+        ? item.filter((nested) => nested === null || ["string", "number", "boolean"].includes(typeof nested)).slice(0, 50)
+        : item
+    ]);
+  return Object.fromEntries(entries);
+}
+
 function clampPositiveInteger(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value ?? "", 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -837,13 +1166,31 @@ function compareMarketplaceStyles(
 }
 
 function profileLabels(profile: Record<string, unknown> | null): string[] {
+  const tone = profile && typeof profile.tone === "object" && !Array.isArray(profile.tone)
+    ? (profile.tone as Record<string, unknown>)
+    : null;
   const labels = [
     ...stringArrayField(profile, "labels"),
     stringField(profile, "primary"),
     ...stringArrayField(profile, "secondary"),
-    ...stringArrayField(profile, "tone")
+    ...stringArrayField(profile, "tone"),
+    ...stringArrayField(tone, "labels"),
+    stringField(tone, "primary"),
+    ...stringArrayField(tone, "secondary")
   ].filter((value): value is string => Boolean(value));
   return [...new Set(labels)].slice(0, 8);
+}
+
+function cleanProfileExcerpt(value: string): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!text.startsWith("<source")) {
+    return text;
+  }
+  const fullTextIndex = text.toLowerCase().indexOf("full source text:");
+  if (fullTextIndex !== -1) {
+    return text.slice(fullTextIndex + "full source text:".length).replace(/<\/source>\s*$/i, "").trim().slice(0, 240);
+  }
+  return "";
 }
 
 function stringArrayField(value: unknown, key: string): string[] {
