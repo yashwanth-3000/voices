@@ -85,6 +85,61 @@ button{font-family:inherit}
   -webkit-backdrop-filter:blur(10px);
 }
 
+.topbarInline{
+  position:static;
+  inset:auto;
+  top:auto;
+  z-index:auto;
+  flex:0 0 auto;
+  padding:0;
+  pointer-events:auto;
+}
+
+.topbarInline .topbarInner{
+  min-height:30px;
+  max-width:100%;
+  padding:1px 6px;
+  background:rgba(255,252,248,.78);
+  box-shadow:0 8px 22px rgba(130,94,68,.08), inset 0 1px 0 rgba(255,255,255,.56);
+}
+
+.topbarInline .navBrand{
+  margin-right:4px;
+  font-size:12px;
+}
+
+.topbarInline .navLinks a{
+  padding:4px 6px;
+  font-size:8px;
+  letter-spacing:.15em;
+}
+
+.topbarInline .navIconLink{
+  width:18px;
+  height:18px;
+}
+
+.topbarInline .navWalletChip{
+  padding:4px 8px 4px 6px;
+  gap:6px;
+}
+
+.topbarInline .navWalletAvatar{
+  width:12px;
+  height:12px;
+}
+
+.topbarInline .navWalletAddress{
+  font-size:10px;
+}
+
+.topbarInline .navWalletMenu{
+  position:absolute;
+  top:calc(100% + 10px);
+  right:0 !important;
+  left:auto !important;
+}
+
 .navBrand{
   margin-right:6px;
   color:var(--text);
@@ -2385,7 +2440,7 @@ button{font-family:inherit}
   flex-direction:column;
   overflow:hidden;
   background:var(--bg0);
-  padding-top:68px;
+  padding-top:10px;
   animation:tryPageIn .42s cubic-bezier(.2,.8,.2,1) both;
 }
 
@@ -2416,29 +2471,37 @@ button{font-family:inherit}
 }
 
 .tryChatHeaderInner{
-  max-width:860px;
+  max-width:980px;
   margin:0 auto;
-  padding:8px 12px;
-  min-height:58px;
+  padding:5px 10px;
+  min-height:46px;
   display:flex;
   align-items:center;
   justify-content:space-between;
-  gap:12px;
+  gap:9px;
   border:1px solid rgba(76,49,31,.11);
-  border-radius:22px;
+  border-radius:18px;
   background:linear-gradient(135deg, rgba(255,252,248,.98), rgba(250,241,232,.94));
   box-shadow:0 18px 44px rgba(130,94,68,.10), inset 0 1px 0 rgba(255,255,255,.7);
   backdrop-filter:blur(14px);
   -webkit-backdrop-filter:blur(14px);
 }
 
+.tryChatHeaderLeft{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex:1 1 260px;
+  min-width:0;
+}
+
 .tryBackLink{
   display:inline-flex;
   align-items:center;
   gap:6px;
-  min-height:34px;
+  min-height:30px;
   border-radius:999px;
-  padding:0 10px;
+  padding:0 8px;
   font-size:12px;
   font-weight:800;
   color:var(--muted);
@@ -2451,15 +2514,22 @@ button{font-family:inherit}
 .tryChatHeaderCenter{
   display:flex;
   align-items:center;
-  gap:10px;
+  gap:8px;
   flex:1 1 auto;
   min-width:0;
 }
 
+.tryChatHeaderNav{
+  display:flex;
+  justify-content:center;
+  flex:0 1 auto;
+  min-width:0;
+}
+
 .tryChatHeaderIcon{
-  width:34px;
-  height:34px;
-  border-radius:10px;
+  width:28px;
+  height:28px;
+  border-radius:9px;
   background:linear-gradient(135deg,#f8a26a,#f36d38);
   color:#fff;
   display:flex;
@@ -2471,7 +2541,7 @@ button{font-family:inherit}
 
 .tryChatHeaderTitle{
   font-family:var(--font-heading);
-  font-size:17px;
+  font-size:15px;
   font-weight:400;
   color:var(--text);
   white-space:nowrap;
@@ -2480,7 +2550,7 @@ button{font-family:inherit}
 }
 
 .tryChatHeaderSub{
-  font-size:11px;
+  font-size:10px;
   color:var(--muted2);
   margin-top:1px;
   white-space:nowrap;
@@ -2488,13 +2558,13 @@ button{font-family:inherit}
 
 .tryChatHeaderPrice{
   flex-shrink:0;
-  font-size:11px;
+  font-size:10px;
   font-weight:750;
   color:var(--accentA);
   border:1px solid rgba(243,109,56,.2);
   background:rgba(243,109,56,.07);
   border-radius:999px;
-  padding:4px 10px;
+  padding:3px 8px;
   font-family:var(--font-mono,monospace);
 }
 
@@ -2502,8 +2572,8 @@ button{font-family:inherit}
   display:flex;
   align-items:center;
   justify-content:flex-end;
-  gap:9px;
-  flex:0 0 auto;
+  gap:7px;
+  flex:1 1 220px;
   min-width:0;
 }
 
@@ -2515,13 +2585,13 @@ button{font-family:inherit}
 .tryCreditCompact{
   display:flex;
   align-items:center;
-  gap:8px;
-  min-height:30px;
+  gap:7px;
+  min-height:27px;
   max-width:160px;
   border:1px solid rgba(76,49,31,.12);
   background:rgba(255,252,248,.88);
   border-radius:999px;
-  padding:4px 10px 4px 8px;
+  padding:3px 8px 3px 7px;
   box-shadow:0 8px 22px rgba(130,94,68,.08);
   color:inherit;
   font-family:inherit;
@@ -2552,8 +2622,8 @@ button{font-family:inherit}
 }
 
 .tryCreditCompactIcon{
-  width:20px;
-  height:20px;
+  width:18px;
+  height:18px;
   border-radius:999px;
   background:rgba(243,109,56,.10);
   color:#d85a29;
@@ -2573,7 +2643,7 @@ button{font-family:inherit}
 .tryCreditCompactText strong{
   color:var(--text);
   font-family:var(--font-mono,monospace);
-  font-size:11px;
+  font-size:10px;
   font-weight:850;
   white-space:nowrap;
   overflow:hidden;
@@ -2583,7 +2653,7 @@ button{font-family:inherit}
 .tryCreditCompactText small{
   margin-top:2px;
   color:var(--muted2);
-  font-size:9px;
+  font-size:8px;
   font-weight:850;
   text-transform:uppercase;
   letter-spacing:.05em;
@@ -4178,7 +4248,7 @@ button{font-family:inherit}
 
 @media (max-width: 720px){
   .tryRoot{
-    padding-top:58px;
+    padding-top:10px;
   }
 
   .tryChatHeader{
@@ -4194,16 +4264,24 @@ button{font-family:inherit}
     border-radius:18px;
   }
 
-  .tryBackLink{
+  .tryChatHeaderLeft{
     order:1;
+    flex:1 1 auto;
+    gap:7px;
+    min-width:0;
   }
 
   .tryChatHeaderCenter{
+    flex:1 1 auto;
+    width:auto;
+    align-items:center;
+    gap:8px;
+  }
+
+  .tryChatHeaderNav{
     order:3;
     flex:1 1 100%;
     width:100%;
-    align-items:flex-start;
-    gap:8px;
   }
 
   .tryChatHeaderIcon{

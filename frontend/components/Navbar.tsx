@@ -24,7 +24,11 @@ function avatarFromAddress(address: string) {
   return `hsl(${hue}, 72%, 58%)`;
 }
 
-export function Navbar() {
+type NavbarProps = {
+  variant?: "floating" | "inline";
+};
+
+export function Navbar({ variant = "floating" }: NavbarProps) {
   const pathname = usePathname();
   const [queryString, setQueryString] = useState("");
   const [open, setOpen] = useState(false);
@@ -61,9 +65,8 @@ export function Navbar() {
     navigator.clipboard.writeText(address).catch(() => {});
   }
 
-  return (
-    <header className="topbar">
-      <nav className="topbarInner" aria-label="Primary">
+  const nav = (
+      <nav className={`topbarInner${variant === "inline" ? " topbarInnerInline" : ""}`} aria-label="Primary">
         <Link className="navBrand" href="/" aria-label="Go to home">
           Voices
         </Link>
@@ -206,6 +209,15 @@ export function Navbar() {
           )}
         </div>
       </nav>
+  );
+
+  if (variant === "inline") {
+    return <div className="topbar topbarInline">{nav}</div>;
+  }
+
+  return (
+    <header className="topbar">
+      {nav}
     </header>
   );
 }
