@@ -3,7 +3,6 @@ import { buildApp } from "./http/app.js";
 import { EventLog } from "./events/event-log.js";
 import { MockChainClient } from "./infra/chain.js";
 import { MockComputeClient } from "./infra/compute.js";
-import { KeeperHubRestClient } from "./infra/keeperhub.js";
 import { MemoryStorageClient } from "./infra/storage.js";
 import { Orchestrator } from "./orchestrator/index.js";
 
@@ -14,7 +13,6 @@ const orchestrator = new Orchestrator({
   storage,
   chain,
   compute: new MockComputeClient(),
-  keeperhub: new KeeperHubRestClient(),
   eventLog: new EventLog({ storage })
 });
 

@@ -25,7 +25,7 @@ import {
   styleExtractionPrompt,
   styleRefinementPrompt
 } from "../prompts.js";
-import { MintStyleInput, AgentChain, AgentCompute, AgentStorage, ChatResult as AgentChatResult, KeeperHubClient } from "../../infra/types.js";
+import { MintStyleInput, AgentChain, AgentCompute, AgentStorage, ChatResult as AgentChatResult } from "../../infra/types.js";
 import {
   VoicesAgentName,
   VoicesSwarmState,
@@ -40,7 +40,6 @@ type LangGraphSwarmDeps = {
   storage: AgentStorage;
   compute: AgentCompute;
   chain: AgentChain;
-  keeperhub: KeeperHubClient;
   publish: (event: AgentEvent) => Promise<AgentEvent>;
 };
 
@@ -130,7 +129,7 @@ export class VoicesLangGraphSwarm {
       llm: createPlannerModel("distribution_mgr", deps.compute),
       tools: [
         this.tuneForPlatformTool(),
-        this.topupCreditsViaKeeperTool(),
+        this.prepareCreditTopupTool(),
         this.handoffToCuratorTool()
       ],
       prompt: DISTRIBUTION_MANAGER_PROMPT,
@@ -1037,159 +1036,17 @@ export class VoicesLangGraphSwarm {
     };
   }
 
-  private checkDistributionCreditBalanceTool() {
+  private prepareCreditTopupTool() {
     return tool(
       async () => {
         const state = getCurrentTaskInput() as VoicesSwarmStateValue;
         const event = requireIncomingEvent(state);
-        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
-        await this.publishToolActivity(state, "distribution_mgr", "check_credit_balance", "started", "Rechecking credits before settlement.");
-        const credits = await this.deps.chain.credits(consumerAddress);
-        await this.publishToolActivity(state, "distribution_mgr", "check_credit_balance", "completed", "Settlement credit balance read.", {
-          consumerAddress,
-          credits: credits.toString()
-        });
-        return new Command({
-          update: {
-            ...appendAgentMessage("distribution_mgr", `Settlement check sees ${credits.toString()} credit(s).`),
-            consumerAddress,
-            creditBalance: credits.toString(),
-            lastError: undefined
-          }
-        });
-      },
-      {
-        name: "check_credit_balance",
-        description: "Read the consumer credit balance during Distribution Manager settlement and auto-top-up reasoning.",
-        schema: z.object({})
-      }
-    );
-  }
-
-  private deductCreditViaKeeperTool() {
-    return tool(
-      async () => {
-        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
-        const event = requireIncomingEvent(state);
-        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
-        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
-        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
-        const spendIntent = state.spendIntent ?? this.deps.chain.spendCreditIntent(styleId);
-        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "started", "Creating the spend-credit transaction intent and asking KeeperHub when configured.", {
-          styleId,
-          consumerAddress
-        });
-        await this.deps.publish({
-          id: `${event.id}:settlement.intent.created`,
-          type: "settlement.intent.created",
-          timestamp: Date.now(),
-          actor: "system",
-          styleId,
-          consumerAddress,
-          payload: { requestId, spendIntent, langGraphThread: `voices:${requestId}` }
-        });
-        const settlement = await this.deps.keeperhub.executeTransaction(spendIntent);
-        if (settlement.status === "confirmed") {
-          await this.deps.publish({
-            id: `${event.id}:credit.deducted`,
-            type: "credit.deducted",
-            timestamp: Date.now(),
-            actor: "system",
-            styleId,
-            consumerAddress,
-            payload: { requestId, txHash: settlement.txHash, langGraphThread: `voices:${requestId}` }
-          });
-        }
-        await this.publishToolActivity(state, "distribution_mgr", "deduct_credit_via_keeper", "completed", `Settlement status is ${settlement.status}.`, {
-          styleId,
-          consumerAddress,
-          workflowId: settlement.workflowId,
-          txHash: settlement.txHash,
-          reason: settlement.reason
-        });
-        return new Command({
-          update: {
-            ...appendAgentMessage("distribution_mgr", `Credit spend submitted with status ${settlement.status}.`),
-            spendIntent,
-            settlementStatus: settlement.status,
-            keeperHubWorkflowId: settlement.workflowId,
-            lastEventType: settlement.status === "confirmed" ? "credit.deducted" : "settlement.intent.created",
-            lastError: settlement.status === "failed" ? settlement.reason : undefined
-          }
-        });
-      },
-      {
-        name: "deduct_credit_via_keeper",
-        description: "Create the current CreditSystem.spendCredit transaction intent and submit it through KeeperHub when configured.",
-        schema: z.object({})
-      }
-    );
-  }
-
-  private depositRoyaltyViaKeeperTool() {
-    return tool(
-      async () => {
-        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
-        const event = requireIncomingEvent(state);
-        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
-        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
-        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
-        await this.publishToolActivity(state, "distribution_mgr", "deposit_royalty_via_keeper", "started", "Checking whether the atomic spendCredit path confirmed royalty settlement.", {
-          styleId,
-          consumerAddress
-        });
-        if (state.settlementStatus === "confirmed") {
-          await this.deps.publish({
-            id: `${event.id}:royalty.settled`,
-            type: "royalty.settled",
-            timestamp: Date.now(),
-            actor: "system",
-            styleId,
-            consumerAddress,
-            payload: { requestId, workflowId: state.keeperHubWorkflowId, langGraphThread: `voices:${requestId}` }
-          });
-        }
-        await this.publishToolActivity(
-          state,
-          "distribution_mgr",
-          "deposit_royalty_via_keeper",
-          "completed",
-          state.settlementStatus === "confirmed"
-            ? "Royalty settlement confirmed through spendCredit."
-            : "Royalty settlement is pending wallet or KeeperHub confirmation.",
-          { styleId, consumerAddress, settlementStatus: state.settlementStatus }
-        );
-        return new Command({
-          update: {
-            ...appendAgentMessage(
-              "distribution_mgr",
-              state.settlementStatus === "confirmed"
-                ? "Royalty settlement confirmed through the atomic spendCredit path."
-                : "Royalty settlement is pending wallet/KeeperHub confirmation."
-            ),
-            lastEventType: state.settlementStatus === "confirmed" ? "royalty.settled" : "settlement.intent.created"
-          }
-        });
-      },
-      {
-        name: "deposit_royalty_via_keeper",
-        description: "Record royalty settlement once the atomic spendCredit path confirms creator payment.",
-        schema: z.object({})
-      }
-    );
-  }
-
-  private topupCreditsViaKeeperTool() {
-    return tool(
-      async () => {
-        const state = getCurrentTaskInput() as VoicesSwarmStateValue;
-        const event = requireIncomingEvent(state);
-        await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "started", "Checking auto-top-up settings for this consumer.");
+        await this.publishToolActivity(state, "distribution_mgr", "prepare_credit_topup", "started", "Checking whether this consumer allows automatic credit top-up intent preparation.");
         return new Command({ update: await this.handleCreditLow(state, event) });
       },
       {
-        name: "topup_credits_via_keeper",
-        description: "If consumer settings enable auto-top-up, prepare or submit a buyCredits transaction through KeeperHub.",
+        name: "prepare_credit_topup",
+        description: "If consumer settings enable auto-top-up, prepare a wallet-signable buyCredits transaction intent.",
         schema: z.object({})
       }
     );
@@ -1571,37 +1428,38 @@ export class VoicesLangGraphSwarm {
       `consumer:${consumerAddress}:settings`
     );
     if (!settings?.autoTopUp) {
-      await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "completed", "Auto-top-up is disabled, so no transaction was prepared.", {
+      await this.publishToolActivity(state, "distribution_mgr", "prepare_credit_topup", "completed", "Auto-top-up is disabled, so no transaction intent was prepared.", {
         consumerAddress
       });
-      return appendAgentMessage("distribution_mgr", `Auto-top-up is disabled for ${consumerAddress}; no transaction was prepared.`);
+      return appendAgentMessage("distribution_mgr", `Auto-top-up is disabled for ${consumerAddress}; no transaction intent was prepared.`);
     }
 
-    const intent = await this.deps.chain.buyCreditsIntent(BigInt(settings.topUpCredits ?? "5"));
-    const result = await this.deps.keeperhub.executeTransaction(intent);
+    const amount = BigInt(settings.topUpCredits ?? "5");
+    const intent = await this.deps.chain.buyCreditsIntent(amount);
     await this.deps.publish({
-      id: `${event.id}:credit.replenished`,
-      type: "credit.replenished",
+      id: `${event.id}:credit.purchase.intent.created`,
+      type: "credit.purchase.intent.created",
       timestamp: Date.now(),
       actor: "system",
       styleId: state.currentStyleId ?? event.styleId,
       consumerAddress,
       payload: {
         requestId,
-        status: result.status,
-        workflowId: result.workflowId,
-        reason: result.reason,
+        amount: amount.toString(),
+        intent,
+        status: "awaiting_wallet_signature",
+        sourceEventType: "credit.low",
         langGraphThread: `voices:${requestId}`
       }
     });
-    await this.publishToolActivity(state, "distribution_mgr", "topup_credits_via_keeper", "completed", "Auto-top-up workflow was prepared through KeeperHub.", {
+    await this.publishToolActivity(state, "distribution_mgr", "prepare_credit_topup", "completed", "Auto-top-up buyCredits intent was prepared for wallet signature.", {
       consumerAddress,
-      status: result.status,
-      workflowId: result.workflowId
+      amount: amount.toString(),
+      intent
     });
     return {
-      ...appendAgentMessage("distribution_mgr", `Auto-top-up workflow prepared for ${consumerAddress}.`),
-      lastEventType: "credit.replenished"
+      ...appendAgentMessage("distribution_mgr", `Auto-top-up intent prepared for ${consumerAddress}.`),
+      lastEventType: "credit.purchase.intent.created"
     };
   }
 
@@ -1941,7 +1799,7 @@ function preferredToolOrder(agentName: VoicesAgentName, transcript: string): str
   }
 
   if (transcript.includes("credit.low")) {
-    return ["topup_credits_via_keeper"];
+    return ["prepare_credit_topup"];
   }
 
   return ["tune_for_platform"];
@@ -1966,9 +1824,7 @@ function toolHasRun(toolName: string, messages: BaseMessage[], transcript: strin
     log_draft: ["generation.drafted emitted", "Draft emitted", "Draft event emitted", "0G history log append is syncing"],
     handoff_to_distribution: ["Handing off style"],
     tune_for_platform: ["Platform variants created", "Selected output format created", "Selected output format emitted", "Spend-credit transaction intent prepared"],
-    deduct_credit_via_keeper: ["Credit spend submitted"],
-    deposit_royalty_via_keeper: ["Royalty settlement"],
-    topup_credits_via_keeper: ["Auto-top-up"],
+    prepare_credit_topup: ["Auto-top-up"],
     handoff_to_content_creator: ["Handing off to Content Creator"],
     handoff_to_curator: ["Handing feedback context back"]
   };
@@ -2084,7 +1940,7 @@ const CONTENT_CREATOR_PROMPT = [
 const DISTRIBUTION_MANAGER_PROMPT = [
   "You are the Distribution Manager agent for Voices on 0G.",
   "Validate the single selected output format and prepare one wallet-signable spend-credit settlement intent.",
-  "After generation.published or settlement.intent.created, stop. Do not recheck credits, do not submit KeeperHub settlement, and do not call extra tools.",
+  "After generation.published or settlement.intent.created, stop. Do not recheck credits or call extra tools.",
   "Only use top-up tooling when the incoming event is credit.low."
 ].join("\n");
 

@@ -19,7 +19,6 @@ export type EventType =
   | "credit.purchased"
   | "credit.deducted"
   | "credit.low"
-  | "credit.replenished"
   | "royalty.settled";
 
 export type AgentEvent = {

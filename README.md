@@ -89,7 +89,7 @@ The backend uses LangGraph for the upload/mint/proof lifecycle, then hands chatb
 
 - `style_curator` uses explicit ReAct tools: `verify_attestation`, `encrypt_and_store_samples`, `extract_style_profile`, `build_and_upload_agent_brain`, `mint_inft`, `refine_profile_from_feedback`, and `handoff_to_content_creator`.
 - `content_creator` uses explicit ReAct tools: `check_credit_balance`, `read_style_profile`, `pull_relevant_samples`, `generate_with_voice`, `log_draft`, and `handoff_to_distribution`. The `generate_with_voice` tool starts the Python CrewAI runner.
-- `distribution_mgr` uses explicit ReAct tools: `tune_for_platform`, `check_credit_balance`, `deduct_credit_via_keeper`, `deposit_royalty_via_keeper`, `topup_credits_via_keeper`, and `handoff_to_curator`.
+- `distribution_mgr` uses explicit ReAct tools: `tune_for_platform`, `prepare_credit_topup`, and `handoff_to_curator`. Settlement is emitted as a wallet-signable 0G Chain transaction intent and confirmed through receipt verification.
 
 The CrewAI generation runner has three agents:
 
@@ -97,7 +97,16 @@ The CrewAI generation runner has three agents:
 - `Style Writer Agent` takes the user prompt plus that runtime packet and generates the draft through the backend's 0G Compute bridge.
 - `Voice Critic + Memory Agent` compares the draft against the packet, asks for one focused revision when the style fit is weak, and returns critique, feedback, and learned preferences for 0G Log/KV.
 
-CrewAI communicates with Node over JSONL. Each CrewAI agent emits `agent.activity` records, so `/events/stream/:requestId` shows which agent is working, what it read, and what it produced. The Node bridge keeps the same `AgentCompute` path, so live runs still use 0G Compute while local tests can use mock compute.
+CrewAI communicates with Node over JSONL. Each CrewAI agent emits `agent.activity` records, so `/events/stream/:requestId` shows which agent is working, what it read, and what it produced. The Node bridge can use the same `AgentCompute` path as the LangGraph agents, so live runs can use 0G Compute while local tests use mock compute.
+
+### Compute strategy
+
+Voices intentionally uses two agent frameworks for different parts of the workflow:
+
+- LangGraph owns the asset lifecycle: attestation verification, encrypted 0G Storage writes, 0G Compute style extraction, AgentBrain manifest creation, iNFT mint intent creation, feedback refinement, and proof generation. This is the core 0G-native agent workflow.
+- CrewAI owns the chat-generation loop: a Voice Context Agent builds a runtime packet from stored 0G evidence, a Style Writer Agent drafts the output, and a Voice Critic + Memory Agent checks style fit and records learned preferences.
+
+For the strongest 0G prize demo, run both LangGraph and CrewAI through the 0G Compute broker. During development or high-quality demo fallback, CrewAI can be pointed at OpenAI while the iNFT creation, profile extraction, memory, storage, chain, and proof layers remain on 0G. If that fallback is used, describe it honestly as a model-quality fallback for the chat phase, not as fully 0G-verifiable generation.
 
 Install the Python runtime when you want the real CrewAI package:
 
@@ -134,7 +143,7 @@ When the creator signs the ownership attestation, Voices recovers the EVM public
 ## 0G integration depth
 
 - 0G Storage: encrypted samples, encrypted style profiles, AgentBrain manifests, KV state, Log history, and LangGraph checkpoints.
-- 0G Compute: style extraction, generation, platform tuning, profile refinement, and optional ReAct planning. Broker mode surfaces provider address, chat id, token usage, duration, and TEE verification result when the provider returns one.
+- 0G Compute: style extraction, profile refinement, optional ReAct planning, and generation when CrewAI is configured to use the runtime 0G compute bridge. Broker mode surfaces provider address, chat id, token usage, duration, and TEE verification result when the provider returns one.
 - 0G Chain: StyleRegistry, CreditSystem, and RoyaltyVault transaction intents; confirmation endpoints now verify receipts and decoded events before emitting confirmed backend events.
 - 0G iNFT: ERC-7857-inspired encrypted metadata, per-token sealed keys, owner-scoped access, dynamic memory/refinement, and AgentBrain manifests stored on 0G.
 

@@ -3,15 +3,13 @@ import { EventLog } from "../events/event-log.js";
 import { AgentEvent, NewAgentEvent } from "../events/types.js";
 import { createChainClient } from "../infra/chain.js";
 import { createComputeClient } from "../infra/compute.js";
-import { createKeeperHubClient } from "../infra/keeperhub.js";
 import { createStorageClient } from "../infra/storage.js";
-import { AgentChain, AgentCompute, AgentStorage, KeeperHubClient } from "../infra/types.js";
+import { AgentChain, AgentCompute, AgentStorage } from "../infra/types.js";
 
 export type OrchestratorDeps = {
   storage?: AgentStorage;
   compute?: AgentCompute;
   chain?: AgentChain;
-  keeperhub?: KeeperHubClient;
   eventLog?: EventLog;
   swarm?: VoicesLangGraphSwarm;
 };
@@ -28,7 +26,6 @@ export class Orchestrator {
     const storage = deps.storage ?? createStorageClient();
     const compute = deps.compute ?? createComputeClient();
     const chain = deps.chain ?? createChainClient();
-    const keeperhub = deps.keeperhub ?? createKeeperHubClient();
     this.storage = storage;
     this.compute = compute;
     this.chain = chain;
@@ -39,7 +36,6 @@ export class Orchestrator {
         storage,
         compute,
         chain,
-        keeperhub,
         publish: (event) => this.events.publish(event)
       });
   }

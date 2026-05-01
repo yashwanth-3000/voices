@@ -136,10 +136,6 @@ export const VoicesSwarmState = Annotation.Root({
     reducer: (_left, right) => right,
     default: () => undefined
   }),
-  keeperHubWorkflowId: Annotation<string | undefined>({
-    reducer: (_left, right) => right,
-    default: () => undefined
-  }),
   settlementStatus: Annotation<string | undefined>({
     reducer: (_left, right) => right,
     default: () => undefined

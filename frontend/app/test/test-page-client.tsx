@@ -984,9 +984,7 @@ function eventBelongsToMode(event: AgentEvent, mode: TestPageMode): boolean {
     "log_draft",
     "handoff_to_distribution",
     "tune_for_platform",
-    "deduct_credit_via_keeper",
-    "deposit_royalty_via_keeper",
-    "topup_credits_via_keeper",
+    "prepare_credit_topup",
     "handoff_to_curator",
     "refine_profile_from_feedback"
   ]);

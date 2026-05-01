@@ -37,13 +37,6 @@ export type TransactionIntent = {
   description: string;
 };
 
-export type KeeperHubResult = {
-  status: "confirmed" | "pending_keeperhub" | "failed";
-  workflowId?: string;
-  txHash?: string;
-  reason?: string;
-};
-
 export type ReceiptVerification = {
   txHash: string;
   blockNumber?: number;
@@ -113,15 +106,9 @@ export interface AgentChain {
   royaltyOf(tokenId: string): Promise<bigint>;
 }
 
-export interface KeeperHubClient {
-  executeTransaction(intent: TransactionIntent): Promise<KeeperHubResult>;
-  pollWorkflow(workflowId: string): Promise<KeeperHubResult>;
-}
-
 export interface AgentRuntime {
   storage: AgentStorage;
   compute: AgentCompute;
   chain: AgentChain;
-  keeperhub: KeeperHubClient;
   publish(event: AgentEvent): Promise<AgentEvent>;
 }
