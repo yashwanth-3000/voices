@@ -12,15 +12,14 @@ export function Footer() {
               <span>Voices</span>
             </div>
             <p className="fine">
-              A frontend-only prototype for a marketplace where creators monetize
-              their writing style and teams generate content with authentic voices.
-              No accounts, payments, or AI calls are wired up in this demo.
+              Creator writing styles become ownable AI voice agents with
+              AgentBrain manifests, live generation logs, proof trails, and
+              on-chain royalty settlement.
             </p>
           </div>
           <div className="miniLinks" aria-label="Footer links">
             <Link href="/#how">How it works</Link>
             <Link href="/#featured">Featured</Link>
-            <Link href="/#creators">Creators</Link>
             <Link href="/#explorers">Explore</Link>
             <Link href="/upload">Upload</Link>
           </div>

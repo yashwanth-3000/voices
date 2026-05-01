@@ -74,7 +74,6 @@ export function Navbar({ variant = "floating" }: NavbarProps) {
         <div className="navLinks hideMobile" aria-label="Primary links">
           <Link href="/styles">Styles</Link>
           <Link href="/upload">Upload</Link>
-          <Link href="/#creators">Creators</Link>
           <Link href="/#how">About</Link>
         </div>
 
