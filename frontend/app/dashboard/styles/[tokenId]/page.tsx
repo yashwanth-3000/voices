@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
 import { Footer } from "../../../../components/Footer";
@@ -62,9 +63,9 @@ export default function VoiceInspectorPage({ params }: PageProps) {
       <main className="siteShell dashboardShell">
         <section className="section sectionTightTop">
           <div className="container">
-            <a className="inspectorBackLink" href="/dashboard">
+            <Link className="inspectorBackLink" href="/dashboard">
               Back to dashboard
-            </a>
+            </Link>
 
             <div className="inspectorHero">
               <div className="inspectorHeroCopy">

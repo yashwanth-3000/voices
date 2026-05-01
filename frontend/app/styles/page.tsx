@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { StyleListingCard } from "../../components/StyleListingCard";
-import { styles } from "../../lib/styles";
 import {
   ChainStyleDetails,
   parseJsonResponse,
@@ -12,12 +11,6 @@ import {
   shortAddress,
   StylesResponse
 } from "../../lib/registryStyles";
-
-const fillLines = [
-  "Includes tone traits, cadence notes, and sample outputs for fast comparison.",
-  "Optimized for consistent voice across posts, memos, landing pages, and threads.",
-  "Preview hooks, structure, and phrasing patterns before you generate.",
-];
 
 type GalleryStyle = {
   id: string;
@@ -63,23 +56,10 @@ export default function StylesPage() {
   }, [loadRegistryStyles]);
 
   const allStyles = useMemo<GalleryStyle[]>(() => {
-    if (registryStyles.length > 0) {
-      return [...registryStyles]
-        .sort((left, right) => (right.marketplace.updatedAt ?? 0) - (left.marketplace.updatedAt ?? 0))
-        .map((style) => mapRegistryStyle(style, registrySource));
-    }
-    if (state !== "error") return [];
-    return styles.map((style, index) => ({
-      id: style.id,
-      href: `/styles/${style.id}`,
-      title: style.title,
-      creator: `${style.creatorName} · @${style.creatorHandle}`,
-      price: style.price,
-      tags: style.tags,
-      blurb: style.blurb,
-      fillText: fillLines[index % fillLines.length]
-    }));
-  }, [registrySource, registryStyles, state]);
+    return [...registryStyles]
+      .sort((left, right) => (right.marketplace.updatedAt ?? 0) - (left.marketplace.updatedAt ?? 0))
+      .map((style) => mapRegistryStyle(style, registrySource));
+  }, [registrySource, registryStyles]);
 
   return (
     <div>
@@ -96,7 +76,7 @@ export default function StylesPage() {
                 <p className="sectionSub">
                   {registryStyles.length > 0
                     ? `${registryStyles.length} styles from the live registry${scannedCount ? ` after scanning ${scannedCount} tokens` : ""}.`
-                    : "A gallery of creator-uploaded voices. Browse by vibe, preview the tone, then pick a style."}
+                    : "Loading creator-uploaded voices from the backend. No local demo styles are shown here."}
                 </p>
               </div>
               <div className="dashboardHeroActions">
@@ -124,8 +104,8 @@ export default function StylesPage() {
             ) : null}
             {state === "ready" && registryStyles.length === 0 ? (
               <div className="dashboardEmptyState">
-                <h2>No registry styles found</h2>
-                <p>The backend returned an empty style registry for the scanned token range.</p>
+                <h2>No live styles found</h2>
+                <p>The backend did not return any on-chain or evidence-backed styles for the scanned token range.</p>
               </div>
             ) : null}
 

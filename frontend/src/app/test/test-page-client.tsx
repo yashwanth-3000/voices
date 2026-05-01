@@ -49,7 +49,7 @@ export function TestPageClient() {
   const [resumeRequestId, setResumeRequestId] = useState("");
   const [prompt, setPrompt] = useState("");
   const [feedback, setFeedback] = useState("");
-  const [platforms, setPlatforms] = useState(["x", "linkedin", "instagram"]);
+  const [platforms, setPlatforms] = useState(["x", "thread", "instagram"]);
   const [health, setHealth] = useState<Record<string, unknown> | null>(null);
   const [steps, setSteps] = useState<FlowStep[]>(initialSteps);
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -533,7 +533,7 @@ export function TestPageClient() {
               <button type="button" onClick={buyOneCredit} disabled={busy || !walletAddress}>{busyAction === "credit" ? "Buying..." : "Buy 1 credit"}</button>
             </div>
             <label>Generation prompt<textarea placeholder="What should the agent write?" value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
-            <div className="checkbox-row">{["x", "linkedin", "instagram"].map((platform) => <label className="checkbox-label" key={platform}><input checked={platforms.includes(platform)} onChange={() => togglePlatform(platform)} type="checkbox" />{platform}</label>)}</div>
+            <div className="checkbox-row">{["x", "thread", "instagram"].map((platform) => <label className="checkbox-label" key={platform}><input checked={platforms.includes(platform)} onChange={() => togglePlatform(platform)} type="checkbox" />{platform}</label>)}</div>
             <div className="button-row multi-actions">
               <button type="button" className="primary" onClick={generateContent} disabled={busy || !styleId || !prompt.trim()}>{busyAction === "generate" ? "Generating..." : "Generate"}</button>
               <button type="button" className="primary" onClick={settleOnChain} disabled={busy || !spendIntent}>{busyAction === "settle" ? "Settling..." : "Spend credit + settle royalty"}</button>

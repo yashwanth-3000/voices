@@ -85,11 +85,25 @@ Then open `/proof/<requestId>` from the smoke output or live UI event stream.
 
 ## Agent architecture
 
-The backend now runs the three Voices specialists as a LangGraph swarm:
+The backend uses LangGraph for the upload/mint/proof lifecycle, then hands chatbot generation to a CrewAI runtime:
 
 - `style_curator` uses explicit ReAct tools: `verify_attestation`, `encrypt_and_store_samples`, `extract_style_profile`, `build_and_upload_agent_brain`, `mint_inft`, `refine_profile_from_feedback`, and `handoff_to_content_creator`.
-- `content_creator` uses explicit ReAct tools: `check_credit_balance`, `read_style_profile`, `pull_relevant_samples`, `generate_with_voice`, `log_draft`, and `handoff_to_distribution`.
+- `content_creator` uses explicit ReAct tools: `check_credit_balance`, `read_style_profile`, `pull_relevant_samples`, `generate_with_voice`, `log_draft`, and `handoff_to_distribution`. The `generate_with_voice` tool starts the Python CrewAI runner.
 - `distribution_mgr` uses explicit ReAct tools: `tune_for_platform`, `check_credit_balance`, `deduct_credit_via_keeper`, `deposit_royalty_via_keeper`, `topup_credits_via_keeper`, and `handoff_to_curator`.
+
+The CrewAI generation runner has three agents:
+
+- `Voice Context Agent` reads the StyleRegistry evidence, AgentBrain manifest, profile KV, selected sample excerpts, and recent memory logs that the backend loaded from 0G. It builds a runtime voice packet from stored evidence only.
+- `Style Writer Agent` takes the user prompt plus that runtime packet and generates the draft through the backend's 0G Compute bridge.
+- `Voice Critic + Memory Agent` compares the draft against the packet, asks for one focused revision when the style fit is weak, and returns critique, feedback, and learned preferences for 0G Log/KV.
+
+CrewAI communicates with Node over JSONL. Each CrewAI agent emits `agent.activity` records, so `/events/stream/:requestId` shows which agent is working, what it read, and what it produced. The Node bridge keeps the same `AgentCompute` path, so live runs still use 0G Compute while local tests can use mock compute.
+
+Install the Python runtime when you want the real CrewAI package:
+
+```bash
+python3 -m pip install -r backend/crewai_runtime/requirements.txt
+```
 
 LangGraph state is persisted through `ZeroGCheckpointSaver`, a custom checkpointer backed by the same 0G Storage-style KV and Log wrapper the rest of the backend uses. KV stores the active checkpoint per thread, while Log stores append-only checkpoint history for replay and debugging.
 

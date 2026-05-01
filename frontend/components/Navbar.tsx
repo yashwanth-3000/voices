@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import { useWallet } from "../context/WalletContext";
@@ -63,15 +64,15 @@ export function Navbar() {
   return (
     <header className="topbar">
       <nav className="topbarInner" aria-label="Primary">
-        <a className="navBrand" href="/" aria-label="Go to home">
+        <Link className="navBrand" href="/" aria-label="Go to home">
           Voices
-        </a>
+        </Link>
 
         <div className="navLinks hideMobile" aria-label="Primary links">
-          <a href="/styles">Styles</a>
-          <a href="/wallet">Upload</a>
-          <a href="/#creators">Creators</a>
-          <a href="/#how">About</a>
+          <Link href="/styles">Styles</Link>
+          <Link href="/upload">Upload</Link>
+          <Link href="/#creators">Creators</Link>
+          <Link href="/#how">About</Link>
         </div>
 
         <span className="navDivider hideMobile" aria-hidden="true" />
@@ -88,13 +89,13 @@ export function Navbar() {
 
         <div className="navWalletArea" ref={menuRef}>
           {!address ? (
-            <a
+            <Link
               className="btn btnDark navWalletConnectBtn"
               href={`/wallet?returnTo=${encodeURIComponent(returnTo)}`}
               aria-label="Connect wallet"
             >
               Connect Wallet
-            </a>
+            </Link>
           ) : (
             <>
               <button
@@ -169,29 +170,29 @@ export function Navbar() {
                 {/* ── Actions ── */}
                 <div className="navWalletActions">
                   {!isOnCorrectNetwork && (
-                    <a
+                    <Link
                       href="/wallet"
                       className="navWalletActionBtn"
                       style={{ color: "#c0392b" }}
                       onClick={() => setOpen(false)}
                     >
                       Switch to 0G Galileo
-                    </a>
+                    </Link>
                   )}
-                  <a
+                  <Link
                     href="/dashboard"
                     className="navWalletActionBtn"
                     onClick={() => setOpen(false)}
                   >
                     View dashboard
-                  </a>
-                  <a
+                  </Link>
+                  <Link
                     href={`/wallet?returnTo=${encodeURIComponent(returnTo)}&switch=1`}
                     className="navWalletActionBtn"
                     onClick={() => setOpen(false)}
                   >
                     Switch wallet
-                  </a>
+                  </Link>
                   <button
                     type="button"
                     className={`navWalletActionBtn navWalletActionDanger`}

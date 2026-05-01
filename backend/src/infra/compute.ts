@@ -2,12 +2,30 @@ import { createRequire } from "node:module";
 import { ethers } from "ethers";
 import OpenAI from "openai";
 import { normalizePrivateKey, optionalEnv, requiredEnv } from "../config.js";
-import { AgentCompute, ChatMessage, ChatResult } from "./types.js";
+import { AgentCompute, ChatMessage, ChatOptions, ChatResult } from "./types.js";
 
 const require = createRequire(import.meta.url);
 const { createZGComputeNetworkBroker } = require("@0glabs/0g-serving-broker") as typeof import("@0glabs/0g-serving-broker");
 
 type Metadata = { endpoint: string; model: string; expiresAt: number };
+type ComputeRetryOptions = { maxRetries?: number };
+
+const DEFAULT_COMPUTE_MIN_INTERVAL_MS = 7_000;
+const DEFAULT_COMPUTE_MAX_RETRIES = 5;
+const DEFAULT_OPENAI_MODEL = "gpt-5.5";
+
+let computeThrottleQueue: Promise<void> = Promise.resolve();
+let lastComputeRequestAt = 0;
+
+class ComputeHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+    readonly retryAfterMs?: number
+  ) {
+    super(`0G Compute request failed: ${status} ${body}`);
+  }
+}
 
 export class MockComputeClient implements AgentCompute {
   async chat(messages: ChatMessage[]): Promise<ChatResult> {
@@ -17,6 +35,9 @@ export class MockComputeClient implements AgentCompute {
     }
     if (prompt.includes("<style_profile>") && prompt.includes("literary analyst")) {
       return mockResult(`<style_profile>${JSON.stringify(buildStyleProfile(prompt))}</style_profile>`);
+    }
+    if (prompt.includes("<style_guide>") && prompt.includes("Style Guide Generator")) {
+      return mockResult(`<style_guide>${JSON.stringify(buildDetailedStyleGuide(prompt))}</style_guide>`);
     }
     if (prompt.includes("Target platforms:") || prompt.includes("platform-specific variants")) {
       return mockResult(JSON.stringify(buildPlatformVariants(prompt)));
@@ -45,7 +66,7 @@ function mockResult(content: string): ChatResult {
 export class ZeroGComputeClient implements AgentCompute {
   private metadata?: Metadata;
 
-  async chat(messages: ChatMessage[], options?: { model?: string; maxRetries?: number; maxTokens?: number }): Promise<ChatResult> {
+  async chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
     if (process.env.OG_COMPUTE_API_KEY && process.env.OG_COMPUTE_SERVICE_URL && process.env.OG_COMPUTE_MODEL) {
       return this.directChat(messages, options);
     }
@@ -66,14 +87,24 @@ export class ZeroGComputeClient implements AgentCompute {
     }
   }
 
-  private async directChat(messages: ChatMessage[], options?: { model?: string; maxTokens?: number }): Promise<ChatResult> {
+  private async directChat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
     const started = Date.now();
     const client = new OpenAI({
       apiKey: requiredEnv("OG_COMPUTE_API_KEY"),
       baseURL: normalizeDirectBaseUrl(requiredEnv("OG_COMPUTE_SERVICE_URL"))
     });
     const model = options?.model ?? requiredEnv("OG_COMPUTE_MODEL");
-    const completion = await client.chat.completions.create({ model, messages, max_tokens: options?.maxTokens });
+    const completion = await withComputeRetries(
+      () =>
+        client.chat.completions.create({
+          model,
+          messages,
+          max_tokens: options?.maxTokens,
+          temperature: options?.temperature,
+          top_p: options?.topP
+        }),
+      options
+    );
     const usage = tokenUsage(completion.usage);
     return {
       content: completion.choices[0]?.message?.content ?? "",
@@ -89,22 +120,31 @@ export class ZeroGComputeClient implements AgentCompute {
     };
   }
 
-  private async brokerChat(messages: ChatMessage[], options?: { maxRetries?: number; maxTokens?: number }): Promise<ChatResult> {
+  private async brokerChat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
     const started = Date.now();
     const broker = await this.createBroker();
     const providerAddress = requiredEnv("OG_COMPUTE_PROVIDER_ADDRESS");
     try {
       const { endpoint, model } = await this.getMetadata(broker, providerAddress);
-      const body = { model, messages, max_tokens: options?.maxTokens };
-      const headers = await broker.inference.getRequestHeaders(providerAddress, JSON.stringify(body));
-      const response = await fetch(`${endpoint}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...headers },
-        body: JSON.stringify(body)
-      });
-      if (!response.ok) {
-        throw new Error(`0G Compute request failed: ${response.status} ${await response.text()}`);
-      }
+      const body = {
+        model,
+        messages,
+        max_tokens: options?.maxTokens,
+        temperature: options?.temperature,
+        top_p: options?.topP
+      };
+      const response = await withComputeRetries(async () => {
+        const headers = await broker.inference.getRequestHeaders(providerAddress, JSON.stringify(body));
+        const response = await fetch(`${endpoint}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+          throw new ComputeHttpError(response.status, await response.text(), retryAfterMs(response.headers.get("retry-after")));
+        }
+        return response;
+      }, options);
       const data = await response.json();
       const chatId = response.headers.get("ZG-Res-Key") || response.headers.get("zg-res-key") || data.id || data.chatID;
       const verified = await broker.inference.processResponse(providerAddress, chatId, JSON.stringify(data.usage || {}));
@@ -144,6 +184,47 @@ export class ZeroGComputeClient implements AgentCompute {
     const wallet = new ethers.Wallet(normalizePrivateKey(requiredEnv("PRIVATE_KEY")), provider);
     return createZGComputeNetworkBroker(wallet as unknown as Parameters<typeof createZGComputeNetworkBroker>[0]);
   }
+}
+
+export class OpenAIComputeClient implements AgentCompute {
+  async chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
+    const started = Date.now();
+    const client = new OpenAI({
+      apiKey: firstConfiguredEnv(["OPENAI_API_KEY", "CHATGPT_API_KEY", "OG_COMPUTE_API_KEY"])
+    });
+    const model = options?.model ?? openAiModel();
+    const prompt = responsePromptFromMessages(messages);
+    const response = await withComputeRetries(
+      () =>
+        client.responses.create({
+          model,
+          instructions: prompt.instructions || undefined,
+          input: prompt.input,
+          max_output_tokens: options?.maxTokens,
+          reasoning: openAiReasoningEffort()
+        }),
+      options
+    );
+    const usage = tokenUsage(response.usage);
+    return {
+      content: response.output_text ?? "",
+      chatId: response.id,
+      verified: null,
+      teeVerified: null,
+      model,
+      serviceUrl: "https://api.openai.com/v1/responses",
+      computePath: "openai",
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      durationMs: Date.now() - started
+    };
+  }
+
+  async verifyResponse(): Promise<boolean | null> {
+    return null;
+  }
+
+  async ensureFunds(): Promise<void> {}
 }
 
 function buildStyleProfile(prompt: string): Record<string, unknown> {
@@ -267,22 +348,82 @@ function buildStyleDelta(prompt: string): Record<string, unknown> {
   };
 }
 
+function buildDetailedStyleGuide(prompt: string): Record<string, unknown> {
+  const samples = extractTaggedBlocks(prompt, "sample");
+  const sampleText = samples.join("\n\n") || prompt;
+  const metadata = parsePromptMetadata(prompt);
+  const sourceContext = recordValue(metadata.sourceContext);
+  const sourceKind = stringValue(metadata.sourceKind) || stringValue(sourceContext.sourceKind) || "unknown";
+  const sentences = splitSentences(sampleText).filter((sentence) => sentence.trim().length >= 40);
+  const examples = (sentences.length > 0 ? sentences : [sampleText])
+    .slice(0, 4)
+    .map((sentence, index) => ({
+      label: `Example ${index + 1}`,
+      source_label: `Sample ${index + 1}`,
+      text: sentence.trim().slice(0, 260),
+      observed_patterns: ["Uses the uploaded creator text as the source for concrete style mechanics."]
+    }));
+
+  return {
+    guide_version: 1,
+    generated_by: "mock-compute",
+    source_type: sourceKind,
+    source_summary: mockAnalysisFocus(sourceKind),
+    source_preservation: {
+      full_input_stored_encrypted: true,
+      public_report_contains_selected_examples_only: true,
+      analyzed_unit_count: samples.length,
+      analyzed_character_count: sampleText.length
+    },
+    prompt_ready_style_brief: "Use a concrete, builder-first voice with clear causality, restrained claims, and specific nouns from the requested topic.",
+    voice_summary: "The voice is practical, technical, and careful about distinguishing real evidence from speculation.",
+    actual_examples: examples,
+    writing_patterns: {
+      length_and_density: "Medium-density paragraphs with direct explanatory movement.",
+      hooks_or_openings: ["Open with the concrete change or tension."],
+      structure: "State the visible mechanism, explain why it matters, then stop before overclaiming.",
+      line_breaks_or_sectioning: "Uses short blocks when the idea is dense.",
+      vocabulary_signals: distinctiveWords(sampleText, 10),
+      punctuation_and_casing: "Uses periods and colons more than decorative punctuation.",
+      emoji_hashtag_link_cta_usage: /[\u{1F300}-\u{1FAFF}]/u.test(sampleText) ? "Emoji appears in source material." : "No strong emoji pattern detected.",
+      argument_shape: "Concrete example followed by implication and caveat."
+    },
+    voice_rules: [
+      "Open with a concrete observation.",
+      "Use specific nouns from the user prompt, not from private examples.",
+      "Explain the mechanism behind the topic.",
+      "Avoid fake precision and unsupported motives.",
+      "Use short paragraphs when the idea is dense.",
+      "Keep the tone practical and reflective."
+    ],
+    avoid_rules: [
+      "Do not output instructions about how to write.",
+      "Do not copy source sentences wholesale.",
+      "Do not import project nouns from examples unless the user prompt asks for them.",
+      "Do not add hashtags, links, metrics, or names that were not supplied."
+    ],
+    generation_recipe: {
+      tweet: ["Write one finished tweet.", "Name the concrete shift.", "End with the useful implication, not a CTA unless the source uses one."],
+      thread: ["Use one idea per post.", "Move from mechanism to consequence."],
+      readme: ["Use clear headings.", "Avoid invented commands or APIs."],
+      article: ["Open with a thesis.", "Use short sections and restrained evidence."],
+      generic: ["Match cadence and reasoning shape without copying topic details."]
+    },
+    confidence: 0.7
+  };
+}
+
 function buildDraft(prompt: string): string {
   const topic = afterLabel(prompt, "Write content matching the voice above on the following topic:").replace(
     /Return only <draft>[\s\S]*$/i,
     ""
   );
   const cleanTopic = normalizeMockTopic(topic || "this topic");
-
-  return [
-    `${cleanTopic} is bigger than the headline. The useful question is what changed, who had to react, and which assumptions stopped being safe.`,
-    "The concrete part matters most: ownership changed, incentives shifted, and people who depended on the platform had to re-check what they could trust.",
-    "No fake precision, no invented motives, no pretending the consequences are settled. Say the visible mechanism plainly, then stop before speculation starts sounding like evidence."
-  ].join("\n\n");
+  return `${cleanTopic} changes the calculus. What took months now takes hours. The gap between experiment and outcome has compressed in a way that rewards iteration over planning.`;
 }
 
 function buildPlatformVariants(prompt: string): Record<string, string> {
-  const platforms = parseJsonArray(afterLabel(prompt, "Target platforms:")) ?? ["x", "linkedin", "instagram"];
+  const platforms = parseJsonArray(afterLabel(prompt, "Target platforms:")) ?? ["x", "thread", "instagram"];
   const draft = compact(between(prompt, "Draft to adapt:", "Required JSON keys:") || prompt);
 
   return Object.fromEntries(
@@ -290,13 +431,13 @@ function buildPlatformVariants(prompt: string): Record<string, string> {
       if (platform === "x") {
         return [platform, truncate(firstSentence(draft), 260)];
       }
-      if (platform === "linkedin") {
+      if (platform === "thread") {
         return [
           platform,
           [
-            firstSentence(draft),
-            "The important part is to keep the claim careful: name the mechanism, avoid fake precision, and separate what is visible from what is still interpretation.",
-            "That makes the post useful instead of just confident."
+            `1/3 ${truncate(firstSentence(draft), 256)}`,
+            "2/3 The useful part is the mechanism: creators upload samples, the system extracts style patterns, and the style becomes something others can license.",
+            "3/3 That makes AI style usage explicit: permissioned, attributable, and monetizable instead of silently scraped."
           ].join("\n\n")
         ];
       }
@@ -314,11 +455,13 @@ function buildPlatformVariants(prompt: string): Record<string, string> {
 function normalizeMockTopic(topic: string): string {
   const stripped = compact(topic)
     .replace(/^(write|draft|create|make)\s+(me\s+)?(a\s+|an\s+)?(post|tweet|thread|caption|linkedin post|article)?\s*(about|on|for)?\s*/i, "")
+    .replace(/^(a\s+|an\s+)?(post|tweet|thread|caption|linkedin post|article|blog|readme)\s+(about|on|for)\s+/i, "")
     .replace(/^about\s+/i, "")
     .replace(/[.?!]+$/, "")
     .trim();
   const normalized = rephraseMockHowSubject(stripped || "this topic")
     .replace(/\belon\s+(?:much|mush|musk)\b/gi, "Elon Musk")
+    .replace(/\belon\b/gi, "Elon Musk")
     .replace(/\bthe\s+x\b/gi, "X")
     .replace(/\bx\b/gi, "X")
     .replace(/\belon\s+musk\b/gi, "Elon Musk")
@@ -336,14 +479,24 @@ function rephraseMockHowSubject(input: string): string {
 }
 
 export function createComputeClient(): AgentCompute {
-  return process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live"
-    ? new ZeroGComputeClient()
-    : new MockComputeClient();
+  const mode = process.env.AGENT_COMPUTE_MODE?.trim().toLowerCase();
+  if (mode === "0g" || mode === "live") {
+    return new ZeroGComputeClient();
+  }
+  if (mode === "openai" || mode === "chatgpt") {
+    return new OpenAIComputeClient();
+  }
+  return new MockComputeClient();
 }
 
 function normalizeDirectBaseUrl(serviceUrl: string): string {
-  const trimmed = serviceUrl.replace(/\/$/, "");
-  return trimmed.endsWith("/v1/proxy") ? trimmed : `${trimmed}/v1/proxy`;
+  const trimmed = serviceUrl.replace(/\/+$/, "");
+  // Already has an explicit versioned path — use as-is
+  if (/\/v\d+(\/|$)/.test(trimmed)) {
+    return trimmed;
+  }
+  // 0G Compute proxy endpoints need /v1/proxy; everything else (OpenAI, Anthropic, etc.) uses /v1
+  return `${trimmed}/v1/proxy`;
 }
 
 function tokenUsage(usage: unknown): { inputTokens?: number; outputTokens?: number } {
@@ -352,6 +505,131 @@ function tokenUsage(usage: unknown): { inputTokens?: number; outputTokens?: numb
     inputTokens: numberValue(record.prompt_tokens) ?? numberValue(record.input_tokens),
     outputTokens: numberValue(record.completion_tokens) ?? numberValue(record.output_tokens)
   };
+}
+
+function firstConfiguredEnv(names: string[]): string {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+  throw new Error(`Missing required environment variable: ${names.join(" or ")}`);
+}
+
+function openAiModel(): string {
+  return (
+    process.env.OPENAI_MODEL?.trim() ||
+    process.env.CHATGPT_MODEL?.trim() ||
+    process.env.OG_COMPUTE_HIGH_QUALITY_MODEL?.trim() ||
+    process.env.OG_COMPUTE_GENERATION_MODEL?.trim() ||
+    DEFAULT_OPENAI_MODEL
+  );
+}
+
+function openAiReasoningEffort(): { effort: "low" | "medium" | "high" | "xhigh" } | undefined {
+  const effort = process.env.OPENAI_REASONING_EFFORT?.trim().toLowerCase();
+  if (effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh") {
+    return { effort };
+  }
+  return undefined;
+}
+
+function responsePromptFromMessages(messages: ChatMessage[]): { instructions: string; input: string } {
+  const instructions = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+    .join("\n\n");
+  const input = messages
+    .filter((message) => message.role !== "system")
+    .map((message) => `${message.role.toUpperCase()}:\n${message.content.trim()}`)
+    .filter((message) => message.trim().length > 0)
+    .join("\n\n");
+  return {
+    instructions,
+    input: input || messages.map((message) => message.content).join("\n\n")
+  };
+}
+
+async function withComputeRetries<T>(operation: () => Promise<T>, options?: ComputeRetryOptions): Promise<T> {
+  const configuredRetries = parsePositiveInt(optionalEnv("OG_COMPUTE_MAX_RETRIES", String(DEFAULT_COMPUTE_MAX_RETRIES)), DEFAULT_COMPUTE_MAX_RETRIES);
+  const maxRetries = Math.max(options?.maxRetries ?? configuredRetries, configuredRetries);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    await waitForComputeSlot();
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableComputeError(error) || attempt >= maxRetries) {
+        throw error;
+      }
+      await sleep(computeBackoffMs(error, attempt));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function waitForComputeSlot(): Promise<void> {
+  const minIntervalMs = parsePositiveInt(
+    optionalEnv("OG_COMPUTE_MIN_INTERVAL_MS", String(DEFAULT_COMPUTE_MIN_INTERVAL_MS)),
+    DEFAULT_COMPUTE_MIN_INTERVAL_MS
+  );
+  const previous = computeThrottleQueue.catch(() => undefined);
+  computeThrottleQueue = previous.then(async () => {
+    const waitMs = Math.max(0, lastComputeRequestAt + minIntervalMs - Date.now());
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+    lastComputeRequestAt = Date.now();
+  });
+  await computeThrottleQueue;
+}
+
+function isRetryableComputeError(error: unknown): boolean {
+  if (error instanceof ComputeHttpError) {
+    return error.status === 429 || error.status === 408 || error.status >= 500;
+  }
+  if (typeof error === "object" && error) {
+    const status = Number((error as { status?: unknown }).status ?? (error as { code?: unknown }).code);
+    if (status === 429 || status === 408 || status >= 500) return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /rate limit|429|temporarily unavailable|timeout|503|502|504/i.test(message);
+}
+
+function computeBackoffMs(error: unknown, attempt: number): number {
+  if (error instanceof ComputeHttpError && error.retryAfterMs) {
+    return error.retryAfterMs;
+  }
+  const base = parsePositiveInt(optionalEnv("OG_COMPUTE_RETRY_BASE_MS", "9000"), 9000);
+  const capped = Math.min(45_000, base * (attempt + 1));
+  return capped + Math.floor(Math.random() * 1000);
+}
+
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.ceil(seconds * 1000);
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isFinite(timestamp)) {
+    return Math.max(0, timestamp - Date.now());
+  }
+  return undefined;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function numberValue(value: unknown): number | undefined {

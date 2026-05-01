@@ -16,10 +16,18 @@ export type ChatResult = {
   providerAddress?: string;
   serviceUrl?: string;
   model?: string;
-  computePath?: "mock" | "direct" | "broker";
+  computePath?: "mock" | "direct" | "broker" | "openai";
   inputTokens?: number;
   outputTokens?: number;
   durationMs?: number;
+};
+
+export type ChatOptions = {
+  model?: string;
+  maxRetries?: number;
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
 };
 
 export type TransactionIntent = {
@@ -86,7 +94,7 @@ export interface AgentStorage {
 }
 
 export interface AgentCompute {
-  chat(messages: ChatMessage[], options?: { model?: string; maxRetries?: number; maxTokens?: number }): Promise<ChatResult>;
+  chat(messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult>;
   verifyResponse(content: string, chatId?: string): Promise<boolean | null>;
   ensureFunds(): Promise<void>;
 }

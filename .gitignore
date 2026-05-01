@@ -13,6 +13,8 @@ backend/.voices-storage-cache.json
 *.log
 *.swp
 *.tsbuildinfo
+__pycache__/
+*.pyc
 
 dist/
 build/

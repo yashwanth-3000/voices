@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
@@ -281,13 +282,13 @@ export default function DashboardPage() {
                               <td>{formatDate(style.marketplace.updatedAt)}</td>
                               <td>
                                 <div className="dashboardVoiceActions">
-                                  <a href={`/dashboard/styles/${encodeURIComponent(style.tokenId)}`}>
+                                  <Link href={`/dashboard/styles/${encodeURIComponent(style.tokenId)}`}>
                                     Inspect
-                                  </a>
+                                  </Link>
                                   {style.agentBrain?.manifestRootHash ? (
-                                    <a href={`/dashboard/styles/${encodeURIComponent(style.tokenId)}/agent-brain`}>
+                                    <Link href={`/dashboard/styles/${encodeURIComponent(style.tokenId)}/agent-brain`}>
                                       AgentBrain
-                                    </a>
+                                    </Link>
                                   ) : null}
                                 </div>
                               </td>

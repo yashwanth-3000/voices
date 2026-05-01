@@ -83,6 +83,12 @@ const WalletContext = createContext<WalletState | null>(null);
 // ─── 0G RPC helpers ───────────────────────────────────────────────────────────
 const OG_RPC = "https://evmrpc-testnet.0g.ai";
 
+function firstAccount(raw: unknown): string | null {
+  if (!Array.isArray(raw)) return null;
+  const account = raw.find((item): item is string => typeof item === "string" && item.length > 0);
+  return account ?? null;
+}
+
 async function fetchBalance(addr: string): Promise<string | null> {
   try { return parseFloat(formatEther(await new JsonRpcProvider(OG_RPC).getBalance(addr))).toFixed(4); }
   catch { return null; }
@@ -155,6 +161,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       // Restore active provider if this is the last-used wallet
       if (info.rdns === ls.rdns() && !activeProvider.current) {
         activeProvider.current = provider;
+        setConnectedWalletName(info.name);
       }
     }
 
@@ -174,7 +181,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         };
         seen.set("injected", fallback);
         setAvailableWallets([...seen.values()]);
-        if (!activeProvider.current) activeProvider.current = window.ethereum;
+        if (!activeProvider.current) {
+          activeProvider.current = window.ethereum;
+          setConnectedWalletName(fallback.name);
+        }
       }
     }, 100);
 
@@ -194,15 +204,31 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (typeof window === "undefined" || !window.ethereum) return;
     const eth = window.ethereum;
+    const rdns = ls.rdns() ?? "injected";
 
     function onAccountsChanged(raw: unknown) {
-      const accs = raw as string[];
-      if (!accs.length) { setAddress(null); setChainId(null); ls.clear(); }
-      else { setAddress(accs[0]); localStorage.setItem(ADDR_KEY, accs[0]); }
+      const account = firstAccount(raw);
+      if (!account) {
+        setAddress(null);
+        setBalance(null);
+        setCredits(null);
+        setChainId(null);
+        setConnectedWalletName(null);
+        ls.clear();
+        return;
+      }
+      setAddress(account);
+      void getChainId(eth).then((cid) => {
+        const nextChainId = cid ?? OG_CHAIN_ID;
+        setChainId(nextChainId);
+        ls.save(account, nextChainId, rdns);
+      });
     }
     function onChainChanged(hex: unknown) {
       const cid = parseInt(hex as string, 16);
-      setChainId(cid); localStorage.setItem(CHAIN_KEY, String(cid));
+      setChainId(cid);
+      const currentAddress = address ?? ls.addr();
+      if (currentAddress) ls.save(currentAddress, cid, rdns);
     }
 
     eth.on("accountsChanged", onAccountsChanged);
@@ -211,7 +237,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       eth.removeListener("accountsChanged", onAccountsChanged);
       eth.removeListener("chainChanged",    onChainChanged);
     };
-  }, []);
+  }, [address]);
 
   // ── Connect — the only place we call wallet.request() ──────────────────────
   const connect = useCallback(async (wallet: DetectedWallet) => {

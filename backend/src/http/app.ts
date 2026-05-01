@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import Fastify, { FastifyInstance, FastifyReply } from "fastify";
 import { detailedStyleGuidePrompt } from "../agents/prompts.js";
 import { AgentEvent, createUlid } from "../events/types.js";
+import { MockChainClient } from "../infra/chain.js";
 import { Orchestrator, createOrchestrator } from "../orchestrator/index.js";
 import { ChatResult } from "../infra/types.js";
 
@@ -81,10 +82,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   app.get("/styles", async (request) => {
-    const query = request.query as { ids?: string; max?: string };
+    const query = request.query as { ids?: string; max?: string; includeUnlisted?: string };
+    const max = clampPositiveInteger(query.max, 12, 50);
+    const liveChain = runtimeModes().chain === "0g";
     const ids = query.ids
       ? query.ids.split(",").map((id) => id.trim()).filter(Boolean)
-      : Array.from({ length: clampPositiveInteger(query.max, 12, 50) }, (_item, index) => String(index + 1));
+      : liveChain
+        ? Array.from({ length: max }, (_item, index) => String(index + 1))
+        : styleIdsWithLocalEvidence(orchestrator, max);
     const styles = await mapWithConcurrency(ids, 4, async (tokenId) => {
         try {
           return await styleDetails(orchestrator, tokenId);
@@ -92,10 +97,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           return null;
         }
       });
-    const discovered = styles.filter((style): style is NonNullable<typeof style> => Boolean(style));
+    const discovered = styles
+      .filter((style): style is NonNullable<typeof style> => Boolean(style))
+      .filter((style) => liveChain || styleHasBackendEvidence(style))
+      .filter((style) => query.includeUnlisted === "true" || style.chain.listed);
     discovered.sort(compareMarketplaceStyles);
     return {
-      source: runtimeModes().chain === "0g" ? "StyleRegistry.styleOf on 0G Chain" : "mock StyleRegistry",
+      source: liveChain ? "StyleRegistry.styleOf on 0G Chain" : "local backend evidence",
       scannedTokenIds: ids,
       profiledCount: discovered.filter((style) => Boolean(style.profile)).length,
       generatedCount: discovered.filter((style) => style.recentOutputs.length > 0).length,
@@ -154,7 +162,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const pendingStyleId = typeof body.pendingStyleId === "string" ? body.pendingStyleId : undefined;
 
     const style = await orchestrator.chain.styleOf(tokenId);
-    if (runtimeModes().chain === "0g" && style.creator.toLowerCase() !== walletAddress.toLowerCase()) {
+    if (runtimeModes().chain === "0g" && !(orchestrator.chain instanceof MockChainClient) && style.creator.toLowerCase() !== walletAddress.toLowerCase()) {
       throw new Error("Mint confirmation creator does not match connected wallet");
     }
     const receipt = await verifyOrFail(reply, () =>
@@ -180,32 +188,36 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       const pendingProfileKey = `style:${pendingStyleId}:profile`;
       const confirmedProfileKey = `style:${tokenId}:profile`;
       const pendingProfile = await orchestrator.storage.kvGet<Record<string, unknown>>(pendingProfileKey);
+      const confirmedWrites: Array<Promise<void>> = [];
       if (pendingProfile) {
-        void orchestrator.storage
-          .kvSet(confirmedProfileKey, {
+        confirmedWrites.push(
+          orchestrator.storage.kvSet(confirmedProfileKey, {
             ...pendingProfile,
             confirmedStyleId: tokenId,
             pendingStyleId,
             mintTxHash: txHash
           })
-          .catch((error) => {
-            request.log.warn({ error }, "background confirmed profile write failed");
-          });
+        );
       }
       const pendingAgentBrainKey = `style:${pendingStyleId}:agentBrain`;
       const confirmedAgentBrainKey = `style:${tokenId}:agentBrain`;
       const pendingAgentBrain = await orchestrator.storage.kvGet<Record<string, unknown>>(pendingAgentBrainKey);
       if (pendingAgentBrain) {
-        void orchestrator.storage
-          .kvSet(confirmedAgentBrainKey, {
+        confirmedWrites.push(
+          orchestrator.storage.kvSet(confirmedAgentBrainKey, {
             ...pendingAgentBrain,
             confirmedStyleId: tokenId,
             pendingStyleId,
             mintTxHash: txHash
           })
-          .catch((error) => {
-            request.log.warn({ error }, "background confirmed AgentBrain write failed");
-          });
+        );
+      }
+      if (confirmedWrites.length > 0) {
+        try {
+          await Promise.all(confirmedWrites);
+        } catch (error) {
+          request.log.warn({ error }, "confirmed style metadata write failed");
+        }
       }
     }
 
@@ -293,7 +305,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         consumerAddress: walletAddress,
         styleId,
         prompt: requireString(body.prompt, "prompt"),
-        platforms: Array.isArray(body.platforms) ? body.platforms : ["x", "linkedin", "instagram"]
+        platforms: sanitizeGenerationPlatforms(body.platforms),
+        ...(body.styleHint && typeof body.styleHint === "object" ? { styleHint: body.styleHint } : {})
       }
     });
     return reply.code(202).send({ requestId, eventId: event.id });
@@ -368,6 +381,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const send = (event: unknown) => {
       raw.write(`data: ${JSON.stringify(event)}\n\n`);
     };
+    raw.write(": connected\n\n");
+    const keepAlive = setInterval(() => {
+      raw.write(": ping\n\n");
+    }, 15_000);
     for (const event of orchestrator.eventsForRequest(params.requestId)) {
       send(event);
     }
@@ -376,7 +393,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         send(event);
       }
     });
-    request.raw.on("close", unsubscribe);
+    request.raw.on("close", () => {
+      clearInterval(keepAlive);
+      unsubscribe();
+    });
   });
 
   return app;
@@ -392,15 +412,63 @@ async function verifyOrFail<T>(reply: FastifyReply, verify: () => Promise<T>): P
   }
 }
 
+type KvLookup<T> = { key: string; value: T } | { key?: undefined; value: null };
+
+async function firstStoredKv<T>(orchestrator: Orchestrator, keys: Array<string | undefined>): Promise<KvLookup<T>> {
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const value = await orchestrator.storage.kvGet<T>(key);
+    if (value) {
+      return { key, value };
+    }
+  }
+  return { value: null };
+}
+
+function kvKeyFromUri(uri: string | undefined): string | undefined {
+  const prefix = "0g://kv/";
+  if (!uri?.startsWith(prefix)) {
+    return undefined;
+  }
+  const key = uri.slice(prefix.length);
+  return key.length > 0 ? key : undefined;
+}
+
+function pendingStyleIdFromProfileKey(key: string | undefined): string | undefined {
+  const prefix = "style:";
+  const suffix = ":profile";
+  if (!key?.startsWith(prefix) || !key.endsWith(suffix)) {
+    return undefined;
+  }
+  const styleId = key.slice(prefix.length, -suffix.length);
+  return styleId.startsWith("pending:") ? styleId : undefined;
+}
+
 async function styleDetails(orchestrator: Orchestrator, tokenId: string) {
   const style = await orchestrator.chain.styleOf(tokenId);
-  const profileKey = `style:${tokenId}:profile`;
-  const agentBrainKey = `style:${tokenId}:agentBrain`;
-  const [storedProfile, agentBrain, recentOutputs] = await Promise.all([
-    orchestrator.storage.kvGet<Record<string, unknown>>(profileKey),
-    orchestrator.storage.kvGet<Record<string, unknown>>(agentBrainKey),
+  const confirmedProfileKey = `style:${tokenId}:profile`;
+  const chainProfileKey = kvKeyFromUri(style.profileURI);
+  const [profileLookup, recentOutputs] = await Promise.all([
+    firstStoredKv<Record<string, unknown>>(orchestrator, [confirmedProfileKey, chainProfileKey]),
     recentOutputsForStyle(orchestrator, tokenId, style.creator)
   ]);
+  const storedProfile = profileLookup.value;
+  const pendingStyleId =
+    stringField(storedProfile, "pendingStyleId") ??
+    pendingStyleIdFromProfileKey(profileLookup.key) ??
+    pendingStyleIdFromProfileKey(chainProfileKey);
+  const confirmedAgentBrainKey = `style:${tokenId}:agentBrain`;
+  const agentBrainLookup = await firstStoredKv<Record<string, unknown>>(orchestrator, [
+    confirmedAgentBrainKey,
+    pendingStyleId ? `style:${pendingStyleId}:agentBrain` : undefined
+  ]);
+  const agentBrain = agentBrainLookup.value;
+  const profileKey = profileLookup.key ?? confirmedProfileKey;
+  const agentBrainKey = agentBrainLookup.key ?? confirmedAgentBrainKey;
   const profile = enrichProfileForResponse(storedProfile);
   const manifestRootHash =
     stringField(agentBrain, "manifest_root_hash") ??
@@ -441,6 +509,7 @@ async function styleDetails(orchestrator: Orchestrator, tokenId: string) {
       metadataHash: style.metadataHash
     },
     profileKey,
+    agentBrainKey,
     profile,
     agentBrain: normalizedAgentBrain,
     marketplace: marketplaceSummary({ tokenId, profile, agentBrain: normalizedAgentBrain, recentOutputs, listed: style.listed }),
@@ -451,10 +520,42 @@ async function styleDetails(orchestrator: Orchestrator, tokenId: string) {
   };
 }
 
+function styleIdsWithLocalEvidence(orchestrator: Orchestrator, max: number): string[] {
+  const ids = new Set<string>();
+  for (const event of orchestrator.events.allEvents()) {
+    for (const candidate of [
+      event.styleId,
+      stringField(event.payload, "styleId"),
+      stringField(event.payload, "tokenId")
+    ]) {
+      const tokenId = normalizeListedTokenId(candidate);
+      if (tokenId) {
+        ids.add(tokenId);
+      }
+    }
+  }
+  return [...ids].slice(0, max);
+}
+
+function normalizeListedTokenId(value: string | undefined): string | undefined {
+  const tokenId = value?.trim();
+  if (!tokenId || tokenId.startsWith("pending:")) {
+    return undefined;
+  }
+  return /^\d+$/.test(tokenId) ? tokenId : undefined;
+}
+
+function styleHasBackendEvidence(style: Awaited<ReturnType<typeof styleDetails>>): boolean {
+  return Boolean(style.profile || style.agentBrain || style.recentOutputs.length > 0);
+}
+
 async function regenerateDetailedStyleGuide(orchestrator: Orchestrator, tokenId: string) {
   const style = await orchestrator.chain.styleOf(tokenId);
-  const profileKey = `style:${tokenId}:profile`;
-  const storedProfile = await orchestrator.storage.kvGet<Record<string, unknown>>(profileKey);
+  const confirmedProfileKey = `style:${tokenId}:profile`;
+  const chainProfileKey = kvKeyFromUri(style.profileURI);
+  const profileLookup = await firstStoredKv<Record<string, unknown>>(orchestrator, [confirmedProfileKey, chainProfileKey]);
+  const profileKey = profileLookup.key ?? confirmedProfileKey;
+  const storedProfile = profileLookup.value;
   if (!storedProfile) {
     throw new Error(`No stored profile found for token ${tokenId}`);
   }
@@ -486,8 +587,17 @@ async function regenerateDetailedStyleGuide(orchestrator: Orchestrator, tokenId:
   };
   await orchestrator.storage.kvSet(profileKey, updatedProfile);
 
-  const agentBrainKey = `style:${tokenId}:agentBrain`;
-  const agentBrain = await orchestrator.storage.kvGet<Record<string, unknown>>(agentBrainKey);
+  const pendingStyleId =
+    stringField(storedProfile, "pendingStyleId") ??
+    pendingStyleIdFromProfileKey(profileLookup.key) ??
+    pendingStyleIdFromProfileKey(chainProfileKey);
+  const confirmedAgentBrainKey = `style:${tokenId}:agentBrain`;
+  const agentBrainLookup = await firstStoredKv<Record<string, unknown>>(orchestrator, [
+    confirmedAgentBrainKey,
+    pendingStyleId ? `style:${pendingStyleId}:agentBrain` : undefined
+  ]);
+  const agentBrainKey = agentBrainLookup.key ?? confirmedAgentBrainKey;
+  const agentBrain = agentBrainLookup.value;
   if (agentBrain) {
     await orchestrator.storage.kvSet(agentBrainKey, {
       ...agentBrain,
@@ -860,19 +970,25 @@ async function buildProofBundle(orchestrator: Orchestrator, requestId: string) {
 
 function renderProofHtml(proof: unknown): string {
   const record = proof && typeof proof === "object" ? proof as Record<string, unknown> : {};
-  const evidenceLinks = Array.isArray(record.evidence_links) ? record.evidence_links : [];
-  const computeCalls = Array.isArray(record.compute_calls) ? record.compute_calls : [];
-  const agentTrail = Array.isArray(record.agent_trail) ? record.agent_trail : [];
-  const links = evidenceLinks
-    .map((item) => {
-      if (!item || typeof item !== "object") return "";
-      const link = item as Record<string, unknown>;
-      const label = typeof link.label === "string" ? link.label : "Evidence";
-      const url = typeof link.url === "string" ? link.url : "";
-      return url ? `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>` : "";
-    })
-    .filter(Boolean)
-    .join("");
+  const evidenceLinks = arrayValue(record.evidence_links);
+  const computeCalls = arrayValue(record.compute_calls);
+  const agentTrail = arrayValue(record.agent_trail);
+  const receipts = arrayValue(record.receipt_verifications);
+  const chain = recordValue(record.chain);
+  const agentBrain = recordValue(record.agent_brain);
+  const runtime = recordValue(record.runtime);
+  const actor = recordValue(record.actor);
+  const requestId = stringValue(record.request_id, "unknown");
+  const status = stringValue(record.status, "unknown");
+  const workflow = stringValue(record.workflow_kind, "unknown");
+  const startedAt = stringValue(record.started_at);
+  const completedAt = stringValue(record.completed_at);
+  const duration = proofDuration(startedAt, completedAt);
+  const tokenId = stringValue(chain.token_id, "unknown");
+  const settlementTx = stringValue(chain.settlement_tx_hash);
+  const mintTx = stringValue(chain.mint_tx_hash);
+  const statusClass = proofStatusClass(status);
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -880,37 +996,476 @@ function renderProofHtml(proof: unknown): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Voices Proof ${escapeHtml(String(record.request_id ?? ""))}</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: #0d1117; color: #e6edf3; }
-    main { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 36px 0 48px; }
-    h1 { margin: 0 0 6px; font-size: 28px; letter-spacing: 0; }
-    h2 { margin: 28px 0 12px; font-size: 18px; letter-spacing: 0; }
-    p { margin: 0; color: #9da7b3; }
-    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 20px; }
-    .box { border: 1px solid #30363d; background: #161b22; border-radius: 8px; padding: 14px; overflow-wrap: anywhere; }
-    .label { color: #8b949e; font-size: 12px; text-transform: uppercase; }
-    .value { margin-top: 6px; font-size: 15px; }
-    a { color: #58a6ff; display: inline-block; margin: 0 10px 10px 0; }
-    pre { white-space: pre-wrap; word-break: break-word; border: 1px solid #30363d; background: #010409; border-radius: 8px; padding: 14px; overflow: auto; }
+    :root {
+      color-scheme: dark;
+      --bg: #090d12;
+      --panel: #101720;
+      --panel2: #141e29;
+      --line: rgba(148, 163, 184, .22);
+      --text: #edf3f8;
+      --muted: #9aa9b8;
+      --soft: #c9d5df;
+      --accent: #ff7a45;
+      --accent2: #64d2ff;
+      --green: #76e39a;
+      --red: #ff8a8a;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 18% -8%, rgba(255, 122, 69, .22), transparent 32rem),
+        radial-gradient(circle at 84% 4%, rgba(100, 210, 255, .12), transparent 30rem),
+        linear-gradient(180deg, #0d1117 0%, #090d12 52%, #070a0f 100%);
+      color: var(--text);
+    }
+    a { color: inherit; text-decoration: none; }
+    main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 34px 0 56px; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 900; letter-spacing: 0; }
+    .brandMark {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), #ffd0b6);
+      box-shadow: 0 12px 36px rgba(255, 122, 69, .22);
+    }
+    .toplink {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 9px 13px;
+      color: var(--soft);
+      font-size: 13px;
+      background: rgba(16, 23, 32, .72);
+    }
+    .hero {
+      border: 1px solid rgba(255, 255, 255, .1);
+      border-radius: 22px;
+      padding: 26px;
+      background: linear-gradient(135deg, rgba(20, 30, 41, .92), rgba(12, 17, 24, .88));
+      box-shadow: 0 24px 80px rgba(0, 0, 0, .28);
+      overflow: hidden;
+    }
+    .heroTop { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; }
+    .eyebrow { color: var(--accent2); font-size: 12px; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    h1 { margin: 8px 0 8px; font-size: clamp(32px, 5vw, 56px); line-height: .96; letter-spacing: 0; }
+    p { margin: 0; color: var(--muted); line-height: 1.55; }
+    .request { margin-top: 10px; color: var(--soft); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+    .statusPill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 850;
+      background: rgba(255, 255, 255, .05);
+      white-space: nowrap;
+    }
+    .statusPill:before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--muted);
+      box-shadow: 0 0 0 4px rgba(154, 169, 184, .12);
+    }
+    .status-settled:before, .status-success:before { background: var(--green); box-shadow: 0 0 0 4px rgba(118, 227, 154, .15); }
+    .status-failed:before { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 138, 138, .15); }
+    .heroGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 22px; }
+    .metric {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .045);
+      border-radius: 14px;
+      padding: 14px;
+      min-height: 86px;
+      overflow-wrap: anywhere;
+    }
+    .metric span, .label { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; font-weight: 800; }
+    .metric strong { display: block; margin-top: 8px; color: var(--text); font-size: 16px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 16px; margin-top: 16px; align-items: start; }
+    .section, .sideCard {
+      border: 1px solid var(--line);
+      background: rgba(16, 23, 32, .82);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 18px 54px rgba(0, 0, 0, .18);
+    }
+    .section + .section, .sideCard + .sideCard { margin-top: 16px; }
+    .sectionHead { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 14px; }
+    h2 { margin: 0; font-size: 18px; letter-spacing: 0; }
+    .count { color: var(--muted); font-size: 12px; font-weight: 800; }
+    .chainGrid, .brainGrid, .runtimeGrid { display: grid; gap: 10px; }
+    .chainGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .kv {
+      border: 1px solid rgba(148, 163, 184, .16);
+      background: rgba(255, 255, 255, .035);
+      border-radius: 12px;
+      padding: 12px;
+      overflow-wrap: anywhere;
+    }
+    .kv strong { display: block; margin-top: 6px; color: var(--soft); font-size: 13px; line-height: 1.35; }
+    .linkGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+    .proofLink {
+      display: block;
+      border: 1px solid rgba(100, 210, 255, .22);
+      background: rgba(100, 210, 255, .07);
+      border-radius: 14px;
+      padding: 13px;
+      color: #d9f4ff;
+    }
+    .proofLink span { display: block; color: rgba(217, 244, 255, .68); font-size: 11px; margin-top: 6px; overflow-wrap: anywhere; }
+    .timeline { position: relative; display: grid; gap: 10px; }
+    .step {
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr);
+      gap: 10px;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--accent2); margin: 5px auto 0; box-shadow: 0 0 0 4px rgba(100, 210, 255, .13); }
+    .step[data-status="completed"] .dot { background: var(--green); box-shadow: 0 0 0 4px rgba(118, 227, 154, .13); }
+    .step[data-status="failed"] .dot { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 138, 138, .13); }
+    .stepCard {
+      border: 1px solid rgba(148, 163, 184, .16);
+      background: rgba(255, 255, 255, .035);
+      border-radius: 13px;
+      padding: 12px;
+    }
+    .stepTop { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+    .stepTop strong { font-size: 13px; }
+    .stepTop time { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+    .step p { margin-top: 5px; font-size: 13px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+    .tag {
+      border: 1px solid rgba(148, 163, 184, .18);
+      border-radius: 999px;
+      padding: 4px 7px;
+      color: var(--soft);
+      background: rgba(255, 255, 255, .04);
+      font-size: 11px;
+      font-weight: 800;
+    }
+    .computeList { display: grid; gap: 10px; }
+    .computeCard {
+      border: 1px solid rgba(255, 122, 69, .22);
+      background: rgba(255, 122, 69, .07);
+      border-radius: 14px;
+      padding: 13px;
+    }
+    .computeCard strong { display: block; font-size: 13px; }
+    .computeMeta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+    details {
+      border: 1px solid var(--line);
+      background: rgba(3, 7, 11, .74);
+      border-radius: 16px;
+      padding: 0;
+      overflow: hidden;
+    }
+    summary { cursor: pointer; list-style: none; padding: 15px 16px; font-weight: 850; }
+    summary::-webkit-details-marker { display: none; }
+    pre {
+      margin: 0;
+      border-top: 1px solid var(--line);
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #03070b;
+      color: #dce7ef;
+      padding: 16px;
+      overflow: auto;
+      max-height: 620px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .empty { color: var(--muted); font-size: 13px; }
+    @media (max-width: 860px) {
+      main { width: min(100% - 22px, 1180px); padding-top: 18px; }
+      .hero { padding: 18px; border-radius: 18px; }
+      .heroTop, .topbar { flex-direction: column; align-items: flex-start; }
+      .heroGrid, .layout, .chainGrid { grid-template-columns: 1fr; }
+      .computeMeta { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>Voices Proof Trail</h1>
-    <p>Request ${escapeHtml(String(record.request_id ?? "unknown"))}</p>
-    <section class="grid">
-      <div class="box"><div class="label">Workflow</div><div class="value">${escapeHtml(String(record.workflow_kind ?? "unknown"))}</div></div>
-      <div class="box"><div class="label">Status</div><div class="value">${escapeHtml(String(record.status ?? "unknown"))}</div></div>
-      <div class="box"><div class="label">Agent Steps</div><div class="value">${agentTrail.length}</div></div>
-      <div class="box"><div class="label">Compute Calls</div><div class="value">${computeCalls.length}</div></div>
+    <div class="topbar">
+      <div class="brand"><span class="brandMark" aria-hidden="true"></span><span>Voices Proof Trail</span></div>
+      <a class="toplink" href="/styles/${escapeHtml(tokenId)}/try">Back to style</a>
+    </div>
+
+    <section class="hero">
+      <div class="heroTop">
+        <div>
+          <div class="eyebrow">${escapeHtml(workflow)} workflow</div>
+          <h1>${escapeHtml(titleCase(status))}</h1>
+          <p>Verifiable record of the 0G agent workflow, voice evidence, compute calls, and on-chain settlement.</p>
+          <div class="request">${escapeHtml(requestId)}</div>
+        </div>
+        <div class="statusPill ${statusClass}">${escapeHtml(titleCase(status))}</div>
+      </div>
+      <div class="heroGrid">
+        ${proofMetric("Token", tokenId)}
+        ${proofMetric("Consumer", shortHash(stringValue(actor.wallet, "unknown")))}
+        ${proofMetric("Agent steps", String(agentTrail.length))}
+        ${proofMetric("Duration", duration)}
+      </div>
     </section>
-    <h2>Evidence Links</h2>
-    <div>${links || "<p>No external evidence links found yet.</p>"}</div>
-    <h2>Proof JSON</h2>
-    <pre>${escapeHtml(JSON.stringify(proof, null, 2))}</pre>
+
+    <div class="layout">
+      <div>
+        <section class="section">
+          <div class="sectionHead"><h2>On-Chain Settlement</h2><span class="count">${settlementTx ? "confirmed" : "pending"}</span></div>
+          <div class="chainGrid">
+            ${proofKv("Style token", tokenId)}
+            ${proofKv("Royalty status", titleCase(status))}
+            ${proofKv("Mint transaction", txLink(mintTx, stringValue(chain.mint_tx_explorer)), true)}
+            ${proofKv("Settlement transaction", txLink(settlementTx, stringValue(chain.settlement_tx_explorer)), true)}
+            ${proofKv("CreditSystem", shortHash(stringValue(chain.credit_system, "not recorded")))}
+            ${proofKv("RoyaltyVault", shortHash(stringValue(chain.royalty_vault, "not recorded")))}
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="sectionHead"><h2>Agent Timeline</h2><span class="count">${agentTrail.length} steps</span></div>
+          ${renderAgentTimeline(agentTrail)}
+        </section>
+      </div>
+
+      <aside>
+        <section class="sideCard">
+          <div class="sectionHead"><h2>Evidence</h2><span class="count">${evidenceLinks.length} links</span></div>
+          ${renderEvidenceLinks(evidenceLinks)}
+        </section>
+
+        <section class="sideCard">
+          <div class="sectionHead"><h2>AgentBrain</h2><span class="count">iNFT memory</span></div>
+          ${renderAgentBrain(agentBrain)}
+        </section>
+
+        <section class="sideCard">
+          <div class="sectionHead"><h2>Runtime</h2><span class="count">${escapeHtml(stringValue(runtime.costProfile, "runtime"))}</span></div>
+          <div class="runtimeGrid">
+            ${proofKv("Storage", stringValue(runtime.storage, "unknown"))}
+            ${proofKv("Compute", `${stringValue(runtime.compute, "unknown")} / ${stringValue(runtime.compute_path, "unknown")}`)}
+            ${proofKv("CrewAI", `${stringValue(runtime.crewai_compute, "unknown")} / ${stringValue(runtime.crewai_compute_path, "unknown")}`)}
+            ${proofKv("Chain", stringValue(runtime.chain, "unknown"))}
+          </div>
+        </section>
+
+        <section class="sideCard">
+          <div class="sectionHead"><h2>Compute Calls</h2><span class="count">${computeCalls.length}</span></div>
+          ${renderComputeCalls(computeCalls)}
+        </section>
+      </aside>
+    </div>
+
+    <section class="section">
+      <div class="sectionHead"><h2>Receipt Checks</h2><span class="count">${receipts.length}</span></div>
+      ${renderReceipts(receipts)}
+    </section>
+
+    <section class="section">
+      <details>
+        <summary>Raw proof JSON</summary>
+        <pre>${escapeHtml(JSON.stringify(proof, null, 2))}</pre>
+      </details>
+    </section>
   </main>
 </body>
 </html>`;
+}
+
+function proofMetric(label: string, value: string): string {
+  return `<div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value || "not recorded")}</strong></div>`;
+}
+
+function proofKv(label: string, value: string, html = false): string {
+  return `<div class="kv"><span class="label">${escapeHtml(label)}</span><strong>${html ? value : escapeHtml(value || "not recorded")}</strong></div>`;
+}
+
+function txLink(txHash: string, explorerUrl?: string): string {
+  if (!txHash) {
+    return escapeHtml("not recorded");
+  }
+  const href = explorerUrl || explorerTxUrl(txHash);
+  return `<a class="proofLink" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(shortHash(txHash))}<span>${escapeHtml(txHash)}</span></a>`;
+}
+
+function renderEvidenceLinks(items: unknown[]): string {
+  if (!items.length) {
+    return `<p class="empty">No external evidence links found yet.</p>`;
+  }
+  return `<div class="linkGrid">${items.map((item) => {
+    const link = recordValue(item);
+    const label = stringValue(link.label, "Evidence");
+    const url = stringValue(link.url);
+    if (!url) return "";
+    return `<a class="proofLink" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}<span>${escapeHtml(shortUrl(url))}</span></a>`;
+  }).join("")}</div>`;
+}
+
+function renderAgentBrain(agentBrain: Record<string, unknown>): string {
+  const manifestUrl = stringValue(agentBrain.manifest_url);
+  const manifestRoot = stringValue(agentBrain.manifest_root_hash);
+  return `<div class="brainGrid">
+    ${proofKv("Manifest root", manifestUrl && manifestRoot ? txLink(manifestRoot, manifestUrl) : shortHash(manifestRoot || "not recorded"), Boolean(manifestUrl && manifestRoot))}
+    ${proofKv("Manifest hash", shortHash(stringValue(agentBrain.manifest_hash, "not recorded")))}
+    ${proofKv("Profile KV", stringValue(agentBrain.profile_kv_key, "not recorded"))}
+    ${proofKv("Memory stream", stringValue(agentBrain.memory_log_stream, "not recorded"))}
+    ${proofKv("Key hash", shortHash(stringValue(agentBrain.key_hash, "not recorded")))}
+    ${proofKv("Wrap mode", stringValue(agentBrain.key_wrap_mode, "not recorded"))}
+  </div>`;
+}
+
+function renderAgentTimeline(items: unknown[]): string {
+  if (!items.length) {
+    return `<p class="empty">No agent activity has been recorded for this request.</p>`;
+  }
+  return `<div class="timeline">${items.map((item) => {
+    const step = recordValue(item);
+    const status = stringValue(step.status, "unknown");
+    const agent = titleCase(stringValue(step.agent, "agent").replaceAll("_", " "));
+    const tool = stringValue(step.tool, "tool");
+    const message = stringValue(step.message, "Agent step recorded.");
+    const timestamp = stringValue(step.timestamp);
+    const duration = numberValue(step.duration_ms);
+    return `<div class="step" data-status="${escapeHtml(status)}">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="stepCard">
+        <div class="stepTop"><strong>${escapeHtml(agent)}</strong><time>${escapeHtml(formatProofTime(timestamp))}</time></div>
+        <p>${escapeHtml(message)}</p>
+        <div class="tags">
+          <span class="tag">${escapeHtml(tool)}</span>
+          <span class="tag">${escapeHtml(status)}</span>
+          ${duration !== undefined ? `<span class="tag">${escapeHtml(formatMs(duration))}</span>` : ""}
+        </div>
+      </div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
+function renderComputeCalls(items: unknown[]): string {
+  if (!items.length) {
+    return `<p class="empty">No compute evidence was attached to this request.</p>`;
+  }
+  return `<div class="computeList">${items.map((item, index) => {
+    const compute = recordValue(item);
+    const purpose = stringValue(compute.purpose, `compute call ${index + 1}`);
+    const verified = stringValue(compute.teeVerified, "recorded");
+    return `<div class="computeCard">
+      <strong>${escapeHtml(titleCase(purpose.replaceAll("_", " ")))}</strong>
+      <div class="computeMeta">
+        ${proofKv("Model", stringValue(compute.model, "unknown"))}
+        ${proofKv("Path", stringValue(compute.path, stringValue(compute.computePath, "unknown")))}
+        ${proofKv("Chat ID", shortHash(stringValue(compute.chatId, "not recorded")))}
+        ${proofKv("Verified", verified)}
+        ${proofKv("Tokens", `${stringValue(compute.inputTokens, "?")} in / ${stringValue(compute.outputTokens, "?")} out`)}
+        ${proofKv("Duration", formatMs(numberValue(compute.durationMs) ?? 0))}
+      </div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
+function renderReceipts(items: unknown[]): string {
+  if (!items.length) {
+    return `<p class="empty">No receipt verifications are attached yet.</p>`;
+  }
+  return `<div class="linkGrid">${items.map((item) => {
+    const receipt = recordValue(item);
+    const events = arrayValue(receipt.events);
+    const txHash = stringValue(receipt.tx_hash);
+    return `<div class="kv">
+      <span class="label">${escapeHtml(stringValue(receipt.event_type, "receipt"))}</span>
+      <strong>${escapeHtml(shortHash(txHash || "not recorded"))}</strong>
+      <div class="tags">
+        ${numberValue(receipt.block_number) !== undefined ? `<span class="tag">block ${escapeHtml(String(numberValue(receipt.block_number)))}</span>` : ""}
+        <span class="tag">${events.length} event${events.length === 1 ? "" : "s"}</span>
+      </div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
+function proofDuration(startedAt: string, completedAt: string): string {
+  const start = Date.parse(startedAt);
+  const end = Date.parse(completedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+    return "not recorded";
+  }
+  return formatMs(end - start);
+}
+
+function proofStatusClass(status: string): string {
+  const normalized = status.toLowerCase();
+  if (normalized.includes("settled") || normalized.includes("minted") || normalized.includes("published")) return "status-settled";
+  if (normalized.includes("failed")) return "status-failed";
+  return "status-running";
+}
+
+function formatProofTime(value: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "unknown";
+  return new Intl.DateTimeFormat("en", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    month: "short",
+    day: "2-digit"
+  }).format(parsed);
+}
+
+function formatMs(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 ms";
+  if (value < 1000) return `${Math.round(value)} ms`;
+  const seconds = value / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds >= 10 ? 0 : 1)} sec`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}m ${rest}s`;
+}
+
+function shortHash(value: string): string {
+  if (!value || value.length <= 16) return value;
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+}
+
+function shortUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    return `${url.host}${url.pathname.length > 28 ? `${url.pathname.slice(0, 28)}...` : url.pathname}`;
+  } catch {
+    return shortHash(value);
+  }
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function stringValue(value: unknown, fallback = ""): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  return fallback;
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
 }
 
 function escapeHtml(value: string): string {
@@ -1068,6 +1623,32 @@ function stringArrayOrEmpty(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
     : [];
+}
+
+const GENERATION_PLATFORMS = new Set(["x", "thread", "instagram", "blog", "github_readme"]);
+
+function sanitizeGenerationPlatforms(value: unknown): string[] {
+  const requested = Array.isArray(value) ? value : ["x"];
+  for (const item of requested) {
+    const normalized = normalizeGenerationPlatform(item);
+    if (normalized && GENERATION_PLATFORMS.has(normalized)) {
+      return [normalized];
+    }
+  }
+  return ["x"];
+}
+
+function normalizeGenerationPlatform(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "twitter" || normalized === "tweet" || normalized === "tweets") return "x";
+  if (normalized === "x") return "x";
+  if (normalized === "thread" || normalized === "tweet_thread" || normalized === "twitter_thread") return "thread";
+  if (normalized === "linked_in" || normalized === "linkedin") return "thread";
+  if (normalized === "ig" || normalized === "instagram" || normalized === "caption") return "instagram";
+  if (normalized === "blogger" || normalized === "blogger_article" || normalized === "blog_article" || normalized === "article" || normalized === "blog") return "blog";
+  if (normalized === "github" || normalized === "github_readme" || normalized === "readme" || normalized === "github_readme_file") return "github_readme";
+  return normalized;
 }
 
 function sanitizeSourceMaterials(value: unknown): Array<Record<string, unknown>> {
@@ -1233,22 +1814,30 @@ function titleCase(value: string): string {
 }
 
 function runtimeModes() {
-  const computeLive = process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live";
+  const computeMode = process.env.AGENT_COMPUTE_MODE?.trim().toLowerCase();
+  const computeLive = computeMode === "0g" || computeMode === "live";
+  const computeOpenAI = computeMode === "openai" || computeMode === "chatgpt";
+  const crewAiComputeMode = (process.env.CREWAI_COMPUTE_MODE || process.env.VOICES_CREWAI_COMPUTE_MODE || "").trim().toLowerCase();
+  const crewAiComputeOpenAI = crewAiComputeMode === "openai" || crewAiComputeMode === "chatgpt";
   return {
     storage: process.env.AGENT_STORAGE_MODE === "0g" ? "0g" : "memory",
-    compute: computeLive ? "0g" : "mock",
+    compute: computeLive ? "0g" : computeOpenAI ? "openai" : "mock",
     compute_path: computeLive
       ? process.env.OG_COMPUTE_PROVIDER_ADDRESS
         ? "broker"
         : process.env.OG_COMPUTE_SERVICE_URL
           ? "direct"
           : "unconfigured"
-      : "mock",
+      : computeOpenAI
+        ? "openai_responses"
+        : "mock",
     chain: process.env.AGENT_CHAIN_MODE === "0g" || process.env.AGENT_CHAIN_MODE === "live" ? "0g" : "mock",
     checkpoint_flush: process.env.AGENT_CHECKPOINT_FLUSH_MODE === "0g" ? "0g" : "local_cache",
-    planner:
-      process.env.AGENT_LANGGRAPH_PLANNER_MODE ||
-      (process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live" ? "0g" : "deterministic"),
+    planner: process.env.AGENT_LANGGRAPH_PLANNER_MODE || "deterministic",
+    generation_runtime: "crewai",
+    crewai_mode: process.env.CREWAI_RUNTIME_MODE || "auto",
+    crewai_compute: crewAiComputeOpenAI ? "openai" : "runtime_compute",
+    crewai_compute_path: crewAiComputeOpenAI ? "openai_responses" : "compute_bridge",
     costProfile:
       process.env.AGENT_STORAGE_MODE === "0g" ||
       process.env.AGENT_COMPUTE_MODE === "0g" ||
@@ -1256,6 +1845,8 @@ function runtimeModes() {
       process.env.AGENT_CHAIN_MODE === "0g" ||
       process.env.AGENT_CHAIN_MODE === "live"
         ? "live_0g"
+        : computeOpenAI || crewAiComputeOpenAI
+          ? "live_openai"
         : "zero_cost_mock"
   };
 }
@@ -1327,6 +1918,7 @@ async function zeroGHealth() {
   const storageIndexer = process.env.OG_STORAGE_INDEXER_RPC || "https://indexer-storage-testnet-turbo.0g.ai";
   const serviceUrl = process.env.OG_COMPUTE_SERVICE_URL || null;
   const modes = runtimeModes();
+  const computeOpenAI = modes.compute === "openai";
   const [blockHeight, storageReachable, computeReachable] = await Promise.all([
     modes.chain === "0g" ? rpcBlockHeight(rpcUrl) : Promise.resolve(null),
     modes.storage === "0g" ? httpReachable(storageIndexer) : Promise.resolve(null),
@@ -1339,10 +1931,13 @@ async function zeroGHealth() {
     storage_indexer: storageIndexer,
     storage_indexer_reachable: storageReachable,
     storage_mode_live: process.env.AGENT_STORAGE_MODE === "0g",
-    compute_provider: process.env.OG_COMPUTE_PROVIDER_ADDRESS || null,
-    compute_service_url: serviceUrl,
+    compute_provider: computeOpenAI ? "openai" : process.env.OG_COMPUTE_PROVIDER_ADDRESS || null,
+    compute_service_url: computeOpenAI ? "https://api.openai.com/v1/responses" : serviceUrl,
     compute_provider_reachable: computeReachable,
-    compute_mode_live: process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live",
+    compute_mode_live: process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live" || process.env.AGENT_COMPUTE_MODE === "openai" || process.env.AGENT_COMPUTE_MODE === "chatgpt",
+    crewai_compute_provider: modes.crewai_compute === "openai" ? "openai" : modes.compute,
+    crewai_compute_service_url: modes.crewai_compute === "openai" ? "https://api.openai.com/v1/responses" : null,
+    crewai_compute_mode_live: modes.crewai_compute === "openai" || modes.compute === "0g" || modes.compute === "openai",
     chain_mode_live: process.env.AGENT_CHAIN_MODE === "0g" || process.env.AGENT_CHAIN_MODE === "live"
   };
 }

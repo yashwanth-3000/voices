@@ -285,78 +285,105 @@ export function contentGenerationPrompt(input: {
   styleProfile: unknown;
   prompt: string;
   excerpts: string[];
+  platforms: string[];
+  qualityRetry?: {
+    reason: string;
+  };
 }): ChatMessage[] {
+  const platforms = input.platforms.length > 0 ? input.platforms : ["x"];
+  const targetFormat = platforms[0] ?? "x";
+  const styleContract = buildGenerationStyleContract(input.styleProfile, targetFormat);
+  const profileSummary = buildSanitizedProfileSummary(input.styleProfile);
+  const transferStrategy = buildVoiceTransferStrategy(input.prompt, targetFormat, input.excerpts, styleContract, profileSummary);
   return [
     {
       role: "system",
       content: [
-        "You are the Content Creator agent in a creator-owned voice marketplace on 0G.",
-        "Your job is to write a fresh draft that matches the supplied style profile while preserving factual honesty and creator safety.",
+        "You are the Content Creator agent for Voices, a 0G-powered style marketplace.",
+        "Your job is not to summarize the user's topic. Your job is to perform style transfer: write the user's topic as if the selected creator wrote it.",
         "",
-        "Voice matching means matching:",
-        "- tone and emotional stance",
-        "- sentence rhythm and paragraph shape",
-        "- specificity level and preferred nouns",
-        "- rhetorical moves such as contrast, caveat, concrete example, escalation, or reframing",
-        "- opening and closing style",
+        "The style profile and examples are the evidence. Use them directly for tone, cadence, sentence shape, vocabulary register, openings, closings, line breaks, punctuation, emoji/hashtag habits, and structural rhythm.",
+        "Transfer the voice and mechanics. Do not transfer private subject matter unless the user also supplied that fact in the task.",
         "",
-        "Content-source boundary:",
-        "- The user prompt is the only source of topic/content for the draft.",
-        "- The style profile and few-shot examples are style references only. They are not evidence, not facts, and not reusable subject matter.",
-        "- Do not mention the examples' domain, product, architecture, wallet mechanics, event logs, 0G, iNFTs, profile hashes, settlement, encrypted samples, or agent workflows unless the user prompt itself asks for those things.",
-        "- If a word appears in the examples but not in the user prompt, treat it as style signal only, not content to include.",
+        "Work like an expert writing agent:",
+        "1. Silently extract the concrete facts and intent from the user's task.",
+        "2. Silently infer the strongest voice mechanics from the profile and examples.",
+        "3. Draft in that voice, then silently compare the draft against the examples for rhythm, structure, wording, and platform fit.",
+        "4. Revise internally until it sounds like the selected style instead of generic marketing copy.",
         "",
-        "Voice matching does not mean copying source wording. The examples are style-only references.",
-        "Do not reuse their topic, product nouns, architecture terms, claims, exact sentences, or signature phrases unless the user explicitly asks for that exact subject matter.",
-        "Never copy a full example sentence. Never stitch together fragments from examples. Transform cadence and reasoning style, not wording.",
+        "Quality bar:",
+        "- The output must be publishable as-is.",
+        "- Include the important facts from the user's topic; do not collapse a rich request into a vague announcement.",
+        "- Preserve factual boundaries. Do not add metrics, partnerships, product claims, links, commands, or APIs unless supplied.",
+        "- Let the supplied style evidence determine the register; do not substitute a generic task template.",
+        "- Prefer the creator's observed structure and vocabulary over category-default phrasing.",
+        "- Do not explain the style, mention these instructions, or output analysis.",
         "",
-        "Factuality rules:",
-        "- Never invent facts, dates, prices, metrics, quotes, named customers, partnerships, fundraises, legal claims, or private details.",
-        "- If the user gives a factual topic with missing details, write in a careful high-level way and avoid unsupported precision.",
-        "- If the requested topic is a real public person or company, avoid defamatory claims and avoid presenting uncertain claims as fact.",
-        "- If the user asks for a result that requires live facts, write only from the supplied prompt unless external facts are included.",
-        "- For public business/news topics, do not add dollar amounts, timelines, motives, governance outcomes, private-account claims, or legal interpretations unless the user supplied them.",
+        "FORMAT RULES:",
+        "- x/twitter: one finished tweet, 260 characters or fewer.",
+        "- thread: a finished tweet thread with 3 to 5 tweet blocks separated by blank lines. Do not include 1/N numbering. Aim for 160 to 220 characters per tweet when the user's material has enough detail.",
+        "- instagram: a caption-style draft, concrete and visually grounded when the topic supports it.",
+        "- blog: markdown with a useful title and sections.",
+        "- github_readme: markdown with practical sections. Do not invent commands or APIs.",
         "",
-        "Silent preflight before final output:",
-        "1. Does every concrete claim come from the user prompt or from broadly safe, high-level public context?",
-        "2. Did any noun from the examples leak into the draft as topic content?",
-        "3. Would the draft still make sense if the examples were never shown?",
-        "If any answer is no, rewrite before output.",
-        "",
-        "Style transfer rules:",
-        "- Use the profile's do_rules and dont_rules if present.",
-        "- Use detailed_style_guide first when present, especially prompt_ready_style_brief, writing_patterns, voice_rules, avoid_rules, actual_examples, and generation_recipe.",
-        "- Use source_profile when present. For X/tweets, follow twitter_profile and generation_guidelines_by_format.tweet/thread. For README/docs requests, follow readme_profile and generation_guidelines_by_format.readme. For blog/article requests, follow article_profile and generation_guidelines_by_format.article.",
-        "- Match the source-specific format mechanics: post length, line breaks, emoji/hashtag/CTA habits for tweets; heading hierarchy and code/example flow for READMEs; thesis, sections, evidence, and conclusion shape for articles.",
-        "- Keep the draft compact unless the user asks for long-form.",
-        "- Prefer concrete nouns and clear causality over hype.",
-        "- Do not explain your reasoning. Do not add preamble. Do not wrap the draft in quotation marks.",
-        "Output only the draft wrapped in <draft>...</draft> tags."
+        "Output only the draft inside <draft>...</draft> tags. Nothing else."
       ].join("\n")
     },
     {
       role: "user",
-      content: [
-        "Style profile to follow:",
-        JSON.stringify(input.styleProfile),
-        "Few-shot examples of this voice. Use them for style only, not content:",
-        ...input.excerpts.map((excerpt, index) => `<voice_example index="${index + 1}">\n${excerpt}\n</voice_example>`),
-        "Forbidden sample bleed unless explicitly present in the user topic: agent demo, workflow trail, style profile, profile hash, encrypted samples, 0G, iNFT, wallet, transaction, settlement, royalty, credit spend, event log.",
-        "Write content matching the voice above on the following topic:",
-        input.prompt,
-        "Return only <draft>...</draft> with no commentary."
-      ].join("\n\n")
+      content: buildGenerationUserMessage(input, styleContract, profileSummary, transferStrategy, targetFormat)
     }
   ];
 }
 
+function buildGenerationUserMessage(
+  input: { styleProfile: unknown; prompt: string; excerpts: string[]; qualityRetry?: { reason: string } },
+  styleContract: Record<string, unknown>,
+  profileSummary: Record<string, unknown>,
+  transferStrategy: Record<string, unknown>,
+  targetFormat: string
+): string {
+  const parts: string[] = [];
+
+  parts.push(`<target_format>${targetFormat}</target_format>`);
+  parts.push(["<style_contract_json>", JSON.stringify(styleContract, null, 2), "</style_contract_json>"].join("\n"));
+  parts.push(["<profile_summary_json>", JSON.stringify(profileSummary, null, 2), "</profile_summary_json>"].join("\n"));
+  parts.push(["<voice_transfer_strategy_json>", JSON.stringify(transferStrategy, null, 2), "</voice_transfer_strategy_json>"].join("\n"));
+
+  parts.push("<creator_style_examples>");
+  if (input.excerpts.length > 0) {
+    input.excerpts.forEach((excerpt, index) => {
+      parts.push(`<example index="${index + 1}">\n${excerpt.slice(0, 1200)}\n</example>`);
+    });
+  } else {
+    parts.push("No raw examples were available; rely on the style profile contract.");
+  }
+  parts.push("</creator_style_examples>");
+
+  if (input.qualityRetry) {
+    parts.push(`<previous_attempt_note>${input.qualityRetry.reason}</previous_attempt_note>`);
+  }
+
+  parts.push([
+    "<user_task>",
+    input.prompt,
+    "</user_task>",
+    "<final_instruction>",
+    "Write the final draft now in the selected creator voice. Use the examples as the voice anchor, the transfer strategy as the shape, and the user task as the factual source. Return only <draft>...</draft>.",
+    "</final_instruction>"
+  ].join("\n"));
+
+  return parts.join("\n\n");
+}
+
 export function platformTuningPrompt(draft: string, platforms: string[]): ChatMessage[] {
+  const requested = platforms.length > 0 ? platforms : ["x"];
   return [
     {
       role: "system",
       content: [
         "You are the Distribution Manager agent for a style marketplace.",
-        "Transform one approved draft into platform-specific variants while preserving the original meaning, voice fingerprint, and factual boundaries.",
+        "Transform one approved draft into the single requested platform output while preserving the original meaning, voice fingerprint, and factual boundaries.",
         "Do not add new facts, stats, claims, names, hashtags, or links that are not supported by the draft.",
         "Do not add 0G/iNFT/agent/workflow/platform-demo language unless it is already in the draft.",
         "Do not add public-person claims, dollar amounts, or causal explanations that are not already in the draft.",
@@ -364,15 +391,18 @@ export function platformTuningPrompt(draft: string, platforms: string[]): ChatMe
         "Return one JSON object only. No markdown, no code fences, no commentary.",
         "",
         "Platform rules:",
-        "For x: stay at or under 260 characters to leave safety margin, make the first clause strong, preserve one clear idea, and use at most one hashtag only if it adds value.",
-        "For linkedin: use a polished professional tone, 900 characters or fewer, short paragraphs, no fake metrics, no overclaiming, and a clear final sentence.",
-        "For instagram: write a caption-style variant, 1 to 3 short paragraphs, concrete rather than generic, with up to 8 relevant hashtags at the end.",
+        "For x: return exactly one tweet, stay at or under 260 characters to leave safety margin, make the first clause strong, preserve one clear idea, and use hashtags/emoji only if they are already supported by the voice.",
+        "For thread: return a tweet thread as one string with 3 to 5 tweets separated by blank lines. Do not include 1/N numbering; each tweet should carry one idea and aim for 160 to 220 characters when the draft has enough substance.",
+        "For instagram: write a caption-style variant, 1 to 3 short paragraphs, concrete rather than generic, and include hashtags only if the draft or voice supports hashtag use.",
+        "For blog: write a markdown article with a title, section headings, coherent flow, and no unsupported facts.",
+        "For github_readme: write markdown README content with practical sections. Do not invent install commands, API references, repo names, badges, or environment variables.",
         "For unknown platforms: keep the same voice, make it concise, and use the exact requested key.",
         "",
         "Output validation rules:",
         "The response must parse as JSON.",
         "The object must contain exactly the requested platform keys.",
         "Every value must be a string.",
+        "Every value must be final publishable content, not advice or writing instructions.",
         "Do not include extra keys such as notes, rationale, or warnings.",
         "If a constraint conflicts with the draft, preserve factual accuracy first and platform polish second."
       ].join("\n")
@@ -380,12 +410,274 @@ export function platformTuningPrompt(draft: string, platforms: string[]): ChatMe
     {
       role: "user",
       content: [
-        `Target platforms: ${JSON.stringify(platforms)}`,
+        `Target platforms: ${JSON.stringify(requested)}`,
         "Draft to adapt:",
         draft,
-        `Required JSON keys: ${JSON.stringify(platforms)}`,
+        `Required JSON keys: ${JSON.stringify(requested)}`,
         "Return exactly the requested keys with string values."
       ].join("\n\n")
     }
   ];
+}
+
+function buildGenerationStyleContract(profile: unknown, targetFormat: string): Record<string, unknown> {
+  const root = recordValue(profile);
+  const guide = recordValue(root.detailed_style_guide);
+  const sourceProfile = recordValue(root.source_profile);
+  const voiceFingerprint = recordValue(root.voice_fingerprint);
+  const guideRecipe = recordValue(guide.generation_recipe);
+  const sourceGuidelines = recordValue(sourceProfile.generation_guidelines_by_format);
+  const writingPatterns = recordValue(guide.writing_patterns);
+
+  return {
+    target_format: targetFormat,
+    primary_source_type: stringValue(sourceProfile.primary_source_type, stringValue(guide.source_type, stringValue(root.sourceKind, "unknown"))),
+    voice_essence: stringValue(root.voice_essence, stringValue(voiceFingerprint.fingerprint_text, "")),
+    prompt_ready_style_brief: stringValue(guide.prompt_ready_style_brief, stringValue(voiceFingerprint.fingerprint_text, "")),
+    writing_patterns: {
+      length_and_density: stringValue(writingPatterns.length_and_density, stringValue(recordValue(root.sentence_rhythm).average_sentence_length, "")),
+      hooks_or_openings: stringArray(writingPatterns.hooks_or_openings).concat(stringArray(recordValue(root.structural_patterns).openings).filter((s) => s.length < 80)).slice(0, 8),
+      structure: stringValue(writingPatterns.structure, stringValue(recordValue(root.structural_patterns).argument_shape, "")),
+      line_breaks_or_sectioning: stringValue(writingPatterns.line_breaks_or_sectioning, stringValue(recordValue(root.structural_patterns).paragraphing, "")),
+      vocabulary_signals: stringArray(writingPatterns.vocabulary_signals).concat(stringArray(recordValue(root.vocabulary).distinctive_words)).slice(0, 16),
+      punctuation_and_casing: stringValue(writingPatterns.punctuation_and_casing, ""),
+      emoji_hashtag_link_cta_usage: stringValue(writingPatterns.emoji_hashtag_link_cta_usage, ""),
+      argument_shape: stringValue(writingPatterns.argument_shape, stringValue(recordValue(root.structural_patterns).argument_shape, ""))
+    },
+    voice_rules: stringArray(guide.voice_rules).concat(stringArray(root.do_rules)).concat(stringArray(root.doRules)).slice(0, 18),
+    avoid_rules: stringArray(guide.avoid_rules).concat(stringArray(root.dont_rules)).concat(stringArray(root.dontRules)).slice(0, 16),
+    target_format_recipe: recipeForTarget(targetFormat, guideRecipe, sourceGuidelines),
+    example_derived_mechanics: exampleMechanics(guide.actual_examples),
+    source_analysis_focus: stringValue(sourceProfile.analysis_focus, stringValue(guide.source_summary, "")),
+    confidence: root.confidence ?? guide.confidence
+  };
+}
+
+function buildVoiceTransferStrategy(
+  prompt: string,
+  targetFormat: string,
+  excerpts: string[],
+  styleContract: Record<string, unknown>,
+  profileSummary: Record<string, unknown>
+): Record<string, unknown> {
+  const writingPatterns = recordValue(styleContract.writing_patterns);
+  const profileStructure = recordValue(profileSummary.structural_patterns);
+  const profileVocabulary = recordValue(profileSummary.vocabulary);
+  const exampleMechanicSummary = recordValue(styleContract.example_derived_mechanics);
+  const exampleMechanicsRecord = recordValue(exampleMechanicSummary.mechanics);
+  const sourceType = stringValue(styleContract.primary_source_type, stringValue(recordValue(profileSummary.source_profile).primary_source_type, "unknown"));
+
+  return {
+    target_format: targetFormat,
+    source_type: sourceType,
+    user_task_terms: contentWords(prompt).slice(0, 16),
+    evidence_derived_shape: {
+      opening_candidates: stringArray(writingPatterns.hooks_or_openings)
+        .concat(stringArray(profileStructure.openings))
+        .concat(excerptOpenings(excerpts))
+        .slice(0, 10),
+      closing_candidates: stringArray(profileStructure.closings).concat(excerptClosings(excerpts)).slice(0, 8),
+      paragraphing: stringValue(profileStructure.paragraphing, stringValue(writingPatterns.line_breaks_or_sectioning, "")),
+      structure: stringValue(writingPatterns.structure, stringValue(profileStructure.argument_shape, "")),
+      argument_shape: stringValue(writingPatterns.argument_shape, stringValue(profileStructure.argument_shape, "")),
+      line_breaks_or_sectioning: stringValue(writingPatterns.line_breaks_or_sectioning, ""),
+      example_line_shape: summarizeLineShape(excerpts)
+    },
+    evidence_derived_register: {
+      voice_essence: stringValue(profileSummary.voice_essence, stringValue(styleContract.voice_essence, "")),
+      vocabulary_signals: stringArray(writingPatterns.vocabulary_signals)
+        .concat(stringArray(profileVocabulary.distinctive_words))
+        .slice(0, 18),
+      favorite_phrases: stringArray(profileVocabulary.favorite_phrases).slice(0, 8),
+      register_notes: stringValue(profileVocabulary.register_notes, ""),
+      punctuation_and_casing: writingPatterns.punctuation_and_casing,
+      emoji_hashtag_link_cta_usage: writingPatterns.emoji_hashtag_link_cta_usage
+    },
+    evidence_derived_mechanics: {
+      target_format_recipe: stringArray(styleContract.target_format_recipe),
+      observed_example_patterns: stringArray(exampleMechanicSummary.observed_patterns),
+      metrics: exampleMechanicsRecord
+    },
+    avoid_rules_from_profile: stringArray(styleContract.avoid_rules).concat(stringArray(profileSummary.dont_rules)).slice(0, 16),
+    adaptation_rules: [
+      "Choose the closest observed structure from evidence_derived_shape.",
+      "Map the user's facts into that observed structure without copying source-only facts.",
+      "Use evidence_derived_register for word choice, density, punctuation, and platform habits.",
+      "If evidence is weak or conflicting, prefer the explicit style profile over generic format conventions."
+    ]
+  };
+}
+
+function excerptOpenings(excerpts: string[]): string[] {
+  return excerpts.map((excerpt) => firstMeaningfulLine(excerpt)).filter(Boolean).slice(0, 6);
+}
+
+function excerptClosings(excerpts: string[]): string[] {
+  return excerpts.map((excerpt) => lastMeaningfulLine(excerpt)).filter(Boolean).slice(0, 6);
+}
+
+function firstMeaningfulLine(value: string): string {
+  return value.split(/\n+/).map((line) => line.trim()).find(Boolean)?.slice(0, 180) ?? "";
+}
+
+function lastMeaningfulLine(value: string): string {
+  const lines = value.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  return (lines.at(-1) ?? "").slice(0, 180);
+}
+
+function summarizeLineShape(excerpts: string[]): Record<string, unknown> {
+  const joined = excerpts.join("\n");
+  const lines = joined.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const bulletLines = lines.filter((line) => /^\s*(?:[-*•]|\d+[.)])\s+/.test(line)).length;
+  const hashtagCount = countMatches(joined, /#[\p{L}\p{N}_]+/gu);
+  const emojiCount = countMatches(joined, /[\u{1F300}-\u{1FAFF}]/gu);
+  return {
+    excerpt_count: excerpts.length,
+    non_empty_line_count: lines.length,
+    bullet_line_count: bulletLines,
+    has_bullets: bulletLines > 0,
+    has_line_breaks: lines.length > excerpts.length,
+    hashtag_count: hashtagCount,
+    emoji_count: emojiCount,
+    average_line_characters: lines.length > 0
+      ? Math.round(lines.reduce((total, line) => total + line.length, 0) / lines.length)
+      : 0
+  };
+}
+
+function contentWords(value: string): string[] {
+  const stop = new Set(["about", "with", "from", "into", "that", "this", "your", "have", "will", "what", "when", "where", "which", "write"]);
+  return value
+    .toLowerCase()
+    .match(/[a-z0-9][a-z0-9-]{2,}/g)
+    ?.filter((word) => !stop.has(word)) ?? [];
+}
+
+function buildSanitizedProfileSummary(profile: unknown): Record<string, unknown> {
+  const root = recordValue(profile);
+  const sourceProfile = recordValue(root.source_profile);
+  const voiceFingerprint = recordValue(root.voice_fingerprint);
+  const vocabulary = recordValue(root.vocabulary);
+  const rhythm = recordValue(root.sentence_rhythm);
+  const structure = recordValue(root.structural_patterns);
+  return {
+    tone: root.tone,
+    voice_essence: stringValue(root.voice_essence, stringValue(voiceFingerprint.fingerprint_text, "")),
+    vocabulary: {
+      distinctive_words: stringArray(vocabulary.distinctive_words).slice(0, 12),
+      favorite_phrases: stringArray(vocabulary.favorite_phrases).slice(0, 8),
+      register_notes: stringValue(vocabulary.register_notes, ""),
+      avoided_patterns: stringArray(vocabulary.avoided_patterns).slice(0, 8)
+    },
+    sentence_rhythm: {
+      average_sentence_length: rhythm.average_sentence_length,
+      variance: rhythm.variance,
+      cadence_notes: rhythm.cadence_notes,
+      compression_level: rhythm.compression_level,
+      punctuation_habits: stringArray(rhythm.punctuation_habits).slice(0, 8)
+    },
+    structural_patterns: {
+      openings: stringArray(structure.openings).filter((s) => s.length < 80).slice(0, 4),
+      closings: stringArray(structure.closings).filter((s) => s.length < 80).slice(0, 4),
+      paragraphing: structure.paragraphing,
+      transition_style: structure.transition_style,
+      argument_shape: structure.argument_shape
+    },
+    rhetorical_moves: stringArray(root.rhetorical_moves).slice(0, 12),
+    do_rules: stringArray(root.do_rules).concat(stringArray(root.doRules)).slice(0, 14),
+    dont_rules: stringArray(root.dont_rules).concat(stringArray(root.dontRules)).slice(0, 12),
+    source_profile: {
+      primary_source_type: sourceProfile.primary_source_type,
+      analysis_focus: sourceProfile.analysis_focus,
+      generation_guidelines_by_format: sourceProfile.generation_guidelines_by_format
+    }
+  };
+}
+
+function excerptMechanics(excerpts: string[]): Record<string, unknown> {
+  const joined = excerpts.join("\n\n");
+  const normalized = joined.replace(/\s+/g, " ").trim();
+  const sentences = normalized.match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [];
+  const lineCount = joined.split(/\n+/).filter((line) => line.trim()).length;
+  const bulletCount = joined.split(/\n+/).filter((line) => /^\s*(?:[-*•]|\d+[.)])\s+/.test(line)).length;
+  const avgSentenceChars = sentences.length > 0
+    ? Math.round(sentences.reduce((total, sentence) => total + sentence.length, 0) / sentences.length)
+    : 0;
+  return {
+    analyzed_excerpt_count: excerpts.length,
+    average_sentence_characters: avgSentenceChars,
+    has_line_breaks: lineCount > excerpts.length,
+    line_break_density: lineCount,
+    bullet_style_visible: bulletCount > 0,
+    punctuation_profile: {
+      question_marks: countMatches(joined, /\?/g),
+      exclamation_marks: countMatches(joined, /!/g),
+      colons: countMatches(joined, /:/g),
+      semicolons: countMatches(joined, /;/g),
+      em_dashes: countMatches(joined, /—/g)
+    }
+  };
+}
+
+function exampleMechanics(value: unknown): Record<string, unknown> {
+  const examples = exampleRecords(value);
+  return {
+    example_count: examples.length,
+    observed_patterns: examples
+      .flatMap((example) => stringArray(example.observed_patterns))
+      .slice(0, 16),
+    mechanics: excerptMechanics(examples.map((example) => stringValue(example.text, "")))
+  };
+}
+
+function countMatches(value: string, pattern: RegExp): number {
+  return value.match(pattern)?.length ?? 0;
+}
+
+function recipeForTarget(targetFormat: string, guideRecipe: Record<string, unknown>, sourceGuidelines: Record<string, unknown>): string[] {
+  const recipeKey = targetFormat === "x" ? "tweet" : targetFormat === "thread" ? "thread" : targetFormat === "github_readme" ? "readme" : targetFormat;
+  const sourceKey = targetFormat === "x" ? "tweet" : targetFormat === "thread" ? "thread" : targetFormat === "github_readme" ? "readme" : targetFormat;
+  return stringArray(guideRecipe[recipeKey])
+    .concat(stringArray(sourceGuidelines[sourceKey]))
+    .slice(0, 10);
+}
+
+function exampleRecords(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const records: Array<Record<string, unknown>> = [];
+  for (const item of value) {
+    if (typeof item === "string") {
+      records.push({ text: item.slice(0, 500), observed_patterns: [] });
+      continue;
+    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const text = stringValue(record.text, stringValue(record.example, ""));
+    if (!text) {
+      continue;
+    }
+    records.push({
+        label: stringValue(record.label, undefined),
+        source_label: stringValue(record.source_label, undefined),
+        text: text.slice(0, 500),
+        observed_patterns: stringArray(record.observed_patterns).slice(0, 6)
+    });
+  }
+  return records;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function stringValue(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }

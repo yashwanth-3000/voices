@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 export function Footer() {
   return (
     <footer className="footer">
@@ -16,11 +18,11 @@ export function Footer() {
             </p>
           </div>
           <div className="miniLinks" aria-label="Footer links">
-            <a href="#how">How it works</a>
-            <a href="#featured">Featured</a>
-            <a href="#creators">Creators</a>
-            <a href="#explorers">Explore</a>
-            <a href="/wallet">Upload</a>
+            <Link href="/#how">How it works</Link>
+            <Link href="/#featured">Featured</Link>
+            <Link href="/#creators">Creators</Link>
+            <Link href="/#explorers">Explore</Link>
+            <Link href="/upload">Upload</Link>
           </div>
         </div>
         <p className="fine">© {new Date().getFullYear()} Voices</p>
@@ -28,4 +30,3 @@ export function Footer() {
     </footer>
   );
 }
-

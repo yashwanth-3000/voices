@@ -66,8 +66,26 @@ export class MockChainClient implements AgentChain {
     return {
       txHash,
       events: [
-        { contract: "CreditSystem", name: "CreditSpent", args: { user: expected.consumer, tokenId: expected.tokenId } },
-        { contract: "RoyaltyVault", name: "RoyaltyDeposited", args: { payer: expected.consumer, tokenId: expected.tokenId } }
+        {
+          contract: "CreditSystem",
+          name: "CreditSpent",
+          args: {
+            user: expected.consumer,
+            tokenId: expected.tokenId,
+            creator: "0x0000000000000000000000000000000000000001",
+            royaltyWei: "0"
+          }
+        },
+        {
+          contract: "RoyaltyVault",
+          name: "RoyaltyDeposited",
+          args: {
+            creator: "0x0000000000000000000000000000000000000001",
+            payer: "mock-credit-system",
+            tokenId: expected.tokenId,
+            amount: "0"
+          }
+        }
       ]
     };
   }
@@ -207,11 +225,18 @@ export class EthersChainClient implements AgentChain {
     if (spent.args.tokenId !== BigInt(expected.tokenId).toString()) {
       throw new Error(`Settlement tokenId mismatch: expected ${expected.tokenId}, got ${spent.args.tokenId}`);
     }
-    if (royalty.args.payer.toLowerCase() !== expected.consumer.toLowerCase()) {
-      throw new Error(`Royalty payer mismatch: expected ${expected.consumer}, got ${royalty.args.payer}`);
-    }
     if (royalty.args.tokenId !== BigInt(expected.tokenId).toString()) {
       throw new Error(`Royalty tokenId mismatch: expected ${expected.tokenId}, got ${royalty.args.tokenId}`);
+    }
+    if (royalty.args.creator.toLowerCase() !== spent.args.creator.toLowerCase()) {
+      throw new Error(`Royalty creator mismatch: expected ${spent.args.creator}, got ${royalty.args.creator}`);
+    }
+    if (royalty.args.amount !== spent.args.royaltyWei) {
+      throw new Error(`Royalty amount mismatch: expected ${spent.args.royaltyWei}, got ${royalty.args.amount}`);
+    }
+    const expectedRoyaltyCaller = this.creditSystem.target.toString().toLowerCase();
+    if (royalty.args.payer.toLowerCase() !== expectedRoyaltyCaller) {
+      throw new Error(`Royalty payer mismatch: expected CreditSystem ${this.creditSystem.target.toString()}, got ${royalty.args.payer}`);
     }
     return { txHash, blockNumber: receipt.blockNumber, events };
   }

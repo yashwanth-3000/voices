@@ -62,7 +62,7 @@ try {
     walletAddress: wallet.address,
     styleId,
     prompt: "Announce that Voices turns creator writing styles into iNFT-powered agent assets on 0G.",
-    platforms: ["x", "linkedin", "instagram"]
+    platforms: ["thread", "x", "instagram"]
   });
   await orchestrator.drain();
 

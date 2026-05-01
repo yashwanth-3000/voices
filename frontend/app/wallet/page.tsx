@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Navbar } from "../../components/Navbar";
@@ -173,20 +174,20 @@ export default function WalletPage() {
 
               {isDashboardMode && address && (
                 <div className="walletDashboardActions">
-                  <a href={returnTo} className="walletOption">
+                  <Link href={returnTo} className="walletOption">
                     <div className="walletOptionLeft">
                       <div className="walletOptionName">Back to app</div>
                       <div className="walletOptionSub">Return to the page you opened this from</div>
                     </div>
                     <div className="walletOptionRight">Open</div>
-                  </a>
-                  <a href={`/wallet?returnTo=${encodeURIComponent(returnTo)}&switch=1`} className="walletOption">
+                  </Link>
+                  <Link href={`/wallet?returnTo=${encodeURIComponent(returnTo)}&switch=1`} className="walletOption">
                     <div className="walletOptionLeft">
                       <div className="walletOptionName">Switch wallet</div>
                       <div className="walletOptionSub">Connect with a different wallet provider</div>
                     </div>
                     <div className="walletOptionRight">Switch</div>
-                  </a>
+                  </Link>
                 </div>
               )}
 
@@ -228,13 +229,13 @@ export default function WalletPage() {
               {/* In switch mode with a wallet already connected, offer a way back */}
               {isSwitchMode && address && (
                 <div style={{ marginTop: 10 }}>
-                  <a
+                  <Link
                     href={returnTo}
                     className="walletFinePrint"
                     style={{ color: "var(--muted2)", textDecoration: "underline", cursor: "pointer" }}
                   >
                     Keep current wallet and go back
-                  </a>
+                  </Link>
                 </div>
               )}
 

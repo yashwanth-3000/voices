@@ -46,7 +46,7 @@ export const VoicesSwarmState = Annotation.Root({
   }),
   targetPlatforms: Annotation<string[]>({
     reducer: (_left, right) => right,
-    default: () => ["x", "linkedin", "instagram"]
+    default: () => ["x"]
   }),
   draftText: Annotation<string | undefined>({
     reducer: (_left, right) => right,

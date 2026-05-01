@@ -9,6 +9,7 @@ import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { createSwarm } from "@langchain/langgraph-swarm";
 import { z } from "zod";
 import { AgentEvent, AgentStatus, EventType, createUlid, requestIdFromEvent } from "../../events/types.js";
+import { runCrewAiGeneration, CrewAiActivity, CrewAiGenerationResult } from "../crewai/runner.js";
 import {
   buildAgentBrain,
   generateContentKey,
@@ -18,7 +19,6 @@ import {
   wrapKeyForOwner
 } from "../../inft/agent-brain.js";
 import {
-  contentGenerationPrompt,
   detailedStyleGuidePrompt,
   jsonRepairPrompt,
   platformTuningPrompt,
@@ -52,7 +52,7 @@ type AgentMeta = {
   lastError?: string;
 };
 
-type AgentActivityStatus = "started" | "completed" | "failed" | "handoff";
+type AgentActivityStatus = "started" | "progress" | "completed" | "failed" | "handoff";
 
 type StyleExtractionMetadata = Record<string, unknown> & {
   sourceContext: Record<string, unknown>;
@@ -67,7 +67,6 @@ type StyleExtractionMetadata = Record<string, unknown> & {
 const MIN_SAMPLE_BYTES = 1024;
 const MAX_SAMPLE_BYTES = 1024 * 1024;
 const DEFAULT_STYLE_SAMPLE_CHAR_BUDGET = 60_000;
-const DENYLIST = ["paul graham", "j.k. rowling", "jk rowling", "stephen king"];
 
 export class VoicesLangGraphSwarm {
   private readonly checkpointer: ZeroGCheckpointSaver;
@@ -89,7 +88,7 @@ export class VoicesLangGraphSwarm {
     {
       displayName: "Distribution Manager",
       graphName: "distribution_mgr",
-      subscribedEvents: ["generation.drafted", "credit.low"],
+      subscribedEvents: ["credit.low"],
       status: "stopped"
     }
   ];
@@ -131,9 +130,6 @@ export class VoicesLangGraphSwarm {
       llm: createPlannerModel("distribution_mgr", deps.compute),
       tools: [
         this.tuneForPlatformTool(),
-        this.checkDistributionCreditBalanceTool(),
-        this.deductCreditViaKeeperTool(),
-        this.depositRoyaltyViaKeeperTool(),
         this.topupCreditsViaKeeperTool(),
         this.handoffToCuratorTool()
       ],
@@ -196,7 +192,7 @@ export class VoicesLangGraphSwarm {
         const state = getCurrentTaskInput() as VoicesSwarmStateValue;
         const event = requireIncomingEvent(state);
         const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
-        await this.publishToolActivity(state, "style_curator", "encrypt_and_store_samples", "started", "Checking sample size, denylist, and encrypting the creator samples.");
+        await this.publishToolActivity(state, "style_curator", "encrypt_and_store_samples", "started", "Checking sample size and encrypting the creator samples.");
         try {
           if (state.attestationVerified === false) {
             throw new Error("Cannot store samples after failed attestation");
@@ -248,7 +244,7 @@ export class VoicesLangGraphSwarm {
       },
       {
         name: "encrypt_and_store_samples",
-        description: "Validate sample size and denylist, encrypt the raw samples, and upload the encrypted bytes to 0G Storage.",
+        description: "Validate sample size, encrypt the raw samples, and upload the encrypted bytes to 0G Storage.",
         schema: z.object({})
       }
     );
@@ -271,9 +267,19 @@ export class VoicesLangGraphSwarm {
           const { compute, profile: baseProfile } = await this.extractProfile(samples, extractionMetadata);
           const guideResult = hasDetailedStyleGuide(baseProfile)
             ? undefined
-            : await this.generateDetailedStyleGuide(samples, baseProfile, extractionMetadata);
+            : await this.generateDetailedStyleGuide(samples, baseProfile, extractionMetadata).catch((error) => {
+                const reason = error instanceof Error ? error.message : String(error);
+                return {
+                  guide: buildFallbackDetailedStyleGuide(baseProfile, samples, extractionMetadata, reason),
+                  compute: undefined
+                };
+              });
           const profile = guideResult
-            ? { ...baseProfile, detailed_style_guide: guideResult.guide, styleGuideCompute: computeEvidence(guideResult.compute, "detailed_style_guide") }
+            ? {
+                ...baseProfile,
+                detailed_style_guide: guideResult.guide,
+                styleGuideCompute: guideResult.compute ? computeEvidence(guideResult.compute, "detailed_style_guide") : undefined
+              }
             : baseProfile;
           const styleId = state.currentStyleId ?? state.pendingStyleId ?? `pending:${event.id}`;
           const profileKey = `style:${styleId}:profile`;
@@ -296,7 +302,7 @@ export class VoicesLangGraphSwarm {
             computeProvider: compute.providerAddress,
             computeModel: compute.model,
             computeChatId: compute.chatId,
-            styleGuideCompute: guideResult
+            styleGuideCompute: guideResult?.compute
               ? computeEvidence(guideResult.compute, "detailed_style_guide")
               : baseProfile.styleGuideCompute,
             langGraphThread: `voices:${requestId}`,
@@ -310,7 +316,7 @@ export class VoicesLangGraphSwarm {
             fullSampleBytes: Buffer.byteLength(allSamples.join("\n"), "utf8"),
             teeVerified: compute.teeVerified ?? compute.verified,
             compute: computeEvidence(compute, "style_profile_extraction"),
-            styleGuideCompute: guideResult ? computeEvidence(guideResult.compute, "detailed_style_guide") : undefined,
+            styleGuideCompute: guideResult?.compute ? computeEvidence(guideResult.compute, "detailed_style_guide") : undefined,
             hasDetailedStyleGuide: hasDetailedStyleGuide(enrichedProfile)
           });
           return new Command({
@@ -659,10 +665,24 @@ export class VoicesLangGraphSwarm {
             }
           });
         }
-        const profile = await this.getProfile(styleId, style.profileURI);
-        await this.publishToolActivity(state, "content_creator", "read_style_profile", "completed", "Style profile loaded from 0G KV.", {
+        let profile: Record<string, unknown>;
+        let profileSource: string;
+        try {
+          profile = await this.getProfile(styleId, style.profileURI);
+          profileSource = "0g_kv";
+        } catch {
+          const hint = recordValue(event.payload.styleHint);
+          if (Object.keys(hint).length > 0) {
+            profile = buildProfileFromHint(hint);
+            profileSource = "style_hint";
+          } else {
+            throw new Error(`Missing style profile for ${styleId}`);
+          }
+        }
+        await this.publishToolActivity(state, "content_creator", "read_style_profile", "completed", `Style profile loaded (${profileSource}).`, {
           styleId,
-          creatorAddress: style.creator
+          creatorAddress: style.creator,
+          profileSource
         });
         return new Command({
           update: {
@@ -689,7 +709,7 @@ export class VoicesLangGraphSwarm {
       async () => {
         const state = getCurrentTaskInput() as VoicesSwarmStateValue;
         const profile = state.styleProfile ?? {};
-        const selectedSamples = stringArray(profile.sampleExcerpts).slice(0, 5);
+        const selectedSamples = styleExcerptsFromProfile(profile).slice(0, 8);
         await this.publishToolActivity(state, "content_creator", "pull_relevant_samples", "completed", `Selected ${selectedSamples.length} style-only excerpt(s) for low-cost conditioning.`, {
           sampleCount: selectedSamples.length
         });
@@ -717,26 +737,57 @@ export class VoicesLangGraphSwarm {
         const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
         const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
         const prompt = state.prompt ?? stringValue(event.payload.prompt, "");
-        await this.publishToolActivity(state, "content_creator", "generate_with_voice", "started", "Calling 0G Compute for a voice-matched draft with strict sample-boundary rules.", {
+        const platforms = generationPlatforms(state, event);
+        await this.publishToolActivity(state, "content_creator", "generate_with_voice", "started", "Starting the CrewAI voice-generation swarm for the selected output format.", {
           styleId,
-          prompt: prompt.slice(0, 160)
+          prompt: prompt.slice(0, 160),
+          platforms
         });
         try {
-          const compute = await this.deps.compute.chat(
-            contentGenerationPrompt({
-              styleProfile: state.styleProfile ?? {},
+          const styleReferences = state.selectedSamples.length > 0
+            ? state.selectedSamples
+            : styleExcerptsFromProfile(state.styleProfile ?? {}).slice(0, 5);
+          const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+          const [styleRegistry, agentBrain, memoryEntries] = await Promise.all([
+            this.getStyleRegistryEvidence(styleId, state),
+            this.getAgentBrainEvidence(styleId, state.styleProfile ?? {}),
+            this.getCrewMemoryEvidence(styleId, consumerAddress, state.styleProfile ?? {})
+          ]);
+          const crew = await runCrewAiGeneration(
+            {
+              requestId,
+              styleId,
+              consumerAddress,
+              creatorAddress: state.creatorAddress,
               prompt,
-              excerpts: state.selectedSamples.length > 0 ? state.selectedSamples : stringArray(state.styleProfile?.sampleExcerpts).slice(0, 5)
-            }),
-            { maxRetries: 1, maxTokens: 500 }
+              platforms,
+              profileKey: state.profileKey,
+              styleRegistry,
+              styleProfile: state.styleProfile ?? {},
+              excerpts: styleReferences,
+              agentBrain,
+              memoryEntries,
+              computeOptions: generationComputeOptions(platforms, "draft")
+            },
+            {
+              compute: this.deps.compute,
+              onActivity: (activity) => this.publishCrewActivity(state, activity)
+            }
           );
-          const rawDraft = extractTagged(compute.content, "draft");
-          const draft = guardGeneratedDraft(rawDraft, prompt, state.styleProfile ?? {});
-          await this.publishToolActivity(state, "content_creator", "generate_with_voice", "completed", "Draft generated and checked for sample-content leakage.", {
+          const draft = finalizeGeneratedDraft(crew.draft);
+          const compute = crewAiComputeEvidence(crew, "crewai_voice_generation");
+          await this.persistCrewMemory(state, {
             styleId,
-            teeVerified: compute.teeVerified ?? compute.verified,
-            qualityGuard: draft === rawDraft.trim() ? "passed" : "fallback_rewrite",
-            compute: computeEvidence(compute, "voice_generation")
+            consumerAddress,
+            prompt,
+            draft,
+            crew
+          });
+          await this.publishToolActivity(state, "content_creator", "generate_with_voice", "completed", "CrewAI swarm generated, critiqued, and queued memory sync for the voice-matched draft.", {
+            styleId,
+            teeVerified: compute.teeVerified,
+            qualityGuard: "voice_critic_memory_agent",
+            compute
           });
           return new Command({
             update: {
@@ -744,9 +795,10 @@ export class VoicesLangGraphSwarm {
               requestId,
               currentStyleId: styleId,
               prompt,
+              targetPlatforms: platforms,
               draftText: draft,
-              teeVerified: compute.teeVerified ?? compute.verified,
-              lastCompute: computeEvidence(compute, "voice_generation"),
+              teeVerified: compute.teeVerified,
+              lastCompute: compute,
               lastError: undefined
             }
           });
@@ -765,7 +817,7 @@ export class VoicesLangGraphSwarm {
       },
       {
         name: "generate_with_voice",
-        description: "Call 0G Compute with the detailed voice-matching prompt and produce a draft wrapped in draft tags.",
+        description: "Run the CrewAI voice context, style writer, and critic/memory agents over 0G Compute evidence.",
         schema: z.object({})
       }
     );
@@ -780,11 +832,14 @@ export class VoicesLangGraphSwarm {
         const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
         const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
         const draft = state.draftText ?? "";
+        const platforms = generationPlatforms(state, event);
         await this.publishToolActivity(state, "content_creator", "log_draft", "started", "Writing the draft to the consumer 0G history log.", {
           styleId,
           consumerAddress
         });
-        await this.deps.storage.logAppend(`consumer:${consumerAddress}:history`, `gen:${event.id}`, {
+        const historyStream = `consumer:${consumerAddress}:history`;
+        const historyKey = `gen:${event.id}`;
+        this.queueHistoryLogAppend(historyStream, historyKey, {
           styleId,
           draft,
           prompt: state.prompt ?? stringValue(event.payload.prompt, ""),
@@ -792,7 +847,7 @@ export class VoicesLangGraphSwarm {
           compute: state.lastCompute,
           langGraphThread: `voices:${requestId}`,
           timestamp: Date.now()
-        });
+        }, "draft history append");
         await this.deps.publish({
           id: `${event.id}:generation.drafted`,
           type: "generation.drafted",
@@ -804,19 +859,25 @@ export class VoicesLangGraphSwarm {
             requestId,
             draft,
             prompt: state.prompt ?? stringValue(event.payload.prompt, ""),
-            platforms: state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
+            platforms,
             teeVerified: state.teeVerified,
             compute: state.lastCompute,
+            historyLogStream: historyStream,
+            historyLogKey: historyKey,
+            historyLogStatus: "syncing_to_0g",
             langGraphThread: `voices:${requestId}`
           }
         });
-        await this.publishToolActivity(state, "content_creator", "log_draft", "completed", "Draft log entry written and generation.drafted emitted.", {
+        await this.publishToolActivity(state, "content_creator", "log_draft", "completed", "Draft event emitted; 0G history log append is syncing in the background.", {
           styleId,
-          consumerAddress
+          consumerAddress,
+          historyLogStream: historyStream,
+          historyLogKey: historyKey,
+          historyLogStatus: "syncing_to_0g"
         });
         return new Command({
           update: {
-            ...appendAgentMessage("content_creator", "Draft written to 0G Storage Log and generation.drafted emitted."),
+            ...appendAgentMessage("content_creator", "Draft emitted; 0G history log append is syncing in the background."),
             currentStyleId: styleId,
             consumerAddress,
             lastEventType: "generation.drafted"
@@ -838,25 +899,24 @@ export class VoicesLangGraphSwarm {
         const event = requireIncomingEvent(state);
         const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
         const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+        const platforms = generationPlatforms(state, event);
         await this.publishToolActivity(state, "content_creator", "handoff_to_distribution", "handoff", "Handing the draft to Distribution Manager for platform variants and settlement intent.", {
           styleId,
-          consumerAddress
+          consumerAddress,
+          platforms
         });
-        return new Command({
-          goto: "distribution_mgr",
-          graph: Command.PARENT,
-          update: {
-            ...appendAgentMessage("content_creator", `Handing off style ${styleId} draft to Distribution Manager.`),
-            activeAgent: "distribution_mgr",
-            workflowKind: "generation",
-            currentStyleId: styleId,
-            consumerAddress,
-            targetPlatforms: state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
-            draftText: state.draftText,
-            royaltyAmount: state.royaltyAmount,
-            lastEventType: "generation.drafted"
-          }
+        const update = await this.publishSelectedOutputAndSettlement({
+          ...state,
+          activeAgent: "distribution_mgr",
+          workflowKind: "generation",
+          currentStyleId: styleId,
+          consumerAddress,
+          targetPlatforms: platforms,
+          draftText: state.draftText,
+          royaltyAmount: state.royaltyAmount,
+          lastEventType: "generation.drafted"
         });
+        return new Command({ update });
       },
       {
         name: "handoff_to_distribution",
@@ -870,70 +930,111 @@ export class VoicesLangGraphSwarm {
     return tool(
       async () => {
         const state = getCurrentTaskInput() as VoicesSwarmStateValue;
-        const event = requireIncomingEvent(state);
-        const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
-        const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
-        const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
-        const draft = state.draftText ?? stringValue(event.payload.draft, "");
-        const platforms = state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]);
-        await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "started", "Calling 0G Compute once to create platform variants.", {
-          styleId,
-          platforms
-        });
-        const compute = await this.deps.compute.chat(platformTuningPrompt(draft, platforms), {
-          maxRetries: 1,
-          maxTokens: 650
-        });
-        const variants = parseVariants(compute.content, draft, platforms);
-        const spendIntent = this.deps.chain.spendCreditIntent(styleId);
-        await this.deps.storage.logAppend(`consumer:${consumerAddress}:history`, `published:${event.id}`, {
-          styleId,
-          variants,
-          teeVerified: compute.teeVerified ?? compute.verified,
-          compute: computeEvidence(compute, "platform_tuning"),
-          langGraphThread: `voices:${requestId}`,
-          timestamp: Date.now()
-        });
-        await this.deps.publish({
-          id: `${event.id}:generation.published`,
-          type: "generation.published",
-          timestamp: Date.now(),
-          actor: "system",
-          styleId,
-          consumerAddress,
-          payload: {
-            requestId,
-            variants,
-            teeVerified: compute.teeVerified ?? compute.verified,
-            compute: computeEvidence(compute, "platform_tuning"),
-            settlementStatus: "awaiting_wallet_signature",
-            spendIntent,
-            langGraphThread: `voices:${requestId}`
-          }
-        });
-        await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "completed", "Variants written to the consumer log and spend-credit intent prepared.", {
-          styleId,
-          platforms,
-          teeVerified: compute.teeVerified ?? compute.verified,
-          compute: computeEvidence(compute, "platform_tuning")
-        });
-        return new Command({
-          update: {
-            ...appendAgentMessage("distribution_mgr", "Platform variants created in one 0G Compute call."),
-            platformVariants: variants,
-            spendIntent,
-            teeVerified: compute.teeVerified ?? compute.verified,
-            lastEventType: "generation.published",
-            lastError: undefined
-          }
-        });
+        return new Command({ update: await this.publishSelectedOutputAndSettlement(state) });
       },
       {
         name: "tune_for_platform",
-        description: "Produce X, LinkedIn, and Instagram variants in one 0G Compute call and write them to the consumer log.",
-        schema: z.object({})
+        description: "Produce only the requested platform output, write it to the consumer log, and prepare the spend-credit intent.",
+        schema: z.object({}),
+        returnDirect: true
       }
     );
+  }
+
+  private async publishSelectedOutputAndSettlement(state: VoicesSwarmStateValue): Promise<VoicesSwarmUpdate> {
+    const event = requireIncomingEvent(state);
+    const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+    const styleId = state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, "");
+    const consumerAddress = state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, event.actor);
+    const draft = state.draftText ?? stringValue(event.payload.draft, "");
+    const platforms = generationPlatforms(state, event);
+    await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "started", "Creating the selected output format and wallet-signable royalty intent.", {
+      styleId,
+      platforms
+    });
+    const tuningCompute = shouldTuneDistributionWithCompute()
+      ? await this.deps.compute.chat(platformTuningPrompt(draft, platforms), generationComputeOptions(platforms, "platform"))
+      : undefined;
+    const prompt = state.prompt ?? stringValue(event.payload.prompt, "");
+    const variants = tuningCompute
+      ? parseVariants(tuningCompute.content, draft, platforms, prompt)
+      : variantsFromDraft(draft, platforms, prompt);
+    const spendIntent = this.deps.chain.spendCreditIntent(styleId);
+    const historyStream = `consumer:${consumerAddress}:history`;
+    const historyKey = `published:${event.id}`;
+    const compute = tuningCompute
+      ? computeEvidence(tuningCompute, "platform_tuning")
+      : state.lastCompute
+        ? { ...state.lastCompute, purpose: "voice_generation_validated" }
+        : undefined;
+    const teeVerified = tuningCompute
+      ? tuningCompute.teeVerified ?? tuningCompute.verified
+      : state.teeVerified ?? null;
+    this.queueHistoryLogAppend(historyStream, historyKey, {
+      styleId,
+      variants,
+      teeVerified,
+      compute,
+      langGraphThread: `voices:${requestId}`,
+      timestamp: Date.now()
+    }, "published variants history append");
+    await this.deps.publish({
+      id: `${event.id}:generation.published`,
+      type: "generation.published",
+      timestamp: Date.now(),
+      actor: "system",
+      styleId,
+      consumerAddress,
+      payload: {
+        requestId,
+        variants,
+        teeVerified,
+        compute,
+        settlementStatus: "awaiting_wallet_signature",
+        spendIntent,
+        historyLogStream: historyStream,
+        historyLogKey: historyKey,
+        historyLogStatus: "syncing_to_0g",
+        langGraphThread: `voices:${requestId}`
+      }
+    });
+    await this.deps.publish({
+      id: `${event.id}:settlement.intent.created`,
+      type: "settlement.intent.created",
+      timestamp: Date.now(),
+      actor: "system",
+      styleId,
+      consumerAddress,
+      payload: {
+        requestId,
+        spendIntent,
+        status: "awaiting_wallet_signature",
+        sourceEventType: "generation.published",
+        langGraphThread: `voices:${requestId}`
+      }
+    });
+    await this.publishToolActivity(state, "distribution_mgr", "tune_for_platform", "completed", "Selected output format emitted and spend-credit intent prepared; 0G history log is syncing in the background.", {
+      styleId,
+      platforms,
+      historyLogStream: historyStream,
+      historyLogKey: historyKey,
+      historyLogStatus: "syncing_to_0g",
+      teeVerified,
+      compute
+    });
+    return {
+      ...appendAgentMessage("distribution_mgr", "Selected output format created. Spend-credit transaction intent prepared."),
+      activeAgent: "distribution_mgr",
+      workflowKind: "generation",
+      currentStyleId: styleId,
+      consumerAddress,
+      targetPlatforms: platforms,
+      platformVariants: variants,
+      spendIntent,
+      teeVerified,
+      lastEventType: "settlement.intent.created",
+      lastError: undefined
+    };
   }
 
   private checkDistributionCreditBalanceTool() {
@@ -1204,6 +1305,138 @@ export class VoicesLangGraphSwarm {
     });
   }
 
+  private async publishCrewActivity(state: VoicesSwarmStateValue, activity: CrewAiActivity): Promise<void> {
+    const event = requireIncomingEvent(state);
+    const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+    await this.deps.publish({
+      id: `${event.id}:agent.activity:${createUlid()}`,
+      type: "agent.activity",
+      timestamp: Date.now(),
+      actor: "content_creator",
+      styleId: state.currentStyleId ?? event.styleId ?? stringValue(event.payload.styleId, undefined),
+      consumerAddress: state.consumerAddress ?? event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
+      payload: {
+        requestId,
+        sourceEventId: event.id,
+        agent: activity.agent,
+        agentLabel: activity.agentLabel,
+        langGraphAgent: "content_creator",
+        tool: activity.tool,
+        status: activity.status,
+        message: activity.message,
+        crewRuntime: "crewai",
+        langGraphThread: `voices:${requestId}`,
+        ...recordValue(activity.payload)
+      }
+    });
+  }
+
+  private async getStyleRegistryEvidence(styleId: string, state: VoicesSwarmStateValue): Promise<Record<string, unknown>> {
+    try {
+      const style = await this.deps.chain.styleOf(styleId);
+      return {
+        styleId,
+        creator: style.creator,
+        royaltyWei: style.royaltyWei.toString(),
+        totalEarnings: style.totalEarnings.toString(),
+        sampleCount: style.sampleCount,
+        listed: style.listed,
+        encryptedSamplesURI: style.encryptedSamplesURI,
+        profileURI: style.profileURI,
+        language: style.language,
+        genres: style.genres,
+        attestationURI: style.attestationURI,
+        metadataHash: style.metadataHash
+      };
+    } catch {
+      return {
+        styleId,
+        creator: state.creatorAddress,
+        royaltyWei: state.royaltyAmount,
+        profileURI: state.profileKey ? `0g://kv/${state.profileKey}` : undefined
+      };
+    }
+  }
+
+  private async getAgentBrainEvidence(styleId: string, profile: Record<string, unknown>): Promise<Record<string, unknown> | undefined> {
+    const pendingStyleId = stringValue(profile.pendingStyleId, undefined);
+    const keys = [
+      `style:${styleId}:agentBrain`,
+      pendingStyleId ? `style:${pendingStyleId}:agentBrain` : undefined
+    ].filter((key): key is string => Boolean(key));
+    for (const key of keys) {
+      const manifest = await this.deps.storage.kvGet<Record<string, unknown>>(key).catch(() => null);
+      if (manifest) {
+        return { ...manifest, kv_key: key };
+      }
+    }
+    return undefined;
+  }
+
+  private async getCrewMemoryEvidence(
+    styleId: string,
+    consumerAddress: string,
+    profile: Record<string, unknown>
+  ): Promise<Array<Record<string, unknown>>> {
+    const pendingStyleId = stringValue(profile.pendingStyleId, undefined);
+    const streams = [
+      `style:${styleId}:memory`,
+      pendingStyleId ? `style:${pendingStyleId}:memory` : undefined,
+      consumerAddress ? `consumer:${consumerAddress}:history` : undefined
+    ].filter((stream): stream is string => Boolean(stream));
+    const entries: Array<Record<string, unknown>> = [];
+    for (const stream of streams) {
+      const scan = await this.deps.storage.logScan<Record<string, unknown>>(stream, "", undefined).catch(() => []);
+      entries.push(
+        ...scan.slice(-8).map((entry) => ({
+          stream,
+          key: entry.key,
+          value: entry.value
+        }))
+      );
+    }
+    return entries.slice(-18);
+  }
+
+  private async persistCrewMemory(
+    state: VoicesSwarmStateValue,
+    input: {
+      styleId: string;
+      consumerAddress: string;
+      prompt: string;
+      draft: string;
+      crew: CrewAiGenerationResult;
+    }
+  ): Promise<void> {
+    const event = requireIncomingEvent(state);
+    const requestId = state.requestId ?? requestIdFromEvent(event) ?? event.id;
+    const memory = {
+      requestId,
+      sourceEventId: event.id,
+      styleId: input.styleId,
+      consumerAddress: input.consumerAddress,
+      prompt: input.prompt,
+      draft: input.draft,
+      critique: input.crew.critique,
+      feedback: stringValue(recordValue(input.crew.memoryPatch).feedback, undefined),
+      learned_preferences: stringArray(recordValue(input.crew.memoryPatch).learned_preferences),
+      revisionCount: input.crew.revisionCount ?? 0,
+      runtime: input.crew.runtime,
+      compute: crewAiComputeEvidence(input.crew, "crewai_voice_generation"),
+      langGraphThread: `voices:${requestId}`,
+      timestamp: Date.now()
+    };
+    const stream = `style:${input.styleId}:memory`;
+    const key = `crew:${event.id}`;
+    this.queueHistoryLogAppend(stream, key, memory, "CrewAI voice memory append");
+    void this.deps.storage.kvSet(`style:${input.styleId}:crewMemory`, {
+      latest: memory,
+      updatedAt: Date.now()
+    }).catch((error) => {
+      console.warn("CrewAI voice memory KV sync failed", error);
+    });
+  }
+
   private async invokeForEvent(event: AgentEvent, activeAgent: VoicesAgentName): Promise<void> {
     this.markBusy(activeAgent);
     const requestId = requestIdFromEvent(event) ?? event.id;
@@ -1390,7 +1623,10 @@ export class VoicesLangGraphSwarm {
       try {
         const compute = await this.deps.compute.chat(styleExtractionPrompt(attempt.samples, attempt.metadata), {
           maxRetries: 1,
-          maxTokens: attempt.maxTokens
+          maxTokens: attempt.maxTokens,
+          model: highQualityGenerationModel(),
+          temperature: generationTemperature(),
+          topP: generationTopP()
         });
         return {
           compute,
@@ -1411,7 +1647,13 @@ export class VoicesLangGraphSwarm {
   ): Promise<{ guide: Record<string, unknown>; compute: AgentChatResult }> {
     const compute = await this.deps.compute.chat(
       detailedStyleGuidePrompt({ samples, profile, metadata }),
-      { maxRetries: 1, maxTokens: 4200 }
+      {
+        maxRetries: 1,
+        maxTokens: 4200,
+        model: highQualityGenerationModel(),
+        temperature: generationTemperature(),
+        topP: generationTopP()
+      }
     );
     return {
       guide: await this.parseTaggedJsonWithRepair(compute.content, "style_guide"),
@@ -1426,7 +1668,11 @@ export class VoicesLangGraphSwarm {
       const parseError = error instanceof Error ? error.message : String(error);
       const repair = await this.deps.compute.chat(
         jsonRepairPrompt({ tag, content: content.slice(0, 60_000), parseError }),
-        { maxRetries: 1, maxTokens: tag === "style_guide" ? 4200 : 2800 }
+        {
+          maxRetries: 1,
+          maxTokens: tag === "style_guide" ? 4200 : 2800,
+          model: highQualityGenerationModel()
+        }
       );
       return parseTaggedJson(repair.content, tag);
     }
@@ -1457,6 +1703,13 @@ export class VoicesLangGraphSwarm {
       }
     }
     throw new Error(`Missing style profile for ${styleId}`);
+  }
+
+  private queueHistoryLogAppend<T>(streamId: string, key: string, value: T, label: string): void {
+    void this.deps.storage.logAppend(streamId, key, value).catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`0G Storage ${label} failed for ${streamId}:${key}: ${reason}`);
+    });
   }
 
   private async publishStyleFailure(event: AgentEvent, requestId: string, reason: string): Promise<void> {
@@ -1664,7 +1917,7 @@ class ZeroGToolPlannerModel extends BaseChatModel<BaseChatModelCallOptions> {
 function createPlannerModel(agentName: VoicesAgentName, compute: AgentCompute): BaseChatModel {
   const plannerMode = process.env.AGENT_LANGGRAPH_PLANNER_MODE;
   const liveCompute = process.env.AGENT_COMPUTE_MODE === "0g" || process.env.AGENT_COMPUTE_MODE === "live";
-  const useZeroGPlanner = plannerMode === "0g" || (plannerMode !== "deterministic" && liveCompute);
+  const useZeroGPlanner = plannerMode === "0g" || plannerMode === "live" || (plannerMode !== "deterministic" && liveCompute);
   return useZeroGPlanner ? new ZeroGToolPlannerModel(agentName, compute) : new VoicesPlannerModel(agentName);
 }
 
@@ -1688,10 +1941,10 @@ function preferredToolOrder(agentName: VoicesAgentName, transcript: string): str
   }
 
   if (transcript.includes("credit.low")) {
-    return ["check_credit_balance", "topup_credits_via_keeper"];
+    return ["topup_credits_via_keeper"];
   }
 
-  return ["tune_for_platform", "check_credit_balance", "deduct_credit_via_keeper", "deposit_royalty_via_keeper"];
+  return ["tune_for_platform"];
 }
 
 function toolHasRun(toolName: string, messages: BaseMessage[], transcript: string): boolean {
@@ -1706,13 +1959,13 @@ function toolHasRun(toolName: string, messages: BaseMessage[], transcript: strin
     build_and_upload_agent_brain: ["AgentBrain manifest uploaded", "AgentBrain upload failed"],
     mint_inft: ["Mint intent prepared", "Mint intent failed"],
     refine_profile_from_feedback: ["refined from feedback", "refinement skipped", "Feedback was not specific"],
-    check_credit_balance: ["generation credit", "No credits available", "Settlement check sees"],
+    check_credit_balance: ["generation credit", "No credits available"],
     read_style_profile: ["Loaded style profile", "is no longer listed"],
     pull_relevant_samples: ["voice example"],
     generate_with_voice: ["Draft generated", "Generation failed"],
-    log_draft: ["generation.drafted emitted"],
+    log_draft: ["generation.drafted emitted", "Draft emitted", "Draft event emitted", "0G history log append is syncing"],
     handoff_to_distribution: ["Handing off style"],
-    tune_for_platform: ["Platform variants created"],
+    tune_for_platform: ["Platform variants created", "Selected output format created", "Selected output format emitted", "Spend-credit transaction intent prepared"],
     deduct_credit_via_keeper: ["Credit spend submitted"],
     deposit_royalty_via_keeper: ["Royalty settlement"],
     topup_credits_via_keeper: ["Auto-top-up"],
@@ -1731,7 +1984,12 @@ function workflowShouldStop(transcript: string): boolean {
     "AgentBrain upload failed",
     "Mint intent failed",
     "Generation failed",
-    "Style is no longer listed"
+    "Style is no longer listed",
+    "Selected output format created",
+    "Selected output format emitted",
+    "Spend-credit transaction intent prepared",
+    "generation.published",
+    "settlement.intent.created"
   ].some((marker) => transcript.includes(marker));
 }
 
@@ -1761,9 +2019,34 @@ function computeEvidence(compute: AgentChatResult, purpose: string): Record<stri
   };
 }
 
+function crewAiComputeEvidence(crew: CrewAiGenerationResult, purpose: string): Record<string, unknown> {
+  const calls = crew.computeCalls ?? [];
+  const lastCall = calls.at(-1);
+  return {
+    purpose,
+    provider: lastCall?.provider,
+    serviceUrl: lastCall?.serviceUrl,
+    model: lastCall?.model,
+    chatId: lastCall?.chatId,
+    teeVerified: calls.length > 0 ? calls.every((call) => call.teeVerified !== false) : null,
+    inputTokens: sumOptional(calls.map((call) => call.inputTokens)),
+    outputTokens: sumOptional(calls.map((call) => call.outputTokens)),
+    durationMs: sumOptional(calls.map((call) => call.durationMs)),
+    path: "crewai",
+    runtime: crew.runtime,
+    revisionCount: crew.revisionCount ?? 0,
+    calls
+  };
+}
+
+function sumOptional(values: Array<number | undefined>): number | undefined {
+  const present = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return present.length > 0 ? present.reduce((total, value) => total + value, 0) : undefined;
+}
+
 function messagesToPlannerText(messages: BaseMessage[]): string {
   return messages
-    .slice(-10)
+    .slice(-40)
     .map((message) => {
       const name = "name" in message && typeof message.name === "string" ? `${message.name}: ` : "";
       const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
@@ -1800,8 +2083,9 @@ const CONTENT_CREATOR_PROMPT = [
 
 const DISTRIBUTION_MANAGER_PROMPT = [
   "You are the Distribution Manager agent for Voices on 0G.",
-  "Tune drafts for X, LinkedIn, and Instagram in one 0G Compute call where possible.",
-  "Prepare credit spend, royalty settlement, and low-credit top-up intents without pretending a wallet signature or KeeperHub confirmation happened."
+  "Validate the single selected output format and prepare one wallet-signable spend-credit settlement intent.",
+  "After generation.published or settlement.intent.created, stop. Do not recheck credits, do not submit KeeperHub settlement, and do not call extra tools.",
+  "Only use top-up tooling when the incoming event is credit.low."
 ].join("\n");
 
 function agentLabel(agent: VoicesAgentName): string {
@@ -1850,7 +2134,7 @@ function initialStateFromEvent(event: AgentEvent, activeAgent: VoicesAgentName):
     consumerAddress: event.consumerAddress ?? stringValue(event.payload.consumerAddress, undefined),
     creatorAddress: event.type === "style.uploaded" ? event.actor : undefined,
     prompt: stringValue(event.payload.prompt, undefined),
-    targetPlatforms: arrayValue(event.payload.platforms, ["x", "linkedin", "instagram"]),
+    targetPlatforms: normalizeGenerationPlatforms(arrayValue(event.payload.platforms, ["x"])),
     draftText: stringValue(event.payload.draft, undefined),
     lastEventType: event.type,
     lastError: undefined
@@ -1882,10 +2166,6 @@ function validateSamples(samples: string[]): void {
   }
   if (bytes > MAX_SAMPLE_BYTES) {
     throw new Error("Writing sample must be under 1MB of text");
-  }
-  const lower = text.toLowerCase();
-  if (DENYLIST.some((author) => lower.includes(author))) {
-    throw new Error("Sample matches a known-author denylist entry");
   }
 }
 
@@ -1928,129 +2208,363 @@ function stripLooseTag(content: string, tag: string): string {
     .trim();
 }
 
-function parseVariants(content: string, draft: string, platforms: string[]): Record<string, string> {
+const ALLOWED_GENERATION_PLATFORMS = new Set(["x", "thread", "instagram", "blog", "github_readme"]);
+const THREAD_TWEET_MAX_CHARS = 220;
+const THREAD_MAX_TWEETS = 5;
+
+function generationPlatforms(state: VoicesSwarmStateValue, event: AgentEvent): string[] {
+  return normalizeGenerationPlatforms(state.targetPlatforms.length > 0 ? state.targetPlatforms : arrayValue(event.payload.platforms, ["x"]));
+}
+
+function normalizeGenerationPlatforms(values: string[]): string[] {
+  for (const value of values) {
+    const normalized = normalizeGenerationPlatform(value);
+    if (normalized && ALLOWED_GENERATION_PLATFORMS.has(normalized)) {
+      return [normalized];
+    }
+  }
+  return ["x"];
+}
+
+function normalizeGenerationPlatform(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "twitter" || normalized === "tweet" || normalized === "tweets") return "x";
+  if (normalized === "x") return "x";
+  if (normalized === "thread" || normalized === "tweet_thread" || normalized === "twitter_thread") return "thread";
+  if (normalized === "linked_in" || normalized === "linkedin") return "thread";
+  if (normalized === "ig" || normalized === "instagram" || normalized === "caption") return "instagram";
+  if (normalized === "blogger" || normalized === "blogger_article" || normalized === "blog_article" || normalized === "article" || normalized === "blog") return "blog";
+  if (normalized === "github" || normalized === "github_readme" || normalized === "readme" || normalized === "github_readme_file") return "github_readme";
+  return normalized;
+}
+
+function maxTokensForPlatforms(platforms: string[], stage: "draft" | "platform"): number {
+  const hasLongForm = platforms.some((platform) => platform === "blog" || platform === "github_readme");
+  if (hasLongForm) {
+    return stage === "draft" ? 2600 : 3200;
+  }
+  if (platforms.some((platform) => platform === "thread")) {
+    return stage === "draft" ? 1100 : 1200;
+  }
+  if (platforms.some((platform) => platform === "instagram")) {
+    return stage === "draft" ? 1200 : 1400;
+  }
+  return stage === "draft" ? 550 : 650;
+}
+
+function generationComputeOptions(platforms: string[], stage: "draft" | "platform") {
+  return {
+    maxRetries: 1,
+    maxTokens: maxTokensForPlatforms(platforms, stage),
+    model: highQualityGenerationModel(),
+    temperature: generationTemperature(),
+    topP: generationTopP()
+  };
+}
+
+function highQualityGenerationModel(): string | undefined {
+  return process.env.OG_COMPUTE_GENERATION_MODEL?.trim() || process.env.OG_COMPUTE_HIGH_QUALITY_MODEL?.trim() || undefined;
+}
+
+function generationTemperature(): number | undefined {
+  return optionalNumberEnv("OG_COMPUTE_GENERATION_TEMPERATURE") ?? 0.7;
+}
+
+function generationTopP(): number | undefined {
+  return optionalNumberEnv("OG_COMPUTE_GENERATION_TOP_P") ?? 0.95;
+}
+
+function optionalNumberEnv(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function shouldTuneDistributionWithCompute(): boolean {
+  const mode = process.env.AGENT_DISTRIBUTION_COMPUTE_TUNING?.trim().toLowerCase();
+  if (mode === "off" || mode === "false" || mode === "0") {
+    return false;
+  }
+  if (mode === "0g" || mode === "live" || mode === "on" || mode === "true" || mode === "1") {
+    return true;
+  }
+  return false;
+}
+
+function parseVariants(content: string, draft: string, platforms: string[], prompt: string): Record<string, string> {
   try {
     const parsed = JSON.parse(extractFirstJsonObject(stripCodeFence(content))) as Record<string, string>;
     return Object.fromEntries(
-      platforms.map((platform) => [
-        platform,
-        enforcePlatformLimit(guardVariant(parsed[platform] ?? tuneFallback(draft, platform), draft, platform), platform)
-      ])
+      platforms.map((platform) => {
+        const fallback = draft || prompt;
+        return [platform, formatVariantForPlatform(platform, parsed[platform] ?? fallback, fallback)];
+      })
     );
   } catch {
-    return Object.fromEntries(platforms.map((platform) => [platform, tuneFallback(draft, platform)]));
+    return variantsFromDraft(draft, platforms, prompt);
   }
 }
 
-const SAMPLE_BLEED_TERMS = [
-  "agent demo",
-  "agent workflow",
-  "workflow trail",
-  "style profile",
-  "profile hash",
-  "encrypted sample",
-  "encrypted samples",
-  "0g",
-  "inft",
-  "wallet",
-  "transaction",
-  "settlement",
-  "royalty",
-  "credit spend",
-  "event log",
-  "event trail",
-  "langgraph",
-  "keeperhub",
-  "creditsystem"
-];
+function variantsFromDraft(draft: string, platforms: string[], prompt: string): Record<string, string> {
+  return Object.fromEntries(
+    platforms.map((platform) => {
+      const fallback = draft || prompt;
+      return [platform, formatVariantForPlatform(platform, draft, fallback)];
+    })
+  );
+}
 
-function guardGeneratedDraft(draft: string, prompt: string, styleProfile: unknown): string {
-  const cleaned = draft.trim();
+function finalizeGeneratedDraft(draft: string): string {
+  const cleaned = cleanGeneratedText(draft);
   if (!cleaned) {
-    return fallbackVoiceDraft(prompt, styleProfile);
-  }
-  if (leaksSampleMatter(cleaned, prompt) || hasUnsupportedPrecision(cleaned, prompt) || containsMetaInstruction(cleaned)) {
-    return fallbackVoiceDraft(prompt, styleProfile);
+    throw new Error("0G Compute returned an empty draft");
   }
   return cleaned;
 }
 
-function guardVariant(variant: string, draft: string, platform: string): string {
-  const cleaned = variant.trim();
-  if (!cleaned || leaksSampleMatter(cleaned, draft) || hasUnsupportedPrecision(cleaned, draft) || containsMetaInstruction(cleaned) || hasUnsupportedHashtags(cleaned, draft)) {
-    return tuneFallback(draft, platform);
+function cleanVariantText(value: string, fallback: string): string {
+  const cleaned = cleanGeneratedText(value);
+  return cleaned || cleanGeneratedText(fallback) || fallback.trim();
+}
+
+function formatVariantForPlatform(platform: string, value: string, fallback: string): string {
+  const cleaned = cleanVariantText(value, fallback);
+  if (platform === "x") {
+    return tweetSized(cleaned, 260);
+  }
+  if (platform === "thread") {
+    return tweetThread(cleaned, fallback);
   }
   return cleaned;
 }
 
-function leaksSampleMatter(text: string, allowedContext: string): boolean {
-  const lowerText = text.toLowerCase();
-  const lowerAllowed = allowedContext.toLowerCase();
-  return SAMPLE_BLEED_TERMS.some((term) => lowerText.includes(term) && !lowerAllowed.includes(term));
-}
-
-function hasUnsupportedPrecision(text: string, allowedContext: string): boolean {
-  const lowerAllowed = allowedContext.toLowerCase();
-  if (/[#$€£]\s?\d/.test(text) && !/[#$€£]\s?\d/.test(allowedContext)) {
-    return true;
+function tweetThread(value: string, fallback: string): string {
+  let parts = threadPartsFrom(value);
+  if (parts.length < 3) {
+    const fallbackParts = threadPartsFrom(fallback);
+    if (threadWordCount(fallbackParts) > threadWordCount(parts)) {
+      parts = fallbackParts;
+    }
   }
-  if (/\b\d+(?:\.\d+)?\s*(?:billion|million|trillion|percent|%)\b/i.test(text) && !/\b\d+(?:\.\d+)?\s*(?:billion|million|trillion|percent|%)\b/i.test(allowedContext)) {
-    return true;
+  parts = splitLongThreadParts(
+    mergeThreadFragments(ensureThreadIdeaCount(parts, fallback || value)),
+    THREAD_TWEET_MAX_CHARS - 6,
+    THREAD_MAX_TWEETS
+  ).slice(0, THREAD_MAX_TWEETS);
+  const selected = parts.length > 0 ? parts : [stripThreadPrefix(value)];
+  const count = Math.min(THREAD_MAX_TWEETS, selected.length);
+  const tweets = selected.slice(0, count).map((part, index) => {
+    const prefix = `${index + 1}/${count} `;
+    return `${prefix}${tweetSized(part, THREAD_TWEET_MAX_CHARS - prefix.length)}`;
+  });
+  return tweets.join("\n\n");
+}
+
+function threadPartsFrom(value: string): string[] {
+  const numbered = splitNumberedThread(value);
+  const parts = numbered.length >= 2 ? numbered : splitIntoTweetIdeas(value);
+  return normalizeThreadParts(parts);
+}
+
+function splitNumberedThread(value: string): string[] {
+  const cleaned = cleanGeneratedText(value).replace(/\r/g, "").trim();
+  const markerPattern = /(^|\n)\s*(?:\d+\s*\/\s*\d+|\d+\s*[\).:-])\s*(?:[-*\u2022]\s*)?/g;
+  const markers = [...cleaned.matchAll(markerPattern)];
+  if (markers.length < 2) {
+    return [];
   }
-  return /\b(?:according to|reportedly|sources say|it is widely reported)\b/i.test(text) && !/\b(?:according to|reportedly|sources say|widely reported)\b/i.test(lowerAllowed);
+  return markers.map((marker, index) => {
+    const start = (marker.index ?? 0) + marker[0].length;
+    const end = markers[index + 1]?.index ?? cleaned.length;
+    return cleaned.slice(start, end).trim();
+  });
 }
 
-function containsMetaInstruction(text: string): boolean {
-  return /\b(?:the voice should|voice should|style should|draft turns|output should|write in the voice|keep the claim careful)\b/i.test(text);
+function normalizeThreadParts(parts: string[]): string[] {
+  return parts
+    .map(stripThreadPrefix)
+    .filter((part) => part.length > 0 && !/^(?:#\w+\s*)+$/.test(part));
 }
 
-function hasUnsupportedHashtags(text: string, allowedContext: string): boolean {
-  return /#[\p{L}\p{N}_]+/u.test(text) && !/#[\p{L}\p{N}_]+/u.test(allowedContext);
+function stripThreadPrefix(value: string): string {
+  let result = cleanGeneratedText(value).replace(/\s+/g, " ").trim();
+  for (let index = 0; index < 4; index += 1) {
+    const stripped = result
+      .replace(/^(?:[-*\u2022]\s*)?(?:\d+\s*\/\s*\d+|\d+\s*[\).:-])\s*(?:[-*\u2022]\s*)?/, "")
+      .trim();
+    if (stripped === result) {
+      break;
+    }
+    result = stripped;
+  }
+  return result.replace(/^[-*\u2022]\s+/, "").trim();
 }
 
-function fallbackVoiceDraft(prompt: string, styleProfile: unknown): string {
-  const subject = normalizePromptSubject(prompt);
-  const profile = recordValue(styleProfile);
-  const tone = recordValue(profile.tone);
-  const primaryTone = stringValue(tone.primary, "clear");
-  const voiceEssence = stringValue(profile.voice_essence, stringValue(profile.voiceEssence, ""));
-  const finalBeat = voiceEssence || primaryTone
-    ? "No fake precision, no invented motives, no pretending the consequences are settled."
-    : "No fake precision. No invented motives. No pretending the consequences are settled.";
-
-  return [
-    `${subject} is bigger than the headline. The useful question is what changed, who had to react, and which assumptions stopped being safe.`,
-    "The concrete part matters most: ownership changed, incentives shifted, and people who depended on the platform had to re-check what they could trust.",
-    `${finalBeat} Say the visible mechanism plainly, then stop before speculation starts sounding like evidence.`
-  ].join("\n\n");
+function threadWordCount(parts: string[]): number {
+  return parts.reduce((count, part) => count + part.split(/\s+/).filter(Boolean).length, 0);
 }
 
-function normalizePromptSubject(prompt: string): string {
-  const stripped = prompt
+function mergeThreadFragments(parts: string[]): string[] {
+  const merged: string[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const current = stripThreadPrefix(parts[index] ?? "");
+    if (!current) {
+      continue;
+    }
+    const next = stripThreadPrefix(parts[index + 1] ?? "");
+    if (next && shouldMergeThreadFragment(current, next)) {
+      merged.push(`${current.replace(/:\s*$/, "")}: ${next}`);
+      index += 1;
+    } else {
+      merged.push(current);
+    }
+  }
+  return merged;
+}
+
+function shouldMergeThreadFragment(current: string, next: string): boolean {
+  const currentWords = current.split(/\s+/).filter(Boolean).length;
+  const nextWords = next.split(/\s+/).filter(Boolean).length;
+  return /:\s*$/.test(current) && currentWords <= 8 && nextWords <= 12;
+}
+
+function splitLongThreadParts(parts: string[], maxBodyChars: number, maxParts: number): string[] {
+  const result: string[] = [];
+  for (const part of parts) {
+    const cleaned = stripThreadPrefix(part);
+    if (!cleaned) {
+      continue;
+    }
+    const remaining = maxParts - result.length;
+    if (cleaned.length <= maxBodyChars || remaining <= 1) {
+      result.push(cleaned);
+      continue;
+    }
+    result.push(...splitThreadPart(cleaned, maxBodyChars, remaining));
+    if (result.length >= maxParts) {
+      break;
+    }
+  }
+  return result.slice(0, maxParts);
+}
+
+function splitThreadPart(value: string, maxBodyChars: number, maxChunks: number): string[] {
+  const clauses = value
+    .split(/(?<=[.!?])\s+|;\s+|\s+-\s+|\s+(?=(?:and|while|without|then|those|others|creators|the platform)\b)/i)
+    .map(tidyThreadChunk)
+    .filter(Boolean);
+  const chunks: string[] = [];
+  for (const clause of clauses.length > 1 ? clauses : chunkWords(value, maxBodyChars)) {
+    const cleaned = tidyThreadChunk(clause);
+    if (!cleaned) {
+      continue;
+    }
+    const last = chunks[chunks.length - 1];
+    const joined = last ? `${last} ${cleaned}` : cleaned;
+    if (last && joined.length <= maxBodyChars) {
+      chunks[chunks.length - 1] = joined;
+    } else if (cleaned.length <= maxBodyChars) {
+      chunks.push(cleaned);
+    } else {
+      chunks.push(...chunkWords(cleaned, maxBodyChars));
+    }
+    if (chunks.length >= maxChunks) {
+      break;
+    }
+  }
+  return chunks.slice(0, maxChunks);
+}
+
+function chunkWords(value: string, maxBodyChars: number): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const word of value.split(/\s+/).filter(Boolean)) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length <= maxBodyChars) {
+      current = next;
+      continue;
+    }
+    if (current) {
+      chunks.push(current);
+    }
+    current = word;
+  }
+  if (current) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
+function tidyThreadChunk(value: string): string {
+  return stripThreadPrefix(value)
+    .replace(/^(?:and|while|then)\s+/i, "")
     .replace(/\s+/g, " ")
-    .trim()
-    .replace(/^(write|draft|create|make)\s+(me\s+)?(a\s+|an\s+)?(post|tweet|thread|caption|linkedin post|article)?\s*(about|on|for)?\s*/i, "")
-    .replace(/^about\s+/i, "")
-    .replace(/[.?!]+$/, "")
     .trim();
-  const normalized = rephraseHowSubject(stripped)
-    .replace(/\belon\s+(?:much|mush|musk)\b/gi, "Elon Musk")
-    .replace(/\bthe\s+x\b/gi, "X")
-    .replace(/\bx\b/gi, "X")
-    .replace(/\belon\s+mush\b/gi, "Elon Musk")
-    .replace(/\belon\s+musk\b/gi, "Elon Musk")
-    .replace(/\bthe\s+twitter\b/gi, "Twitter")
-    .replace(/\btwitter\b/gi, "Twitter");
-  const subject = normalized || "This topic";
-  return subject.charAt(0).toUpperCase() + subject.slice(1);
 }
 
-function rephraseHowSubject(input: string): string {
-  const match = input.match(/^how\s+(.+?)\s+(bought|acquired)\s+(.+)$/i);
-  if (!match) {
-    return input;
+function ensureThreadIdeaCount(parts: string[], fallback: string): string[] {
+  const normalized = normalizeThreadParts(parts);
+  if (normalized.length >= 3) {
+    return normalized;
   }
-  return `${match[1]} ${match[2].toLowerCase() === "acquired" ? "acquiring" : "buying"} ${match[3]}`;
+  const cleaned = stripThreadMarkers(fallback).replace(/\s+/g, " ").trim();
+  const words = cleaned.split(" ").filter(Boolean);
+  if (words.length < 12) {
+    return normalized.length > 0 ? normalized : cleaned ? [cleaned] : [];
+  }
+  const chunkSize = Math.ceil(words.length / 3);
+  const chunks = [0, 1, 2]
+    .map((index) => words.slice(index * chunkSize, (index + 1) * chunkSize).join(" ").trim())
+    .filter(Boolean);
+  return chunks.length >= 3 ? chunks : normalized;
+}
+
+function splitIntoTweetIdeas(value: string): string[] {
+  const cleaned = cleanGeneratedText(value)
+    .replace(/^[-*\u2022]\s+/gm, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .trim();
+  const blocks = cleaned
+    .split(/\n{2,}/)
+    .map(stripThreadPrefix)
+    .filter((part) => part.length > 0 && !/^#\w+/.test(part));
+  if (blocks.length >= 3) {
+    return blocks;
+  }
+  return cleaned
+    .split(/(?<=[.!?])\s+/)
+    .map(stripThreadPrefix)
+    .filter((part) => part.length > 0 && !/^#\w+/.test(part));
+}
+
+function stripThreadMarkers(value: string): string {
+  return cleanGeneratedText(value)
+    .replace(/(^|\n)\s*(?:\d+\s*\/\s*\d+|\d+\s*[\).:-])\s*(?:[-*\u2022]\s*)?/g, "$1")
+    .replace(/^[-*\u2022]\s+/gm, "")
+    .trim();
+}
+
+function tweetSized(value: string, maxLength: number): string {
+  const cleaned = cleanGeneratedText(value).replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) {
+    return cleaned;
+  }
+  const slice = cleaned.slice(0, maxLength + 1);
+  const breakAt = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf("? "), slice.lastIndexOf("! "), slice.lastIndexOf("; "), slice.lastIndexOf(", "), slice.lastIndexOf(" "));
+  const shortened = cleaned.slice(0, breakAt > maxLength * 0.55 ? breakAt : maxLength - 1).trim();
+  return `${shortened.replace(/[,:;.!?]+$/, "")}…`;
+}
+
+function cleanGeneratedText(value: string): string {
+  return stripCodeFence(value)
+    .replace(/^<draft[^>]*>/i, "")
+    .replace(/<\/draft>$/i, "")
+    .replace(/^["'“”]+|["'“”]+$/g, "")
+    .replace(/\r/g, "")
+    .trim();
 }
 
 function matchTaggedContent(content: string, tag: string): string | undefined {
@@ -2123,9 +2637,163 @@ function normalizeSampleExcerpts(profile: Record<string, unknown>, samples: stri
     .map((sample) => sample.slice(0, 240));
 }
 
+function styleExcerptsFromProfile(profile: Record<string, unknown>): string[] {
+  const guide = recordValue(profile.detailed_style_guide);
+  const sourceProfile = recordValue(profile.source_profile);
+  const examples = [
+    ...stringArray(profile.sample_excerpts),
+    ...stringArray(profile.sampleExcerpts),
+    ...exampleTexts(guide.actual_examples),
+    ...exampleTexts(recordValue(sourceProfile.twitter_profile).actual_examples),
+    ...exampleTexts(recordValue(sourceProfile.readme_profile).actual_examples),
+    ...exampleTexts(recordValue(sourceProfile.article_profile).actual_examples)
+  ]
+    .map(cleanSampleExcerpt)
+    .map((example) => example.slice(0, 900))
+    .filter(Boolean);
+
+  return [...new Set(examples)].slice(0, 8);
+}
+
+function exampleTexts(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      if (typeof item === "string") {
+        return item;
+      }
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        return stringValue((item as Record<string, unknown>).text, stringValue((item as Record<string, unknown>).example, ""));
+      }
+      return "";
+    })
+    .filter(Boolean);
+}
+
 function hasDetailedStyleGuide(profile: Record<string, unknown>): boolean {
   const guide = recordValue(profile.detailed_style_guide);
   return Boolean(stringValue(guide.prompt_ready_style_brief, undefined)) && Array.isArray(guide.actual_examples) && guide.actual_examples.length > 0;
+}
+
+function buildFallbackDetailedStyleGuide(
+  profile: Record<string, unknown>,
+  samples: string[],
+  metadata: Record<string, unknown>,
+  reason: string
+): Record<string, unknown> {
+  const sourceKind = stringValue(metadata.sourceKind, "unknown");
+  const sourceSummary = stringValue(metadata.sourceSummary, `${samples.length} submitted sample${samples.length === 1 ? "" : "s"}`);
+  const examples = normalizeSampleExcerpts(profile, samples).slice(0, 5).map((text, index) => ({
+    label: `Example ${index + 1}`,
+    source_label: sourceSummary,
+    text,
+    observed_patterns: ["Representative creator-owned excerpt retained for style transfer."]
+  }));
+  const guideByFormat = recordValue(recordValue(profile.source_profile).generation_guidelines_by_format);
+  const tweetRecipe = stringArray(guideByFormat.tweet);
+  const readmeRecipe = stringArray(guideByFormat.readme);
+  const articleRecipe = stringArray(guideByFormat.article);
+  const doRules = stringArray(profile.do_rules).concat(stringArray(profile.doRules)).slice(0, 16);
+  const dontRules = stringArray(profile.dont_rules).concat(stringArray(profile.dontRules)).slice(0, 12);
+
+  return {
+    guide_version: 1,
+    generated_by: "profile-fallback",
+    source_type: sourceKind,
+    source_summary: sourceSummary,
+    source_preservation: {
+      full_input_stored_encrypted: true,
+      public_report_contains_selected_examples_only: true,
+      analyzed_unit_count: samples.length,
+      analyzed_character_count: samples.join("\n").length
+    },
+    prompt_ready_style_brief: stringValue(
+      profile.voice_essence,
+      "Use the extracted tone, rhythm, structure, and examples as style signals while keeping all topic facts limited to the user prompt."
+    ),
+    voice_summary: stringValue(recordValue(profile.voice_fingerprint).fingerprint_text, stringValue(profile.voice_essence, "Profile-derived voice guide.")),
+    actual_examples: examples.length > 0 ? examples : [],
+    writing_patterns: {
+      length_and_density: stringValue(recordValue(profile.sentence_rhythm).average_sentence_length, "balanced"),
+      hooks_or_openings: stringArray(recordValue(profile.structural_patterns).openings),
+      structure: stringValue(recordValue(profile.structural_patterns).argument_shape, "Concrete opening, mechanism, and careful close."),
+      line_breaks_or_sectioning: stringValue(recordValue(profile.structural_patterns).paragraphing, "Use source-like paragraphing."),
+      vocabulary_signals: stringArray(recordValue(profile.vocabulary).distinctive_words),
+      punctuation_and_casing: stringArray(recordValue(profile.sentence_rhythm).punctuation_habits).join(", "),
+      emoji_hashtag_link_cta_usage: sourceKind === "twitter" ? "Follow observed source profile; do not invent hashtags or links." : "Use only if supported by the source.",
+      argument_shape: stringValue(recordValue(profile.structural_patterns).argument_shape, "State the visible mechanism and avoid unsupported certainty.")
+    },
+    voice_rules: doRules.length > 0 ? doRules : ["Use concrete nouns.", "Keep claims grounded in the prompt.", "Match the extracted cadence without copying source sentences."],
+    avoid_rules: dontRules.length > 0 ? dontRules : ["Do not copy private examples.", "Do not invent metrics, links, or motives.", "Do not output writing instructions."],
+    generation_recipe: {
+      tweet: tweetRecipe.length > 0 ? tweetRecipe : ["Write one finished tweet.", "Open with the concrete point.", "Keep unsupported facts out."],
+      thread: ["Use one idea per post.", "Move from mechanism to consequence."],
+      readme: readmeRecipe.length > 0 ? readmeRecipe : ["Use clear headings.", "Do not invent commands, APIs, or badges."],
+      article: articleRecipe.length > 0 ? articleRecipe : ["Open with a thesis.", "Use sections and careful evidence."],
+      generic: ["Transfer cadence and structure, not private subject matter."]
+    },
+    fallback_reason: reason,
+    confidence: Number(profile.confidence ?? 0.55)
+  };
+}
+
+function buildProfileFromHint(hint: Record<string, unknown>): Record<string, unknown> {
+  const blurb = stringValue(hint.blurb, "");
+  const about = stringValue(hint.about, "");
+  const tags = stringArray(hint.tags);
+  const bestFor = stringArray(hint.bestFor);
+  const traits = Array.isArray(hint.traits)
+    ? (hint.traits as Array<Record<string, unknown>>).filter((t) => t && typeof t === "object")
+    : [];
+  const samples = Array.isArray(hint.samples)
+    ? (hint.samples as Array<Record<string, unknown>>).filter((s) => s && typeof s === "object")
+    : [];
+  const sampleTexts = samples
+    .map((s) => stringValue(s.text, ""))
+    .filter(Boolean)
+    .slice(0, 6);
+  const voiceEssence = blurb || about || `A ${tags[0] ?? "distinctive"} voice.`;
+  const doRules: string[] = [
+    ...traits.map((t) => `${stringValue(t.label, "")} — ${stringValue(t.value, "")}`).filter((r) => r.length > 3),
+    about ? `About this voice: ${about}` : "",
+    ...bestFor.map((b) => `Strong for: ${b}`)
+  ].filter(Boolean).slice(0, 12);
+  const baseProfile: Record<string, unknown> = {
+    tone: {
+      labels: tags,
+      primary: tags[0] ?? "direct",
+      secondary: tags.slice(1, 4),
+      confidence: 0.8
+    },
+    vocabulary: {
+      distinctive_words: traits.flatMap((t) => stringValue(t.value, "").toLowerCase().split(/\W+/).filter((w) => w.length > 3)).slice(0, 12),
+      favorite_phrases: [],
+      avoided_patterns: [],
+      register_notes: about
+    },
+    sentence_rhythm: { average_sentence_length: "medium", variance: "medium", cadence_notes: about },
+    structural_patterns: {
+      argument_shape: traits.find((t) => /structure|cadence|format/i.test(stringValue(t.label, "")))
+        ? stringValue(traits.find((t) => /structure|cadence|format/i.test(stringValue(t.label, "")))!.value, "")
+        : "Concrete opening, explanation, then implication."
+    },
+    voice_essence: voiceEssence,
+    do_rules: doRules,
+    dont_rules: ["Do not write generic hype or vague abstractions.", "Do not copy sample sentences."],
+    sample_excerpts: sampleTexts.map((t) => t.slice(0, 240)),
+    source_profile: { primary_source_type: "file_upload" },
+    confidence: 0.75,
+    _source: "style_hint"
+  };
+  const detailedGuide = buildFallbackDetailedStyleGuide(
+    baseProfile,
+    sampleTexts,
+    { sourceKind: "file_upload", sourceSummary: `${sampleTexts.length} style sample(s) from hint` },
+    "profile_from_hint"
+  );
+  return { ...baseProfile, detailed_style_guide: detailedGuide };
 }
 
 function cleanSampleExcerpt(value: string): string {
@@ -2264,38 +2932,6 @@ function feedbackText(payload: Record<string, unknown>): string {
   ]
     .filter(Boolean)
     .join("\n\n");
-}
-
-function tuneFallback(draft: string, platform: string): string {
-  const cleaned = draft.replace(/\s+/g, " ").trim();
-  if (platform === "x") {
-    return truncate(cleaned, 280);
-  }
-  if (platform === "instagram") {
-    return cleaned;
-  }
-  return cleaned;
-}
-
-function enforcePlatformLimit(value: string, platform: string): string {
-  const cleaned = value.trim();
-  if (platform === "x") {
-    return truncate(cleaned, 280);
-  }
-  if (platform === "linkedin") {
-    return truncate(cleaned, 900);
-  }
-  return cleaned;
-}
-
-function truncate(value: string, maxLength: number): string {
-  if (value.length <= maxLength) {
-    return value;
-  }
-  const sliced = value.slice(0, Math.max(0, maxLength - 1)).trimEnd();
-  const lastSpace = sliced.lastIndexOf(" ");
-  const compact = lastSpace > 120 ? sliced.slice(0, lastSpace) : sliced;
-  return `${compact.replace(/[.,;:!?-]+$/, "")}…`;
 }
 
 function stringArray(value: unknown): string[] {

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../../../components/Navbar";
 import { Footer } from "../../../../../components/Footer";
@@ -86,9 +87,9 @@ export default function AgentBrainInspectorPage({ params }: PageProps) {
       <main className="siteShell dashboardShell">
         <section className="section sectionTightTop">
           <div className="container">
-            <a className="inspectorBackLink" href={`/dashboard/styles/${encodeURIComponent(tokenId)}`}>
+            <Link className="inspectorBackLink" href={`/dashboard/styles/${encodeURIComponent(tokenId)}`}>
               Back to voice inspector
-            </a>
+            </Link>
 
             <div className="inspectorHero">
               <div className="inspectorHeroCopy">
