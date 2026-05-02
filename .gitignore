@@ -25,6 +25,7 @@ typechain-types/
 .turbo/
 .next/
 out/
+.vercel/
 .playwright-mcp/
 .playwright-cli/
 voices-*.png
