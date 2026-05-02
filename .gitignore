@@ -1,6 +1,5 @@
 node_modules/
 .pnpm-store/
-pnpm-lock.yaml
 .0g-skills/
 
 .env
@@ -26,7 +25,9 @@ typechain-types/
 .turbo/
 .next/
 out/
+.playwright-mcp/
 .playwright-cli/
+voices-*.png
 
 deployments/*.json
 **/deployments/*.json

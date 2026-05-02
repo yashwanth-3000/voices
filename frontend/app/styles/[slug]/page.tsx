@@ -78,10 +78,12 @@ function LiveRegistryStyleDetail({ style }: { style: ChainStyleDetails }) {
   const sourceContext = recordValue(profile.sourceContext);
   const sourceProfile = recordValue(profile.source_profile);
   const detailedGuide = recordValue(profile.detailed_style_guide);
+  const styleGuideCompute = recordValue(profile.styleGuideCompute);
   const sourceMaterials = arrayRecords(profile.sourceMaterials).length
     ? arrayRecords(profile.sourceMaterials)
     : arrayRecords(sourceContext.sourceMaterials);
   const outputs = style.recentOutputs ?? [];
+  const proofOutput = outputs.find((output) => output.requestId);
   const title = marketplace.title || stringValue(profile.styleName) || `Style token ${style.tokenId}`;
   const sourceKind = stringValue(profile.sourceKind) || stringValue(sourceContext.sourceKind) || "unknown";
   const summary =
@@ -183,13 +185,16 @@ function LiveRegistryStyleDetail({ style }: { style: ChainStyleDetails }) {
               </article>
 
               <article className="styleDetailPanel">
-                <PanelHeader eyebrow="Evidence" title="0G proof trail" subtitle="On-chain registry fields and AgentBrain references for this iNFT." />
+                <PanelHeader eyebrow="Evidence" title="0G proof trail" subtitle="On-chain registry fields, AgentBrain storage, memory stream, and compute proof for this agent." />
                 <div className="evidenceList">
                   <Evidence label="Profile KV" value={style.profileKey || style.chain.profileURI} />
+                  <Evidence label="AgentBrain KV" value={style.agentBrainKey} />
                   <Evidence label="Samples URI" value={style.chain.encryptedSamplesURI} />
                   <Evidence label="Manifest root" value={stringValue(agentBrain.manifestRootHash)} />
+                  <Evidence label="Manifest storage tx" value={stringValue(agentBrain.manifestStorageTxHash)} />
                   <Evidence label="Samples root" value={stringValue(agentBrain.samplesRootHash)} />
                   <Evidence label="Profile root" value={stringValue(agentBrain.profileRootHash)} />
+                  <Evidence label="Memory log stream" value={stringValue(agentBrain.memoryLogStream)} />
                   <Evidence label="Key hash" value={stringValue(agentBrain.keyHash)} />
                   <Evidence label="Compute model" value={stringValue(agentBrain.computeModel) || stringValue(profile.computeModel)} />
                   <Evidence label="TEE verified" value={profile.teeVerified === undefined ? "Not recorded" : String(profile.teeVerified)} />
@@ -201,6 +206,30 @@ function LiveRegistryStyleDetail({ style }: { style: ChainStyleDetails }) {
                     ))}
                   </div>
                 ) : null}
+              </article>
+
+              <article className="styleDetailPanel">
+                <PanelHeader eyebrow="Compute proof" title="Inference evidence" subtitle="The style guide and generations attach compute metadata that judges can inspect." />
+                <div className="evidenceList">
+                  <Evidence label="Guide purpose" value={stringValue(styleGuideCompute.purpose)} />
+                  <Evidence label="Guide model" value={stringValue(styleGuideCompute.model)} />
+                  <Evidence label="Guide provider" value={stringValue(styleGuideCompute.provider)} />
+                  <Evidence label="Guide chat id" value={stringValue(styleGuideCompute.chatId)} />
+                  <Evidence label="Guide path" value={stringValue(styleGuideCompute.path) || stringValue(styleGuideCompute.computePath)} />
+                  <Evidence label="Guide TEE" value={styleGuideCompute.teeVerified === undefined ? "Not recorded" : String(styleGuideCompute.teeVerified)} />
+                  <Evidence label="Token usage" value={computeTokenSummary(styleGuideCompute)} />
+                </div>
+                {proofOutput?.requestId ? (
+                  <div className="proofCtaBox">
+                    <span>Generation proof page</span>
+                    <a href={`/api/backend/proof/${encodeURIComponent(proofOutput.requestId)}`} target="_blank" rel="noreferrer">
+                      Open proof trail
+                    </a>
+                    <small>{proofOutput.requestId}</small>
+                  </div>
+                ) : (
+                  <p className="styleEmptyText">No generated output proof has been recorded yet.</p>
+                )}
               </article>
             </aside>
           </div>
@@ -539,6 +568,11 @@ function OutputCard({
           ))}
         </div>
       ) : null}
+      {output.requestId ? (
+        <a className="outputProofLink" href={`/api/backend/proof/${encodeURIComponent(output.requestId)}`} target="_blank" rel="noreferrer">
+          View proof page
+        </a>
+      ) : null}
     </article>
   );
 }
@@ -569,6 +603,15 @@ function nestedValue(value: Record<string, unknown>, path: string[]): unknown {
 
 function nestedString(value: Record<string, unknown>, path: string[]): string | undefined {
   return stringValue(nestedValue(value, path));
+}
+
+function computeTokenSummary(compute: Record<string, unknown>): string | undefined {
+  const input = numberValue(compute.inputTokens);
+  const output = numberValue(compute.outputTokens);
+  if (input === undefined && output === undefined) {
+    return undefined;
+  }
+  return `${input ?? "?"} in / ${output ?? "?"} out`;
 }
 
 function profileLabels(profile: Record<string, unknown>): string[] {

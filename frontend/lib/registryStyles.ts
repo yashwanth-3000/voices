@@ -29,6 +29,7 @@ export type ChainStyleDetails = {
     hasProfile?: boolean;
   };
   profileKey?: string;
+  agentBrainKey?: string;
   profile?: Record<string, unknown> | null;
   agentBrain?: Record<string, unknown> | null;
   recentOutputs?: Array<{

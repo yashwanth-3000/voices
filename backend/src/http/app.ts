@@ -4,7 +4,7 @@ import { detailedStyleGuidePrompt } from "../agents/prompts.js";
 import { AgentEvent, createUlid } from "../events/types.js";
 import { MockChainClient } from "../infra/chain.js";
 import { Orchestrator, createOrchestrator } from "../orchestrator/index.js";
-import { ChatResult } from "../infra/types.js";
+import { AgentStorage, ChatResult } from "../infra/types.js";
 
 type StyleOutputPreview = {
   requestId?: string;
@@ -46,6 +46,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       modes: runtimeModes(),
       "0g_health": zeroG,
       zeroG,
+      persistence: storageDiagnostics(orchestrator.storage),
       orchestrator: orchestrator.status()
     };
   });
@@ -1317,7 +1318,11 @@ function renderAgentBrain(agentBrain: Record<string, unknown>): string {
   const manifestRoot = stringValue(agentBrain.manifest_root_hash);
   return `<div class="brainGrid">
     ${proofKv("Manifest root", manifestUrl && manifestRoot ? txLink(manifestRoot, manifestUrl) : shortHash(manifestRoot || "not recorded"), Boolean(manifestUrl && manifestRoot))}
+    ${proofKv("Manifest storage tx", shortHash(stringValue(agentBrain.manifest_storage_tx, "not recorded")))}
     ${proofKv("Manifest hash", shortHash(stringValue(agentBrain.manifest_hash, "not recorded")))}
+    ${proofKv("Samples storage tx", shortHash(stringValue(agentBrain.samples_storage_tx, "not recorded")))}
+    ${proofKv("Samples root", shortHash(stringValue(agentBrain.samples_root_hash, "not recorded")))}
+    ${proofKv("Profile root", shortHash(stringValue(agentBrain.profile_root_hash, "not recorded")))}
     ${proofKv("Profile KV", stringValue(agentBrain.profile_kv_key, "not recorded"))}
     ${proofKv("Memory stream", stringValue(agentBrain.memory_log_stream, "not recorded"))}
     ${proofKv("Key hash", shortHash(stringValue(agentBrain.key_hash, "not recorded")))}
@@ -1849,6 +1854,11 @@ function runtimeModes() {
           ? "live_openai"
         : "zero_cost_mock"
   };
+}
+
+function storageDiagnostics(storage: AgentStorage): Record<string, unknown> {
+  const diagnostics = (storage as AgentStorage & { diagnostics?: () => Record<string, unknown> }).diagnostics;
+  return typeof diagnostics === "function" ? diagnostics.call(storage) : { backend: "unknown" };
 }
 
 function explorerTxUrl(txHash: string): string {

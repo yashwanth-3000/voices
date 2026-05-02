@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { Indexer, MemData, Batcher, KvClient, getFlowContract } from "@0gfoundation/0g-ts-sdk";
 import { ethers } from "ethers";
 import { decryptBytes, encryptBytes, resolveAesKey } from "../crypto.js";
@@ -21,6 +21,15 @@ export class MemoryStorageClient implements AgentStorage {
   protected readonly kv = new Map<string, unknown>();
   protected readonly logs = new Map<string, LogEntry[]>();
   protected readonly blobs = new Map<string, Uint8Array>();
+
+  diagnostics(): Record<string, unknown> {
+    return {
+      backend: "memory",
+      kvEntries: this.kv.size,
+      logStreams: this.logs.size,
+      logEntries: countLogEntries(this.logs)
+    };
+  }
 
   async kvSet<T>(key: string, value: T): Promise<void> {
     this.kv.set(key, value);
@@ -108,6 +117,7 @@ export class ZeroGStorageClient extends MemoryStorageClient {
       ? undefined
       : resolve(process.env.AGENT_STORAGE_CACHE_PATH?.trim() || ".voices-storage-cache.json");
     this.flushCheckpointsToZeroG = process.env.AGENT_CHECKPOINT_FLUSH_MODE === "0g";
+    this.seedLocalCache();
     this.loadLocalCache();
   }
 
@@ -157,6 +167,29 @@ export class ZeroGStorageClient extends MemoryStorageClient {
     }
     const encrypted = new Uint8Array(await blob.arrayBuffer());
     return decryptBytes(encrypted, resolveAesKey(encryptionKey));
+  }
+
+  override diagnostics(): Record<string, unknown> {
+    const seedPath = process.env.AGENT_STORAGE_SEED_PATH?.trim();
+    const resolvedSeedPath = seedPath ? resolve(seedPath) : undefined;
+    const cacheExists = Boolean(this.cachePath && existsSync(this.cachePath));
+    return {
+      backend: "0g",
+      kvRpcConfigured: Boolean(this.kvRpc),
+      checkpointFlush: this.flushCheckpointsToZeroG ? "0g" : "local_cache",
+      kvEntries: this.kv.size,
+      logStreams: this.logs.size,
+      logEntries: countLogEntries(this.logs),
+      localCache: {
+        enabled: Boolean(this.cachePath),
+        path: this.cachePath,
+        exists: cacheExists,
+        bytes: cacheExists && this.cachePath ? fileSize(this.cachePath) : 0,
+        seedPath: resolvedSeedPath,
+        seedExists: Boolean(resolvedSeedPath && existsSync(resolvedSeedPath)),
+        railwayVolumeMount: process.env.RAILWAY_VOLUME_MOUNT_PATH || undefined
+      }
+    };
   }
 
   private async uploadMemData(bytes: Uint8Array, failureMessage: string): Promise<{ rootHash: string; txHash?: string }> {
@@ -292,10 +325,24 @@ export class ZeroGStorageClient extends MemoryStorageClient {
     }
   }
 
+  private seedLocalCache(): void {
+    const seedPath = process.env.AGENT_STORAGE_SEED_PATH?.trim();
+    if (!this.cachePath || !seedPath || existsSync(this.cachePath)) {
+      return;
+    }
+    const resolvedSeedPath = resolve(seedPath);
+    if (!existsSync(resolvedSeedPath)) {
+      return;
+    }
+    mkdirSync(dirname(this.cachePath), { recursive: true });
+    copyFileSync(resolvedSeedPath, this.cachePath);
+  }
+
   private persistLocalCache(): void {
     if (!this.cachePath) {
       return;
     }
+    mkdirSync(dirname(this.cachePath), { recursive: true });
     const cache: StorageCache = {
       kv: Object.fromEntries(this.kv.entries()),
       logs: Object.fromEntries(this.logs.entries())
@@ -325,6 +372,22 @@ function isNonceContentionError(error: unknown): boolean {
     record.info?.error?.message
   ].filter(Boolean).join(" ").toLowerCase();
   return text.includes("replacement") || text.includes("underpriced") || text.includes("nonce") || text.includes("already known");
+}
+
+function countLogEntries(logs: Map<string, LogEntry[]>): number {
+  let count = 0;
+  for (const entries of logs.values()) {
+    count += entries.length;
+  }
+  return count;
+}
+
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
 }
 
 function isCheckpointWrite(streamId: string, key: string): boolean {

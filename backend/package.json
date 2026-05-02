@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "tsc -p tsconfig.json && mkdir -p dist/crewai_runtime && cp crewai_runtime/voices_crew.py dist/crewai_runtime/voices_crew.py && cp crewai_runtime/requirements.txt dist/crewai_runtime/requirements.txt",
     "dev": "tsx watch src/index.ts",
     "dev:mock": "PORT=4317 AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock CREWAI_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx watch src/index.ts",
     "start": "tsx src/index.ts",
+    "start:prod": "node dist/index.js",
     "start:mock": "PORT=4317 AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock CREWAI_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx src/index.ts",
     "start:0g": "AGENT_STORAGE_MODE=0g AGENT_COMPUTE_MODE=0g AGENT_CHAIN_MODE=0g tsx src/index.ts",
     "smoke:agents": "AGENT_STORAGE_MODE=memory AGENT_COMPUTE_MODE=mock CREWAI_COMPUTE_MODE=mock AGENT_CHAIN_MODE=mock tsx src/smoke-agents.ts",
