@@ -4,6 +4,7 @@ node_modules/
 
 .env
 backend/.voices-storage-cache.json
+backend/seed/voices-storage-cache.json
 .voices-storage-cache.json
 .env.*
 !.env.example

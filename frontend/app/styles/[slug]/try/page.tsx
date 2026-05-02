@@ -1359,7 +1359,7 @@ function deriveRun(run: LiveRun) {
   const finalText = variantEntries[0]?.[1] ?? "";
   const spendIntent = payloadIntent(published, "spendIntent") ?? payloadIntent(latestEvent(run.events, "settlement.intent.created"), "spendIntent");
   const compute = payloadRecordObject(published, "compute") ?? payloadRecordObject(drafted, "compute");
-  const teeVerified = Boolean(payloadValue(published, "teeVerified") ?? payloadValue(drafted, "teeVerified") ?? compute?.teeVerified);
+  const teeVerified = booleanOrNull(payloadValue(published, "teeVerified") ?? payloadValue(drafted, "teeVerified") ?? compute?.teeVerified ?? compute?.verified);
   const proofHref = run.requestId ? `/api/backend/proof/${encodeURIComponent(run.requestId)}` : undefined;
   const status = statusFromEvents(run.events, run.status);
   const error = run.error ?? (failed ? eventExplanation(failed) : undefined);
@@ -1381,7 +1381,7 @@ function deriveRun(run: LiveRun) {
       canRetry: true,
       spendIntent,
       proofHref,
-      computeVerified: teeVerified ? "TEE verified" : "Compute failed",
+      computeVerified: teeVerified === true ? "TEE verified" : teeVerified === false ? "TEE not verified" : Boolean(compute) ? "Compute recorded" : "Compute failed",
       error
     };
   }
@@ -1830,8 +1830,9 @@ function eventExplanation(event: AgentEvent): string {
   return event.styleId ?? event.consumerAddress ?? event.actor;
 }
 
-function runEvidenceStatus(events: AgentEvent[], teeVerified: boolean, hasCompute: boolean): string {
-  if (teeVerified) return "TEE verified";
+function runEvidenceStatus(events: AgentEvent[], teeVerified: boolean | null, hasCompute: boolean): string {
+  if (teeVerified === true) return "TEE verified";
+  if (teeVerified === false) return "TEE not verified";
   const latestActivity = [...events].reverse().find((event) => event.type === "agent.activity");
   const payload = eventPayload(latestActivity);
   const tool = String(payload.tool ?? "");
@@ -1849,7 +1850,7 @@ function runEvidenceStatus(events: AgentEvent[], teeVerified: boolean, hasComput
   if (tool === "handoff_to_distribution") return "Preparing output";
   if (tool === "tune_for_platform" && status === "started") return "Formatting output";
   if (tool === "tune_for_platform" && status === "completed") return "Output ready";
-  if (hasCompute) return "Compute complete";
+  if (hasCompute) return "Compute recorded";
   return "Compute pending";
 }
 
@@ -1860,6 +1861,16 @@ function payloadString(event: AgentEvent | undefined, key: string): string {
 
 function payloadValue(event: AgentEvent | undefined, key: string): unknown {
   return eventPayload(event)[key];
+}
+
+function booleanOrNull(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return null;
 }
 
 function payloadRecord(event: AgentEvent | undefined, key: string): Record<string, string> {

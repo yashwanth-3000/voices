@@ -1885,7 +1885,7 @@ function crewAiComputeEvidence(crew: CrewAiGenerationResult, purpose: string): R
     serviceUrl: lastCall?.serviceUrl,
     model: lastCall?.model,
     chatId: lastCall?.chatId,
-    teeVerified: calls.length > 0 ? calls.every((call) => call.teeVerified !== false) : null,
+    teeVerified: aggregateTeeVerified(calls),
     inputTokens: sumOptional(calls.map((call) => call.inputTokens)),
     outputTokens: sumOptional(calls.map((call) => call.outputTokens)),
     durationMs: sumOptional(calls.map((call) => call.durationMs)),
@@ -1894,6 +1894,13 @@ function crewAiComputeEvidence(crew: CrewAiGenerationResult, purpose: string): R
     revisionCount: crew.revisionCount ?? 0,
     calls
   };
+}
+
+function aggregateTeeVerified(calls: CrewAiGenerationResult["computeCalls"]): boolean | null {
+  if (!calls?.length) return null;
+  if (calls.some((call) => call.teeVerified === false)) return false;
+  if (calls.every((call) => call.teeVerified === true)) return true;
+  return null;
 }
 
 function sumOptional(values: Array<number | undefined>): number | undefined {

@@ -2,10 +2,10 @@
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "pnpm --filter backend build"
+    "buildCommand": "virtualenv /opt/venv && . /opt/venv/bin/activate && pip install --no-cache-dir -r backend/crewai_runtime/requirements.txt && pnpm --filter backend build"
   },
   "deploy": {
-    "startCommand": "pnpm --filter backend start:prod",
+    "startCommand": "sh backend/scripts/start-railway.sh",
     "healthcheckPath": "/admin/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
