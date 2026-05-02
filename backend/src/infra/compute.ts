@@ -1,3 +1,4 @@
+import "../runtime/node-globals.js";
 import { createRequire } from "node:module";
 import { ethers } from "ethers";
 import OpenAI from "openai";

@@ -1,3 +1,4 @@
+import "../../runtime/node-globals.js";
 import { Buffer } from "node:buffer";
 import { ethers } from "ethers";
 import { AIMessage, BaseMessage, HumanMessage, isToolMessage } from "@langchain/core/messages";

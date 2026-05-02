@@ -1,3 +1,4 @@
+import "../../runtime/node-globals.js";
 import {
   BaseCheckpointSaver,
   Checkpoint,
