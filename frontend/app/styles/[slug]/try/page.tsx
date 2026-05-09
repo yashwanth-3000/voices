@@ -2,7 +2,7 @@
 
 import { BrowserProvider } from "ethers";
 import Link from "next/link";
-import type { FormEvent, KeyboardEvent, ReactNode } from "react";
+import type { FormEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { TransactionRequest } from "ethers";
 import { Navbar } from "../../../../components/Navbar";
@@ -10,6 +10,8 @@ import { useWallet } from "../../../../context/WalletContext";
 import { ChainStyleDetails, parseJsonResponse, registryStyleToModel, shortAddress } from "../../../../lib/registryStyles";
 import { readMintedStyles } from "../../../../lib/mintedStyles";
 import { getStyle, StyleModel } from "../../../../lib/styles";
+import { CONTRACTS, explorerAddressUrl } from "../../../../lib/proofTrail";
+import { friendlyErrorMessage } from "../../../../lib/friendlyErrors";
 
 type PageProps = { params: { slug: string } };
 
@@ -413,6 +415,7 @@ export default function TryStylePage({ params }: PageProps) {
   const [creditInfo, setCreditInfo] = useState<CreditInfo | null>(null);
   const [creditError, setCreditError] = useState("");
   const [isCreditPopoverOpen, setIsCreditPopoverOpen] = useState(false);
+  const [isProofPopoverOpen, setIsProofPopoverOpen] = useState(false);
   const [creditBuyAmount, setCreditBuyAmount] = useState(1);
   const [recentCreditPurchase, setRecentCreditPurchase] = useState<RecentCreditPurchase | null>(null);
   const [selectedPlatforms, setSelectedPlatforms] = useState<GenerationPlatform[]>(["x"]);
@@ -421,6 +424,7 @@ export default function TryStylePage({ params }: PageProps) {
   const pendingTransactionLocks = useRef<Set<string>>(new Set());
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const proofMenuRef = useRef<HTMLDivElement | null>(null);
   const creditMenuRef = useRef<HTMLDivElement | null>(null);
 
   const loadRegistryStyle = useCallback(async () => {
@@ -435,7 +439,7 @@ export default function TryStylePage({ params }: PageProps) {
     } catch (error) {
       setRegistryDetails(undefined);
       setRegistryStyle(undefined);
-      setRegistryError(error instanceof Error ? error.message : String(error));
+      setRegistryError(friendlyErrorMessage(error));
       setRegistryState("error");
     }
   }, [params.slug]);
@@ -509,9 +513,44 @@ export default function TryStylePage({ params }: PageProps) {
     };
   }, [isCreditPopoverOpen]);
 
+  useEffect(() => {
+    if (!isProofPopoverOpen) return;
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (!proofMenuRef.current?.contains(target)) {
+        setIsProofPopoverOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") setIsProofPopoverOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isProofPopoverOpen]);
+
+  useEffect(() => {
+    function openProofFromHash() {
+      if (window.location.hash === "#proof-trail") {
+        setIsProofPopoverOpen(true);
+      }
+    }
+    openProofFromHash();
+    window.addEventListener("hashchange", openProofFromHash);
+    return () => window.removeEventListener("hashchange", openProofFromHash);
+  }, []);
+
   const groups = useMemo(() => groupMessages(messages), [messages]);
   const hasBusyRun = useMemo(() => messages.some((m) => m.liveRun && isRunBusy(m.liveRun)), [messages]);
   const latestRun = useMemo(() => [...messages].reverse().find((m) => m.liveRun)?.liveRun, [messages]);
+  const latestProofRequestId = latestRun?.requestId ?? registryDetails?.recentOutputs?.find((output) => output.requestId)?.requestId;
   const creditCount = parseCreditCount(creditInfo?.credits);
   const hasCredits = creditCount > 0n;
   const creditStatusLabel = creditState === "loading"
@@ -519,7 +558,9 @@ export default function TryStylePage({ params }: PageProps) {
     : creditState === "buying"
       ? "Buying credit"
       : creditState === "error"
-        ? "Credit check failed"
+        ? creditError.toLowerCase().includes("not enough og")
+          ? "Not enough OG"
+          : "Credit check failed"
         : !address
           ? "Wallet required"
           : hasCredits
@@ -558,8 +599,9 @@ export default function TryStylePage({ params }: PageProps) {
         setCreditState("ready");
       } catch (error) {
         setCreditState("error");
-        setCreditError(errorMessage(error));
-        addAssistantNotice(errorMessage(error));
+        const message = friendlyErrorMessage(error);
+        setCreditError(message);
+        addAssistantNotice(message);
         return;
       }
     }
@@ -608,7 +650,7 @@ export default function TryStylePage({ params }: PageProps) {
       openEventStream(assistantId, generated.requestId);
       void monitorGeneration(assistantId, generated.requestId);
     } catch (error) {
-      updateRun(assistantId, (run) => ({ ...run, status: "failed", error: errorMessage(error) }));
+      updateRun(assistantId, (run) => ({ ...run, status: "failed", error: friendlyErrorMessage(error) }));
     }
   }
 
@@ -616,7 +658,7 @@ export default function TryStylePage({ params }: PageProps) {
     try {
       await waitForAny(messageId, requestId, TERMINAL_TYPES, GENERATION_TIMEOUT_MS);
     } catch (error) {
-      updateRun(messageId, (run) => ({ ...run, status: "failed", error: errorMessage(error) }));
+      updateRun(messageId, (run) => ({ ...run, status: "failed", error: friendlyErrorMessage(error) }));
     }
   }
 
@@ -664,7 +706,7 @@ export default function TryStylePage({ params }: PageProps) {
       await refreshCredits(receipt.from);
       updateRun(messageId, (current) => ({ ...current, busyAction: undefined, lastTxHash: receipt.hash }));
     } catch (error) {
-      updateRun(messageId, (current) => ({ ...current, busyAction: undefined, error: errorMessage(error) }));
+      updateRun(messageId, (current) => ({ ...current, busyAction: undefined, error: friendlyErrorMessage(error, { action: "buy credits" }) }));
     } finally {
       releaseTransactionLock(lockKey);
     }
@@ -710,7 +752,7 @@ export default function TryStylePage({ params }: PageProps) {
         ...current,
         busyAction: undefined,
         status: "awaiting_settlement",
-        error: errorMessage(error),
+        error: friendlyErrorMessage(error, { action: "pay the royalty" }),
         lastTxHash: signedReceipt?.hash ?? current.lastTxHash
       }));
     } finally {
@@ -746,7 +788,7 @@ export default function TryStylePage({ params }: PageProps) {
         ...current,
         busyAction: undefined,
         status: "awaiting_settlement",
-        error: errorMessage(error),
+        error: friendlyErrorMessage(error, { action: "confirm the royalty payment" }),
         lastTxHash: txHash
       }));
     } finally {
@@ -834,7 +876,7 @@ export default function TryStylePage({ params }: PageProps) {
       setCreditState("ready");
     } catch (error) {
       setCreditState("error");
-      setCreditError(errorMessage(error));
+      setCreditError(friendlyErrorMessage(error));
     }
   }
 
@@ -884,7 +926,7 @@ export default function TryStylePage({ params }: PageProps) {
       setIsCreditPopoverOpen(true);
     } catch (error) {
       setCreditState("error");
-      setCreditError(errorMessage(error));
+      setCreditError(friendlyErrorMessage(error, { action: "buy credits" }));
     } finally {
       releaseTransactionLock(lockKey);
     }
@@ -1010,6 +1052,19 @@ export default function TryStylePage({ params }: PageProps) {
 
           <div className="tryHeaderActions">
             <div className="tryChatHeaderPrice">{style.price}</div>
+            {registryDetails ? (
+              <TryProofTrail
+                style={registryDetails}
+                latestProofRequestId={latestProofRequestId}
+                open={isProofPopoverOpen}
+                menuRef={proofMenuRef}
+                onToggle={() => {
+                  setIsCreditPopoverOpen(false);
+                  setIsProofPopoverOpen((open) => !open);
+                }}
+                onClose={() => setIsProofPopoverOpen(false)}
+              />
+            ) : null}
             <div className="tryCreditMenu" ref={creditMenuRef}>
               <button
                 type="button"
@@ -1217,6 +1272,90 @@ export default function TryStylePage({ params }: PageProps) {
           <p className="tryComposerHint">{composerHint}</p>
         </div>
       </main>
+    </div>
+  );
+}
+
+function TryProofTrail({
+  style,
+  latestProofRequestId,
+  open,
+  menuRef,
+  onToggle,
+  onClose
+}: {
+  style: ChainStyleDetails;
+  latestProofRequestId?: string;
+  open: boolean;
+  menuRef: RefObject<HTMLDivElement>;
+  onToggle: () => void;
+  onClose: () => void;
+}) {
+  const agentBrain = recordValue(style.agentBrain);
+  const manifestRoot = stringValue(agentBrain.manifestRootHash);
+  const memoryLogStream = stringValue(agentBrain.memoryLogStream);
+  const proofHref = latestProofRequestId ? `/api/backend/proof/${encodeURIComponent(latestProofRequestId)}` : undefined;
+
+  return (
+    <div className="tryProofMenu" id="proof-trail" ref={menuRef}>
+      <button
+        type="button"
+        className="tryProofCompact"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={onToggle}
+        title="Open Proof Trail"
+      >
+        <span className="tryProofCompactIcon" aria-hidden="true"><IconCheck /></span>
+        <span className="tryProofCompactText">
+          <strong>Proof Trail</strong>
+          <small>{latestProofRequestId ? "ready" : "agent proof"}</small>
+        </span>
+      </button>
+
+      {open ? (
+        <div className="tryProofPopover" role="dialog" aria-label="Proof Trail details">
+          <div className="tryProofPopoverHead">
+            <div>
+              <strong>Proof Trail</strong>
+            </div>
+            <button type="button" onClick={onClose}>Close</button>
+          </div>
+          <div className="tryProofGrid">
+            <TryProofFact label="AgentBrain manifest root" value={manifestRoot} />
+            <TryProofFact label="Profile KV key" value={style.profileKey || style.chain.profileURI} />
+            <TryProofFact label="Memory log stream" value={memoryLogStream} />
+            <TryProofFact label="Latest generation proof" value={latestProofRequestId} href={proofHref} />
+            {CONTRACTS.map((contract) => (
+              <TryProofFact
+                key={contract.label}
+                label={contract.label}
+                value={contract.address}
+                href={explorerAddressUrl(contract.address)}
+              />
+            ))}
+          </div>
+          <div className="tryProofPopoverActions">
+            <Link href={`/dashboard/styles/${style.tokenId}/agent-brain`}>AgentBrain inspector</Link>
+            {proofHref ? <a href={proofHref} target="_blank" rel="noreferrer">Latest proof page</a> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function TryProofFact({ label, value, href }: { label: string; value?: string; href?: string }) {
+  return (
+    <div className="tryProofFact">
+      <span>{label}</span>
+      {href && value ? (
+        <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel={href.startsWith("http") ? "noreferrer" : undefined} title={value}>
+          {value}
+        </a>
+      ) : (
+        <strong title={value}>{value || "Not recorded"}</strong>
+      )}
     </div>
   );
 }
@@ -1553,10 +1692,15 @@ function statusFromEvents(events: AgentEvent[], fallback: RunStatus): RunStatus 
 
 function deriveCrewSummary(events: AgentEvent[]) {
   const agents = CREW_AGENT_STEPS.map((step) => {
-    const latest = [...events].reverse().find((event) => {
+    const matchingEvents = events.filter((event) => {
       const payload = eventPayload(event);
       return event.type === "agent.activity" && (payload.tool === step.tool || payload.agent === step.key);
     });
+    const latestTerminal = [...matchingEvents].reverse().find((event) => {
+      const status = eventPayload(event).status;
+      return status === "completed" || status === "failed";
+    });
+    const latest = latestTerminal ?? matchingEvents.at(-1);
     const payload = eventPayload(latest);
     const state = normalizeCrewState(payload.status);
     return {
@@ -1934,23 +2078,6 @@ function runConsumerAddress(run: LiveRun): string | null {
   return event.consumerAddress ?? (payloadConsumer || null);
 }
 
-function errorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  const lower = raw.toLowerCase();
-  if (
-    lower.includes("replacement_underpriced") ||
-    lower.includes("replacement transaction underpriced") ||
-    lower.includes("replacement fee too low") ||
-    lower.includes("transaction underpriced")
-  ) {
-    return "Your wallet already has a pending transaction with this nonce. Open MetaMask and Speed up or Cancel the pending transaction, or wait for it to confirm before pressing Pay royalty again.";
-  }
-  if (lower.includes("nonce too low")) {
-    return "This wallet nonce was already used by another pending or confirmed transaction. Refresh the page, check MetaMask activity, then try again after the wallet syncs.";
-  }
-  return raw;
-}
-
 function parseCreditCount(value: string | undefined): bigint {
   try {
     return BigInt(value ?? "0");
@@ -1969,7 +2096,11 @@ function clampCreditAmount(value: number): number {
 }
 
 function formatCreditPrice(value: string | undefined): string {
-  const wei = parseCreditCount(value);
+  return formatWeiAmount(parseCreditCount(value));
+}
+
+function formatWeiAmount(value: bigint | string | undefined): string {
+  const wei = typeof value === "bigint" ? value : parseCreditCount(value);
   const unit = 1_000_000_000_000_000_000n;
   const whole = wei / unit;
   const fraction = wei % unit;
@@ -2058,6 +2189,10 @@ function normalizeSourcePlatform(value: unknown): GenerationPlatform | null {
 
 function recordValue(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
 function styleHintFor(style: StyleModel | undefined): Record<string, unknown> | null {

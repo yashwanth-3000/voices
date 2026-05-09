@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { StyleListingCard } from "../../components/StyleListingCard";
+import { friendlyErrorMessage } from "../../lib/friendlyErrors";
 import {
   ChainStyleDetails,
   parseJsonResponse,
@@ -55,7 +56,7 @@ export default function StylesPage() {
       setRegistryStyles([]);
       setRegistrySource("");
       setScannedCount(0);
-      setError(flowError instanceof Error ? flowError.message : String(flowError));
+      setError(friendlyErrorMessage(flowError));
       setState("error");
     }
   }, []);
@@ -204,8 +205,6 @@ export default function StylesPage() {
                   tags={s.tags}
                   blurb={s.blurb}
                   fillText={s.fillText}
-                  status={s.status}
-                  tokenId={s.tokenId}
                   outputCount={s.outputCount}
                   sampleCount={s.sampleCount}
                   hasAgentBrain={s.hasAgentBrain}

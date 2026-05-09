@@ -16,6 +16,7 @@ import {
   OG_CHAIN_ID_HEX,
   OG_NETWORK,
 } from "../lib/chain";
+import { friendlyErrorMessage } from "../lib/friendlyErrors";
 
 const { Contract, JsonRpcProvider, formatEther } = ethers;
 
@@ -261,7 +262,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       const err = e as { code?: number; message?: string };
       setError(err.code === 4001
         ? "Connection rejected — please approve in your wallet."
-        : (err.message ?? "Failed to connect."));
+        : friendlyErrorMessage(e, { action: "connect the wallet", fallback: "Failed to connect." }));
     } finally {
       setIsConnecting(false);
     }
@@ -283,7 +284,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       const cid = await getChainId(p);
       if (cid !== null) { setChainId(cid); localStorage.setItem(CHAIN_KEY, String(cid)); }
     } catch (e: unknown) {
-      setError((e as { message?: string }).message ?? "Failed to switch network.");
+      setError(friendlyErrorMessage(e, { action: "switch to 0G Galileo", fallback: "Failed to switch network." }));
     }
   }, []);
 

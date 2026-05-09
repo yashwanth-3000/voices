@@ -174,17 +174,18 @@ def run_crewai(payload: AgentPayload) -> AgentPayload:
         cache=False,
     )
 
+    result = crew.kickoff(inputs={})
+    outputs = task_outputs(result)
+    context_output = outputs[0] if len(outputs) > 0 else ""
+    writer_output = outputs[1] if len(outputs) > 1 else raw_text(result)
+    critic_output = outputs[2] if len(outputs) > 2 else raw_text(result)
+    emitted_voice_packet = parse_json_object(context_output) or evidence_packet
     emit_activity(
         "voice_context",
         "completed",
         "Runtime voice packet prepared from stored evidence.",
-        {**source_summary(payload), "output": {"voicePacket": evidence_packet}},
+        {**source_summary(payload), "output": {"voicePacket": emitted_voice_packet}},
     )
-    emit_activity("style_writer", "started", "Generating the first voice-matched draft through 0G Compute.", {"platforms": platforms(payload)})
-    result = crew.kickoff(inputs={})
-    outputs = task_outputs(result)
-    writer_output = outputs[1] if len(outputs) > 1 else raw_text(result)
-    critic_output = outputs[2] if len(outputs) > 2 else raw_text(result)
     draft = extract_draft(writer_output) or extract_draft(critic_output) or clean_text(writer_output)
     emit_activity(
         "style_writer",
@@ -194,8 +195,7 @@ def run_crewai(payload: AgentPayload) -> AgentPayload:
     )
 
     emit_activity("voice_critic_memory", "started", "Comparing draft against profile, excerpts, and memory evidence.", {})
-    critique = parse_json_object(critic_output) or heuristic_critique(payload, draft, evidence_packet)
-    critique.setdefault("draft", draft)
+    critique = apply_revision_gate(parse_json_object(critic_output) or heuristic_critique(payload, draft, evidence_packet), draft)
     final_draft = clean_text(str(critique.get("draft") or draft))
     revision_count = 0
 
@@ -206,7 +206,12 @@ def run_crewai(payload: AgentPayload) -> AgentPayload:
             "voice_critic_memory",
             "completed",
             "Style match looked weak; requesting one targeted revision from Style Writer Agent.",
-            {"revisionGuidance": guidance[:320]},
+            {
+                "styleMatch": critique.get("style_match"),
+                "needsRevision": True,
+                "revisionGuidance": guidance[:320],
+                "minStyleScore": min_style_score(),
+            },
         )
         emit_activity("style_writer", "started", "Revising the draft using critic guidance and the same runtime voice packet.", {})
         revised = bridge_chat(
@@ -220,13 +225,18 @@ def run_crewai(payload: AgentPayload) -> AgentPayload:
             "Revision generated after critic feedback.",
             {"draftPreview": final_draft[:220], "output": {"draft": final_draft}},
         )
-        emit_activity("voice_critic_memory", "started", "Recording final critique and memory update after revision.", {})
-        critique = {
-            **critique,
-            "draft": final_draft,
-            "needs_revision": False,
-            "revision_count": revision_count,
-        }
+        emit_activity("voice_critic_memory", "started", "Re-checking the revised draft against stored voice evidence.", {})
+        revised_critic = bridge_chat(
+            critic_messages(payload, evidence_packet, final_draft),
+            {**compute_options(payload), "purpose": "voice_critic_memory"},
+        )
+        critique = apply_revision_gate(
+            parse_json_object(revised_critic["content"]) or heuristic_critique(payload, final_draft, evidence_packet),
+            final_draft,
+            allow_revision=False,
+        )
+        critique = close_revision_loop(critique, revision_count)
+        final_draft = clean_text(str(critique.get("draft") or final_draft))
 
     memory_patch = build_memory_patch(payload, final_draft, critique)
     memory_patch["runtime"] = "crewai"
@@ -238,6 +248,7 @@ def run_crewai(payload: AgentPayload) -> AgentPayload:
             "styleMatch": critique.get("style_match"),
             "needsRevision": bool(critique.get("needs_revision")),
             "learnedPreferenceCount": len(memory_patch.get("learned_preferences", [])),
+            "revisionCount": revision_count,
             "output": {
                 "draft": final_draft,
                 "critique": critique,
@@ -289,7 +300,7 @@ def run_bridge_harness(payload: AgentPayload, runtime: str) -> AgentPayload:
     else:
         critic = bridge_chat(critic_messages(payload, evidence_packet, draft), {**compute_options(payload), "purpose": "voice_critic_memory"})
         critique = parse_json_object(critic["content"]) or heuristic_critique(payload, draft, evidence_packet)
-    critique.setdefault("draft", draft)
+    critique = apply_revision_gate(critique, draft)
 
     revision_count = 0
     final_draft = clean_text(str(critique.get("draft") or draft))
@@ -300,7 +311,12 @@ def run_bridge_harness(payload: AgentPayload, runtime: str) -> AgentPayload:
             "voice_critic_memory",
             "completed",
             "Style match looked weak; requesting one targeted revision from Style Writer Agent.",
-            {"revisionGuidance": guidance[:320]},
+            {
+                "styleMatch": critique.get("style_match"),
+                "needsRevision": True,
+                "revisionGuidance": guidance[:320],
+                "minStyleScore": min_style_score(),
+            },
         )
         emit_activity("style_writer", "started", "Revising the draft using critic guidance and the same runtime voice packet.", {})
         revised = bridge_chat(
@@ -308,14 +324,21 @@ def run_bridge_harness(payload: AgentPayload, runtime: str) -> AgentPayload:
             {**compute_options(payload), "purpose": "style_writer_revision"},
         )
         final_draft = extract_draft(revised["content"]) or clean_text(revised["content"]) or final_draft
-        critique = {**critique, "draft": final_draft, "needs_revision": False, "revision_count": revision_count}
         emit_activity(
             "style_writer",
             "completed",
             "Revision generated after critic feedback.",
             {"draftPreview": final_draft[:220], "output": {"draft": final_draft}},
         )
-        emit_activity("voice_critic_memory", "started", "Recording final critique and memory update after revision.", {})
+        emit_activity("voice_critic_memory", "started", "Re-checking the revised draft against stored voice evidence.", {})
+        critic = bridge_chat(critic_messages(payload, evidence_packet, final_draft), {**compute_options(payload), "purpose": "voice_critic_memory"})
+        critique = apply_revision_gate(
+            parse_json_object(critic["content"]) or heuristic_critique(payload, final_draft, evidence_packet),
+            final_draft,
+            allow_revision=False,
+        )
+        critique = close_revision_loop(critique, revision_count)
+        final_draft = clean_text(str(critique.get("draft") or final_draft))
 
     memory_patch = build_memory_patch(payload, final_draft, critique)
     memory_patch["runtime"] = runtime
@@ -327,6 +350,7 @@ def run_bridge_harness(payload: AgentPayload, runtime: str) -> AgentPayload:
             "styleMatch": critique.get("style_match"),
             "needsRevision": bool(critique.get("needs_revision")),
             "learnedPreferenceCount": len(memory_patch.get("learned_preferences", [])),
+            "revisionCount": revision_count,
             "output": {
                 "draft": final_draft,
                 "critique": critique,
@@ -487,7 +511,7 @@ def writer_task_description(payload: AgentPayload) -> str:
 def critic_task_description(payload: AgentPayload) -> str:
     return (
         "Compare the generated draft against the runtime voice packet, profile, excerpts, and memory evidence. "
-        "If style match is weak, set needs_revision true and provide concise revision_guidance. "
+        f"If style match is weak or style_match.score is below {min_style_score():.2f}, set needs_revision true and provide concise revision_guidance. "
         "Also return learned_preferences suitable for 0G Log/KV. Return JSON only.\n\n"
         f"Original user prompt:\n{str(payload.get('prompt') or '')}"
     )
@@ -554,6 +578,7 @@ def critic_messages(payload: AgentPayload, voice_packet: AgentPayload, draft: st
                 [
                     "You are the Voice Critic + Memory Agent inside the Voices CrewAI swarm.",
                     "Compare the draft with the runtime voice packet and stored evidence.",
+                    f"If style_match.score is below {min_style_score():.2f}, needs_revision must be true.",
                     "Return JSON only. Do not add policy text or hidden reasoning.",
                     "Schema: {\"draft\":\"final draft or same draft\",\"style_match\":{\"score\":0-1,\"why\":\"...\"},\"needs_revision\":false,\"revision_guidance\":\"...\",\"critique\":\"...\",\"feedback\":\"...\",\"learned_preferences\":[\"...\"]}",
                 ]
@@ -693,7 +718,7 @@ def heuristic_critique(payload: AgentPayload, draft: str, voice_packet: AgentPay
     draft_terms = set(content_terms(draft))
     overlap = len(terms.intersection(draft_terms))
     score = min(0.92, 0.45 + overlap / 30)
-    needs_revision = bool(draft.strip()) and score < 0.58 and max_revisions() > 0
+    needs_revision = bool(draft.strip()) and score < min_style_score() and max_revisions() > 0
     return {
         "draft": draft,
         "style_match": {
@@ -709,6 +734,54 @@ def heuristic_critique(payload: AgentPayload, draft: str, voice_packet: AgentPay
             "Prefer evidence-derived structure over generic platform defaults.",
         ],
     }
+
+
+def apply_revision_gate(critique: AgentPayload, draft: str, allow_revision: bool = True) -> AgentPayload:
+    checked = dict(critique)
+    checked.setdefault("draft", draft)
+    score = style_match_score(checked)
+    checked["min_style_score"] = min_style_score()
+    if allow_revision and max_revisions() > 0 and score is not None and score < min_style_score():
+        existing = str(checked.get("revision_guidance") or "").strip()
+        score_guidance = (
+            f"Style match score is {round(score * 100)}%, below the {round(min_style_score() * 100)}% bar. "
+            "Revise by matching the evidence-derived structure, rhythm, vocabulary register, and format mechanics more closely."
+        )
+        checked["needs_revision"] = True
+        checked["revision_guidance"] = f"{existing} {score_guidance}".strip()
+    return checked
+
+
+def close_revision_loop(critique: AgentPayload, revision_count: int) -> AgentPayload:
+    checked = dict(critique)
+    checked["revision_count"] = revision_count
+    score = style_match_score(checked)
+    if revision_count >= max_revisions() and (truthy(checked.get("needs_revision")) or (score is not None and score < min_style_score())):
+        checked["revision_limit_reached"] = True
+        checked["needs_revision"] = False
+        note = "Revision limit reached after the critic-requested pass."
+        critique_text = str(checked.get("critique") or "").strip()
+        checked["critique"] = f"{critique_text} {note}".strip()
+    return checked
+
+
+def style_match_score(critique: AgentPayload) -> Optional[float]:
+    style_match = obj(critique.get("style_match"))
+    value = style_match.get("score")
+    if isinstance(value, (int, float)):
+        score = float(value)
+    elif isinstance(value, str):
+        try:
+            score = float(value.strip().rstrip("%"))
+            if score > 1:
+                score = score / 100
+        except ValueError:
+            return None
+    else:
+        return None
+    if not 0 <= score <= 1:
+        return None
+    return score
 
 
 def mock_draft(payload: AgentPayload, voice_packet: AgentPayload) -> str:
@@ -734,6 +807,14 @@ def max_revisions() -> int:
         return max(0, int(os.environ.get("CREWAI_MAX_REVISIONS") or "1"))
     except ValueError:
         return 1
+
+
+def min_style_score() -> float:
+    try:
+        value = float(os.environ.get("CREWAI_MIN_STYLE_SCORE") or "0.72")
+    except ValueError:
+        value = 0.72
+    return min(0.95, max(0.0, value))
 
 
 def platforms(payload: AgentPayload) -> List[str]:

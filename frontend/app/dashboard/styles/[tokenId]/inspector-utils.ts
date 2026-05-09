@@ -1,3 +1,5 @@
+import { friendlyErrorMessage } from "../../../../lib/friendlyErrors";
+
 export type AgentBrainDetails = {
   manifestRootHash?: string;
   manifestHash?: string;
@@ -139,9 +141,11 @@ export async function parseJsonResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const record = asRecord(data);
     throw new Error(
-      stringField(record, "message") ||
-        stringField(record, "error") ||
-        `Request failed with ${response.status}`
+      friendlyErrorMessage(
+        stringField(record, "message") ||
+          stringField(record, "error") ||
+          `Request failed with ${response.status}`
+      )
     );
   }
   return data as T;

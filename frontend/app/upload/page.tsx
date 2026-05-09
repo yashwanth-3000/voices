@@ -7,6 +7,7 @@ import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { Button } from "../../components/Button";
 import { useWallet } from "../../context/WalletContext";
+import { friendlyErrorMessage } from "../../lib/friendlyErrors";
 
 const MIN_CHARS = 200;
 const ROYALTY_MIN = 0.0001;
@@ -218,6 +219,40 @@ function MarkdownView({ text }: { text: string }) {
   return <div className="vcMarkdown">{blocks}</div>;
 }
 
+function SourceTabIcon({ type }: { type: "upload" | "twitter" | "blog" | "github" }) {
+  if (type === "twitter") {
+    return (
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+        <path d="M18.2 3h3.1l-6.8 7.8 8 10.2h-6.2l-4.9-6.2L5.8 21H2.7l7.3-8.4L2.4 3h6.4l4.4 5.6L18.2 3Zm-1.1 16.2h1.7L7.9 4.7H6.1l11 14.5Z" />
+      </svg>
+    );
+  }
+  if (type === "blog") {
+    return (
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z" />
+        <path d="M14 3v5h5" />
+        <path d="M8 13h8" />
+        <path d="M8 17h5" />
+      </svg>
+    );
+  }
+  if (type === "github") {
+    return (
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+        <path d="M12 .9A11.1 11.1 0 0 0 .9 12.2c0 4.9 3.1 9 7.5 10.5.5.1.7-.2.7-.5v-1.9c-3.1.7-3.7-1.3-3.7-1.3-.5-1.3-1.2-1.6-1.2-1.6-1-.7.1-.7.1-.7 1.1.1 1.7 1.2 1.7 1.2 1 1.7 2.6 1.2 3.2.9.1-.7.4-1.2.7-1.5-2.4-.3-5-1.2-5-5.5 0-1.2.4-2.2 1.2-3-.1-.3-.5-1.4.1-2.9 0 0 .9-.3 3 1.1a10.3 10.3 0 0 1 5.5 0c2.1-1.4 3-1.1 3-1.1.6 1.5.2 2.6.1 2.9.7.8 1.2 1.8 1.2 3 0 4.3-2.6 5.2-5 5.5.4.3.7 1 .7 2v2.9c0 .3.2.6.7.5a11.2 11.2 0 0 0 7.5-10.5A11.1 11.1 0 0 0 12 .9Z" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 15V3" />
+      <path d="m7 8 5-5 5 5" />
+      <path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+    </svg>
+  );
+}
+
 async function extractFileText(file: File): Promise<string> {
   const name = file.name || "file";
   const lower = name.toLowerCase();
@@ -420,6 +455,22 @@ export default function UploadPage() {
     () => [...workflowEvents].sort((left, right) => right.timestamp - left.timestamp),
     [workflowEvents],
   );
+  const latestWorkflowEvent = visibleWorkflowEvents[0] ?? null;
+  const latestWorkflowStatus = latestWorkflowEvent
+    ? String(eventPayload(latestWorkflowEvent).status ?? (latestWorkflowEvent.type.endsWith(".failed") ? "failed" : "completed"))
+    : "";
+  const workflowStreamBadge = useMemo(() => {
+    if (latestWorkflowStatus === "started" && mintPhase === "processing") {
+      return { state: "working", label: "working" };
+    }
+    if (latestWorkflowStatus === "failed") {
+      return { state: "error", label: "failed" };
+    }
+    if (mintPhase === "ready" || mintPhase === "success") {
+      return { state: "open", label: "ready" };
+    }
+    return { state: streamStatus, label: streamStatus };
+  }, [latestWorkflowStatus, mintPhase, streamStatus]);
   const selectedEvent = useMemo(
     () => workflowEvents.find((event) => event.id === selectedEventId) ?? null,
     [selectedEventId, workflowEvents],
@@ -500,7 +551,7 @@ export default function UploadPage() {
           },
         });
       } catch (error) {
-        setMintError(error instanceof Error ? error.message : String(error));
+        setMintError(friendlyErrorMessage(error));
       }
     }
   }
@@ -629,7 +680,7 @@ export default function UploadPage() {
       setBlogStatus("ready");
     } catch (err) {
       setBlogStatus("error");
-      setBlogError(err instanceof Error ? err.message : "Could not import this URL.");
+      setBlogError(friendlyErrorMessage(err, { fallback: "Could not import this URL." }));
     } finally {
       setBlogLoadingIndex(null);
     }
@@ -695,7 +746,7 @@ export default function UploadPage() {
       setTwitterStatus("ready");
     } catch (err) {
       setTwitterStatus("error");
-      setTwitterError(err instanceof Error ? err.message : "Could not import X posts.");
+      setTwitterError(friendlyErrorMessage(err, { fallback: "Could not import X posts." }));
     }
   }
 
@@ -714,7 +765,7 @@ export default function UploadPage() {
       if (repos.length === 0) setGithubError("No public repos found.");
     } catch (err) {
       setGithubStatus("error");
-      setGithubError(err instanceof Error ? err.message : "Could not load GitHub repos.");
+      setGithubError(friendlyErrorMessage(err, { fallback: "Could not load GitHub repos." }));
     }
   }
 
@@ -769,7 +820,7 @@ export default function UploadPage() {
       setGithubStatus("ready");
     } catch (err) {
       setGithubStatus("error");
-      setGithubError(err instanceof Error ? err.message : "Could not import the README.");
+      setGithubError(friendlyErrorMessage(err, { fallback: "Could not import the README." }));
     }
   }
 
@@ -839,7 +890,7 @@ export default function UploadPage() {
       setMintIntent(intent);
       setMintPhase("ready");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = friendlyErrorMessage(error, { action: "prepare the mint intent" });
       if (message.startsWith("Timed out waiting")) {
         setMintError(
           `${message}. Live 0G jobs can occasionally take longer; the log stream is still listening${activeRequestId ? ` for ${activeRequestId}` : ""}.`,
@@ -872,7 +923,7 @@ export default function UploadPage() {
       setMintPhase("success");
       void refreshWorkflowEvents(requestId);
     } catch (error) {
-      setMintError(error instanceof Error ? error.message : String(error));
+      setMintError(friendlyErrorMessage(error, { action: "mint the voice" }));
       setMintPhase("ready");
     }
   }
@@ -948,10 +999,10 @@ export default function UploadPage() {
   }
 
   const tabs = [
-    { id: "upload" as const,  label: "Upload Files" },
-    { id: "twitter" as const, label: "Twitter" },
-    { id: "blog" as const,    label: "Blog/Article" },
-    { id: "github" as const,  label: "GitHub" },
+    { id: "upload" as const,  label: "Upload Files", hint: "TXT / Markdown" },
+    { id: "twitter" as const, label: "Twitter", hint: "Public posts" },
+    { id: "blog" as const,    label: "Blog/Article", hint: "Article URLs" },
+    { id: "github" as const,  label: "GitHub", hint: "READMEs" },
   ];
 
   return (
@@ -973,9 +1024,16 @@ export default function UploadPage() {
             <div className="vcPrimary">
 
               {/* Card 1 — Content Sources (tabbed) */}
-              <section className="vcCard" aria-label="Content sources">
-                <div className="vcCardHead">
-                  <h2>Content Sources</h2>
+              <section className="vcCard vcSourceCard" aria-label="Content sources">
+                <div className="vcCardHead vcSourceHead">
+                  <div className="vcCardHeadText">
+                    <h2>Content Sources</h2>
+                    <p>Bring in creator-owned writing samples from one place or combine several sources.</p>
+                  </div>
+                  <div className="vcSourceSummaryPill" aria-label={`${sourceCount} content sources added`}>
+                    <strong>{sourceCount}</strong>
+                    <span>{sourceCount === 1 ? "source" : "sources"}</span>
+                  </div>
                 </div>
 
                 {/* Tab bar */}
@@ -989,7 +1047,13 @@ export default function UploadPage() {
                       className={`vcTab${activeTab === t.id ? " vcTabActive" : ""}`}
                       onClick={() => setActiveTab(t.id)}
                     >
-                      {t.label}
+                      <span className="vcTabIcon" aria-hidden="true">
+                        <SourceTabIcon type={t.id} />
+                      </span>
+                      <span className="vcTabText">
+                        <span className="vcTabLabel">{t.label}</span>
+                        <span className="vcTabHint">{t.hint}</span>
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -1456,13 +1520,13 @@ export default function UploadPage() {
 
               {/* Live backend logs */}
               <section className="vcCard vcWorkflowLogCard" aria-label="Live backend workflow logs">
-                <div className="vcWorkflowLogHead">
-                  <div>
-                    <h3>Live Backend Logs</h3>
-                    <p>{requestId ? "Streaming real agent events from the backend." : "Logs appear here after minting starts."}</p>
-                  </div>
-                  <span data-state={streamStatus}>{streamStatus}</span>
-                </div>
+	                <div className="vcWorkflowLogHead">
+	                  <div>
+	                    <h3>Live Backend Logs</h3>
+	                    <p>{requestId ? "Streaming real agent events from the backend." : "Logs appear here after minting starts."}</p>
+	                  </div>
+	                  <span data-state={workflowStreamBadge.state}>{workflowStreamBadge.label}</span>
+	                </div>
 
                 {requestId ? (
                   <div className="vcWorkflowRequest">
@@ -1644,9 +1708,16 @@ async function apiGet<T = Record<string, unknown>>(path: string): Promise<T> {
 
 async function parseResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
+  let data: { message?: string; error?: string } = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as { message?: string; error?: string };
+    } catch {
+      data = { message: text };
+    }
+  }
   if (!response.ok) {
-    throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+    throw new Error(friendlyErrorMessage(data.message ?? data.error ?? `Request failed with ${response.status}`));
   }
   return data as T;
 }

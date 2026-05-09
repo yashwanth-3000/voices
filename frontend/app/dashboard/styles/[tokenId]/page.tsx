@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../../components/Navbar";
 import { Footer } from "../../../../components/Footer";
 import { Button } from "../../../../components/Button";
+import { friendlyErrorMessage } from "../../../../lib/friendlyErrors";
 import {
   asRecord,
   ChainStyleDetails,
@@ -38,7 +39,7 @@ export default function VoiceInspectorPage({ params }: PageProps) {
       setStyle(data);
       setState("ready");
     } catch (flowError) {
-      setError(flowError instanceof Error ? flowError.message : String(flowError));
+      setError(friendlyErrorMessage(flowError));
       setStyle(null);
       setState("error");
     }

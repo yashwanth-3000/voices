@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BrowserProvider, Interface, TransactionRequest, ethers } from "ethers";
+import { friendlyErrorMessage } from "../../lib/friendlyErrors";
 import "./test-page.css";
 
 type AgentEvent = {
@@ -1072,12 +1073,19 @@ async function apiPost<T = Record<string, unknown>>(path: string, body: Record<s
 
 async function parseResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
+  let data: { message?: string; error?: string; backendUrl?: string } = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as { message?: string; error?: string; backendUrl?: string };
+    } catch {
+      data = { message: text };
+    }
+  }
   if (!response.ok) {
     if (data.error === "backend_unavailable") {
-      throw new Error(`Backend is offline at ${data.backendUrl}. Restart it and refresh Health. Details: ${data.message ?? response.status}`);
+      throw new Error(friendlyErrorMessage(`Backend is offline at ${data.backendUrl}. Restart it and refresh Health. Details: ${data.message ?? response.status}`));
     }
-    throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+    throw new Error(friendlyErrorMessage(data.message ?? data.error ?? `Request failed with ${response.status}`));
   }
   return data as T;
 }
@@ -1222,5 +1230,5 @@ function sleep(ms: number): Promise<void> {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return friendlyErrorMessage(error);
 }

@@ -35,3 +35,4 @@ deployments/*.json
 **/deployments/*.json
 
 implemtation.md
+.vercel

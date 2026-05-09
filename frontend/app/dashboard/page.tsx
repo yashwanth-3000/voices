@@ -6,6 +6,7 @@ import { Navbar } from "../../components/Navbar";
 import { Footer } from "../../components/Footer";
 import { Button } from "../../components/Button";
 import { useWallet } from "../../context/WalletContext";
+import { friendlyErrorMessage } from "../../lib/friendlyErrors";
 
 type ChainStyleDetails = {
   tokenId: string;
@@ -108,7 +109,7 @@ export default function DashboardPage() {
       setScannedCount(data.scannedTokenIds.length);
       setState("ready");
     } catch (flowError) {
-      setError(flowError instanceof Error ? flowError.message : String(flowError));
+      setError(friendlyErrorMessage(flowError));
       setStyles([]);
       setSource("");
       setScannedCount(0);
@@ -321,9 +322,16 @@ function DashboardStat({ label, value, detail }: { label: string; value: string;
 
 async function parseJsonResponse(response: Response) {
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
+  let data: { message?: string; error?: string } = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as { message?: string; error?: string };
+    } catch {
+      data = { message: text };
+    }
+  }
   if (!response.ok) {
-    throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+    throw new Error(friendlyErrorMessage(data.message ?? data.error ?? `Request failed with ${response.status}`));
   }
   return data;
 }

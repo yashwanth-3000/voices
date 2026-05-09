@@ -17,6 +17,8 @@ type PendingKvWrite = {
   reject: (error: unknown) => void;
 };
 
+const DEFAULT_STORAGE_OPERATION_TIMEOUT_MS = 90_000;
+
 export class MemoryStorageClient implements AgentStorage {
   protected readonly kv = new Map<string, unknown>();
   protected readonly logs = new Map<string, LogEntry[]>();
@@ -100,6 +102,7 @@ export class ZeroGStorageClient extends MemoryStorageClient {
   private readonly indexer: Indexer;
   private readonly cachePath?: string;
   private readonly flushCheckpointsToZeroG: boolean;
+  private readonly operationTimeoutMs: number;
   private storageTxQueue: Promise<void> = Promise.resolve();
   private kvFlushTimer?: ReturnType<typeof setTimeout>;
   private pendingKvWrites: PendingKvWrite[] = [];
@@ -113,6 +116,7 @@ export class ZeroGStorageClient extends MemoryStorageClient {
     const provider = new ethers.JsonRpcProvider(this.rpcUrl);
     this.signer = new ethers.Wallet(normalizePrivateKey(requiredEnv("PRIVATE_KEY")), provider);
     this.indexer = new Indexer(this.indexerUrl);
+    this.operationTimeoutMs = positiveIntegerEnv("OG_STORAGE_OPERATION_TIMEOUT_MS", DEFAULT_STORAGE_OPERATION_TIMEOUT_MS);
     this.cachePath = process.env.AGENT_STORAGE_CACHE_PATH === "off"
       ? undefined
       : resolve(process.env.AGENT_STORAGE_CACHE_PATH?.trim() || ".voices-storage-cache.json");
@@ -292,7 +296,11 @@ export class ZeroGStorageClient extends MemoryStorageClient {
       .then(async () => {
         for (let attempt = 0; attempt < 3; attempt += 1) {
           try {
-            return await operation();
+            return await withTimeout(
+              operation(),
+              this.operationTimeoutMs,
+              `0G Storage ${label} timed out after ${formatDuration(this.operationTimeoutMs)}`
+            );
           } catch (error) {
             if (attempt < 2 && isNonceContentionError(error)) {
               console.warn(`0G Storage ${label} hit nonce contention; retrying after pending tx settles.`);
@@ -396,6 +404,27 @@ function isCheckpointWrite(streamId: string, key: string): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]?.trim());
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function formatDuration(ms: number): string {
+  return ms >= 1_000 ? `${Math.round(ms / 1_000)}s` : `${ms}ms`;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  });
 }
 
 function sleep(ms: number): Promise<void> {

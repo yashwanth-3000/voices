@@ -1,3 +1,5 @@
+import { friendlyErrorMessage } from "../../../../lib/friendlyErrors";
+
 type FirecrawlPayload = {
   success?: boolean;
   data?: {
@@ -156,7 +158,7 @@ async function scrapeWithFirecrawl(url: string): Promise<
   } catch (error) {
     return {
       ok: false,
-      message: error instanceof Error ? error.message : "Firecrawl could not scrape this URL.",
+      message: friendlyErrorMessage(error, { fallback: "Firecrawl could not scrape this URL." }),
     };
   }
 }
@@ -208,7 +210,7 @@ async function scrapeDirectly(url: string): Promise<
   } catch (error) {
     return {
       ok: false,
-      message: error instanceof Error ? error.message : "Could not fetch this URL directly.",
+      message: friendlyErrorMessage(error, { fallback: "Could not fetch this URL directly." }),
     };
   } finally {
     clearTimeout(timer);

@@ -7,6 +7,8 @@ import { Button } from "../../../components/Button";
 import { getStyle, StyleModel } from "../../../lib/styles";
 import { readMintedStyles } from "../../../lib/mintedStyles";
 import { ChainStyleDetails, parseJsonResponse, registryStyleToModel, shortAddress } from "../../../lib/registryStyles";
+import { CONTRACTS, explorerAddressUrl } from "../../../lib/proofTrail";
+import { friendlyErrorMessage } from "../../../lib/friendlyErrors";
 
 type PageProps = {
   params: { slug: string };
@@ -38,7 +40,7 @@ export default function StyleDetailPage({ params }: PageProps) {
       }
     } catch (flowError) {
       setRegistryDetails(undefined);
-      setRegistryError(flowError instanceof Error ? flowError.message : String(flowError));
+      setRegistryError(friendlyErrorMessage(flowError));
       setRegistryState("error");
     }
   }, [params.slug]);
@@ -114,6 +116,7 @@ function LiveRegistryStyleDetail({ style }: { style: ChainStyleDetails }) {
               </div>
               <div className="styleDetailActions">
                 <Button href="/styles" variant="secondary">Back to styles</Button>
+                <Button href="#proof-trail" variant="secondary">Proof Trail</Button>
                 <Button href={`/styles/${style.tokenId}/try`} variant="primary">Try style</Button>
               </div>
             </div>
@@ -184,20 +187,35 @@ function LiveRegistryStyleDetail({ style }: { style: ChainStyleDetails }) {
                 </div>
               </article>
 
-              <article className="styleDetailPanel">
-                <PanelHeader eyebrow="Evidence" title="0G proof trail" subtitle="On-chain registry fields, AgentBrain storage, memory stream, and compute proof for this agent." />
+              <article className="styleDetailPanel proofTrailPanel" id="proof-trail">
+                <PanelHeader eyebrow="Judge proof" title="Proof Trail" subtitle="The exact AgentBrain, 0G Storage, memory, generation proof, and contract evidence for this voice agent." />
                 <div className="evidenceList">
-                  <Evidence label="Profile KV" value={style.profileKey || style.chain.profileURI} />
-                  <Evidence label="AgentBrain KV" value={style.agentBrainKey} />
+                  <Evidence label="AgentBrain manifest root" value={stringValue(agentBrain.manifestRootHash)} truncate={false} />
+                  <Evidence label="Profile KV key" value={style.profileKey || style.chain.profileURI} truncate={false} />
+                  <Evidence label="Memory log stream" value={stringValue(agentBrain.memoryLogStream)} truncate={false} />
+                  <Evidence
+                    label="Latest generation proof"
+                    value={proofOutput?.requestId}
+                    href={proofOutput?.requestId ? `/api/backend/proof/${encodeURIComponent(proofOutput.requestId)}` : undefined}
+                    truncate={false}
+                  />
+                  <Evidence label="AgentBrain KV" value={style.agentBrainKey} truncate={false} />
                   <Evidence label="Samples URI" value={style.chain.encryptedSamplesURI} />
-                  <Evidence label="Manifest root" value={stringValue(agentBrain.manifestRootHash)} />
                   <Evidence label="Manifest storage tx" value={stringValue(agentBrain.manifestStorageTxHash)} />
                   <Evidence label="Samples root" value={stringValue(agentBrain.samplesRootHash)} />
                   <Evidence label="Profile root" value={stringValue(agentBrain.profileRootHash)} />
-                  <Evidence label="Memory log stream" value={stringValue(agentBrain.memoryLogStream)} />
                   <Evidence label="Key hash" value={stringValue(agentBrain.keyHash)} />
                   <Evidence label="Compute model" value={stringValue(agentBrain.computeModel) || stringValue(profile.computeModel)} />
                   <Evidence label="TEE verified" value={profile.teeVerified === undefined ? "Not recorded" : String(profile.teeVerified)} />
+                  {CONTRACTS.map((contract) => (
+                    <Evidence
+                      key={contract.label}
+                      label={contract.label}
+                      value={contract.address}
+                      href={explorerAddressUrl(contract.address)}
+                      truncate={false}
+                    />
+                  ))}
                 </div>
                 {style.evidenceLinks?.length ? (
                   <div className="styleEvidenceLinks">
@@ -206,6 +224,10 @@ function LiveRegistryStyleDetail({ style }: { style: ChainStyleDetails }) {
                     ))}
                   </div>
                 ) : null}
+                <div className="styleEvidenceLinks">
+                  <a href={`/dashboard/styles/${style.tokenId}/agent-brain`}>Open AgentBrain inspector</a>
+                  <a href={`/styles/${style.tokenId}/try#proof-trail`}>Open try-page proof</a>
+                </div>
               </article>
 
               <article className="styleDetailPanel">
@@ -533,11 +555,28 @@ function SourceCard({ source }: { source: Record<string, unknown> }) {
   );
 }
 
-function Evidence({ label, value }: { label: string; value?: string }) {
+function Evidence({
+  label,
+  value,
+  href,
+  truncate = true
+}: {
+  label: string;
+  value?: string;
+  href?: string;
+  truncate?: boolean;
+}) {
+  const display = value ? (truncate ? shortHash(value) : value) : "Not recorded";
   return (
     <div className="evidenceRow">
       <span>{label}</span>
-      <strong>{value ? shortHash(value) : "Not recorded"}</strong>
+      {href && value ? (
+        <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel={href.startsWith("http") ? "noreferrer" : undefined} title={value}>
+          {display}
+        </a>
+      ) : (
+        <strong title={value}>{display}</strong>
+      )}
     </div>
   );
 }

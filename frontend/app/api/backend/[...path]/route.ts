@@ -1,3 +1,5 @@
+import { friendlyErrorMessage } from "../../../../lib/friendlyErrors";
+
 const DEFAULT_BACKEND_URL = "http://127.0.0.1:4317";
 
 type RouteContext = {
@@ -52,7 +54,7 @@ async function proxy(request: Request, context: RouteContext): Promise<Response>
         }
       });
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = friendlyErrorMessage(error);
     }
   }
 

@@ -1,4 +1,5 @@
 import type { StyleModel } from "./styles";
+import { friendlyErrorMessage } from "./friendlyErrors";
 
 export type ChainStyleDetails = {
   tokenId: string;
@@ -88,7 +89,7 @@ export async function parseJsonResponse<T>(response: Response): Promise<T> {
     }
   }
   if (!response.ok) {
-    throw new Error(data.message ?? data.error ?? `Request failed with ${response.status}`);
+    throw new Error(friendlyErrorMessage(data.message ?? data.error ?? `Request failed with ${response.status}`));
   }
   return data as T;
 }

@@ -453,6 +453,126 @@ test("ContentCreator runs CrewAI generation with selected voice context and acce
   }
 });
 
+test("CrewAI critic score below the quality bar triggers a revision pass", async () => {
+  const previousCrewMode = process.env.CREWAI_RUNTIME_MODE;
+  const previousCrewComputeMode = process.env.CREWAI_COMPUTE_MODE;
+  const previousMinStyleScore = process.env.CREWAI_MIN_STYLE_SCORE;
+  const previousMaxRevisions = process.env.CREWAI_MAX_REVISIONS;
+  const previousDistributionTuning = process.env.AGENT_DISTRIBUTION_COMPUTE_TUNING;
+  process.env.CREWAI_RUNTIME_MODE = "bridge";
+  process.env.CREWAI_COMPUTE_MODE = "mock";
+  process.env.CREWAI_MIN_STYLE_SCORE = "0.72";
+  process.env.CREWAI_MAX_REVISIONS = "1";
+  process.env.AGENT_DISTRIBUTION_COMPUTE_TUNING = "off";
+  let writerCalls = 0;
+  let criticCalls = 0;
+  const compute: AgentCompute = {
+    async chat(messages) {
+      const prompt = messages.map((message) => message.content).join("\n");
+      if (prompt.includes("Voice Critic + Memory Agent") || prompt.includes("<draft_to_review>")) {
+        criticCalls += 1;
+        const revised = criticCalls > 1;
+        return {
+          content: JSON.stringify({
+            draft: revised
+              ? "Web3 works when the mechanism is clear: who owns the data, what runs onchain, and where the trust assumption moved."
+              : "Web3 is changing ownership for everyone.",
+            style_match: {
+              score: revised ? 0.86 : 0.58,
+              why: revised ? "Concrete mechanism-first framing." : "Too generic for the supplied evidence."
+            },
+            needs_revision: false,
+            revision_guidance: "Make the draft more mechanism-first and less generic.",
+            critique: revised ? "Revision matches the stored voice evidence." : "The first draft is too broad.",
+            feedback: "Prefer mechanism-first framing.",
+            learned_preferences: ["Use concrete ownership and trust-assumption language."]
+          }),
+          verified: true,
+          model: "voice-critic-test"
+        };
+      }
+      if (prompt.includes("<runtime_voice_packet_json>") && prompt.includes("<user_task>")) {
+        writerCalls += 1;
+        const revised = prompt.includes("Revise the previous draft");
+        return {
+          content: revised
+            ? "<draft>Web3 works when the mechanism is clear: who owns the data, what runs onchain, and where the trust assumption moved.</draft>"
+            : "<draft>Web3 is changing ownership for everyone.</draft>",
+          verified: true,
+          model: "voice-writer-test"
+        };
+      }
+      return {
+        content: JSON.stringify({ tool: "final", args: {} }),
+        verified: true,
+        model: "planner-test"
+      };
+    },
+    async verifyResponse() {
+      return true;
+    },
+    async ensureFunds() {}
+  };
+  try {
+    const { orchestrator, storage, chain } = createTestOrchestrator({ compute });
+    chain.setCredits("0x00000000000000000000000000000000000000a4", 3n);
+    await storage.kvSet("style:4:profile", {
+      tone: { primary: "technical" },
+      detailed_style_guide: {
+        prompt_ready_style_brief: "Use concise, mechanism-first writing with concrete ownership and trust assumptions.",
+        actual_examples: [
+          {
+            text: "Web3 needs less posture and more receipts: what runs onchain, who controls the data, and where the trust assumption actually moved.",
+            observed_patterns: ["Uses mechanism-first framing instead of generic claims."]
+          }
+        ]
+      },
+      sampleExcerpts: [
+        "Web3 needs less posture and more receipts: what runs onchain, who controls the data, and where the trust assumption actually moved."
+      ]
+    });
+    await orchestrator.start();
+
+    await orchestrator.publish({
+      id: "gen-critic-revision",
+      type: "generation.requested",
+      timestamp: Date.now(),
+      actor: "0x00000000000000000000000000000000000000a4",
+      styleId: "4",
+      consumerAddress: "0x00000000000000000000000000000000000000a4",
+      payload: {
+        requestId: "req-critic-revision",
+        prompt: "tweet about why web3 matters",
+        platforms: ["x"]
+      }
+    });
+    await orchestrator.drain();
+
+    const events = orchestrator.eventsForRequest("req-critic-revision");
+    const published = events.find((event) => event.type === "generation.published");
+    const variants = (published?.payload.variants ?? {}) as Record<string, string>;
+    assert.equal(writerCalls, 2);
+    assert.equal(criticCalls, 2);
+    assert.equal(events.some((event) => event.type === "generation.failed"), false);
+    assert.equal(
+      events.some((event) => event.type === "agent.activity" && String(event.payload.message).includes("requesting one targeted revision")),
+      true
+    );
+    assert.match(variants.x, /what runs onchain/i);
+  } finally {
+    if (previousCrewMode === undefined) delete process.env.CREWAI_RUNTIME_MODE;
+    else process.env.CREWAI_RUNTIME_MODE = previousCrewMode;
+    if (previousCrewComputeMode === undefined) delete process.env.CREWAI_COMPUTE_MODE;
+    else process.env.CREWAI_COMPUTE_MODE = previousCrewComputeMode;
+    if (previousMinStyleScore === undefined) delete process.env.CREWAI_MIN_STYLE_SCORE;
+    else process.env.CREWAI_MIN_STYLE_SCORE = previousMinStyleScore;
+    if (previousMaxRevisions === undefined) delete process.env.CREWAI_MAX_REVISIONS;
+    else process.env.CREWAI_MAX_REVISIONS = previousMaxRevisions;
+    if (previousDistributionTuning === undefined) delete process.env.AGENT_DISTRIBUTION_COMPUTE_TUNING;
+    else process.env.AGENT_DISTRIBUTION_COMPUTE_TUNING = previousDistributionTuning;
+  }
+});
+
 test("Content generation prompt anchors the model with selected voice examples", () => {
   const privateExample = "week - n: • Leveraged AI and computer vision to enhance data integrity and user experience in SampleApp.";
   const messages = contentGenerationPrompt({

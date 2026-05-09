@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navbar } from "../../../../../components/Navbar";
 import { Footer } from "../../../../../components/Footer";
+import { friendlyErrorMessage } from "../../../../../lib/friendlyErrors";
 import {
   asRecord,
   ChainStyleDetails,
@@ -55,7 +56,7 @@ export default function AgentBrainInspectorPage({ params }: PageProps) {
           );
           manifest = await parseJsonResponse<Record<string, unknown>>(manifestResponse);
         } catch (manifestError) {
-          storageWarning = manifestError instanceof Error ? manifestError.message : String(manifestError);
+          storageWarning = friendlyErrorMessage(manifestError);
         }
       }
 
@@ -63,7 +64,7 @@ export default function AgentBrainInspectorPage({ params }: PageProps) {
       setState("ready");
     } catch (flowError) {
       setDetails({ style: null, manifest: null, storageWarning: "" });
-      setError(flowError instanceof Error ? flowError.message : String(flowError));
+      setError(friendlyErrorMessage(flowError));
       setState("error");
     }
   }, [tokenId]);

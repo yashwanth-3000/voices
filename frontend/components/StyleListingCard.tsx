@@ -8,8 +8,6 @@ type StyleListingCardProps = {
   tags: string[];
   blurb: string;
   fillText: string;
-  status: string;
-  tokenId: string;
   outputCount: number;
   sampleCount: number;
   hasAgentBrain: boolean;
@@ -25,8 +23,6 @@ export function StyleListingCard({
   tags,
   blurb,
   fillText,
-  status,
-  tokenId,
   outputCount,
   sampleCount,
   hasAgentBrain,
@@ -39,10 +35,6 @@ export function StyleListingCard({
     <Link className="styleListing" href={href} aria-label={`Open style: ${title}`}>
       <div className="styleListingTop">
         <div>
-          <div className="styleListingEyebrow">
-            <span>{status}</span>
-            <span>Token {tokenId}</span>
-          </div>
           <div className="styleListingTitle">{title}</div>
           <div className="styleListingMeta">{creator}</div>
         </div>
